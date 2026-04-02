@@ -1,0 +1,11 @@
+--- a/transformer_engine/pytorch/csrc/extensions/mxfp4_hip.cpp	2026-03-30 21:51:56.216901294 -0500
++++ b/transformer_engine/pytorch/csrc/extensions/mxfp4_hip.cpp	2026-03-24 12:30:11.134713019 -0500
+@@ -75,7 +75,7 @@
+     }
+ 
+     auto device = input.device();
+-    hipStream_t stream = c10::hip::getCurrentHIPStream().stream();
++    hipStream_t stream = c10::hip::getCurrentHIPStream(device.index()).stream();
+ 
+     bool use_rowwise = rowwise_fp4_out.has_value() || shuffle_rowwise_scale || shuffle_rowwise_fp4;
+     bool use_colwise = colwise_fp4_out.has_value() || shuffle_colwise_scale || shuffle_colwise_fp4;

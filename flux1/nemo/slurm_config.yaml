@@ -1,0 +1,18 @@
+num_nodes: 4
+gpus_per_node: 8
+model_name: flux1/nemo
+docker_image: rocm/mlperf:flux1_training_6.0_2026-01-10-20-46-44_dev_ainic_installed_rdma_core
+sbatch_template: launcher/templates/sbatch.sh.j2
+experiment_type: 'train'
+num_experiments: 10
+model_store:
+  store_name: mlperf_training
+  experiment_logdir: '/mlperf/training/flux1_nemo/experiments/'
+  cache:
+    model_dir: /mlperf/training/flux1_nemo/model/
+    data_dir: /mlperf/training/flux1_nemo/data/
+megatron_config:
+  cp: 1
+  tp: 1
+  pp: 1
+
