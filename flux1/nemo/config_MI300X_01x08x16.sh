@@ -6,7 +6,7 @@ export WARMUP_STEPS=${WARMUP_STEPS:-1600}
 
 export BATCHSIZE=512
 export LEARNING_RATE=${LEARNING_RATE:-"0.0002"}
-export MBS=64
+export MBS=32
 export FP8_RECIPE="delayed"  # mxfp8 currently not working on AMD GPU
 # System parameters
 export DGXNNODES=1
@@ -46,3 +46,4 @@ export WALLTIME_RUNANDTIME=200
 export WALLTIME=$((5 + ${NEXP:-1} * ($WALLTIME_RUNANDTIME + 5)))
 
 export USE_CUDA_GRAPH=False
+export HSA_NO_SCRATCH_RECLAIM=1

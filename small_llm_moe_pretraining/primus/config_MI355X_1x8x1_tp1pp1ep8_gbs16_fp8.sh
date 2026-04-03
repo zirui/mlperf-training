@@ -70,14 +70,24 @@ export NVTE_USE_OPTIMIZED_HIPIFIED_CAST_TRANSPOSE=1
 # -----------------------------------------------------------------------------
 # NVTE — FMHA / CK Backend
 # -----------------------------------------------------------------------------
+export NVTE_FLASH_ATTN=0                   # Disable FlashAttention so FusedAttention (CK/ASM) is used
 export NVTE_CK_USES_FWD_V3=1
 export NVTE_CK_USES_BWD_V3=1
-export NVTE_CK_IS_V3_ATOMIC_FP32=0
+export NVTE_CK_IS_V3_ATOMIC_FP32=1
 export NVTE_CK_V3_BF16_CVT=0              # 0=RTNE (default on gfx950), 1=RTNA, 2=RTZ (1,2 deprecated on gfx950)
 export NVTE_FMHA_BACKEND_DENSE_FWD=ck_v3  # Dense fwd: ck_v3 | ck | aotriton
 export NVTE_FMHA_BACKEND_DENSE_BWD=ck_v3  # Dense bwd: ck_v3 | ck | aotriton
 export NVTE_FMHA_BACKEND_SWA_FWD=ck       # SWA fwd:   ck | aotriton (no ck_v3 support)
 export NVTE_FMHA_BACKEND_SWA_BWD=ck       # SWA bwd:   ck | aotriton (no ck_v3 support)
+
+# -----------------------------------------------------------------------------
+# NVTE — Debug (disable for production runs)
+# -----------------------------------------------------------------------------
+# export NVTE_DEBUG=1
+# export NVTE_DEBUG_LEVEL=2
+# export NVTE_FMHA_DEBUG=1
+# export NVTE_LOG_FUSED_ATTN_CONFIG=1
+# export NVTE_LOG_CK_CONFIG=1
 
 # -----------------------------------------------------------------------------
 # MLPerf Logging

@@ -89,7 +89,7 @@ Source the appropriate config for your GPU and precision:
 source config_MI355X_01x08x16.sh
 ```
 
-### Launch 1 Training Run
+### Launch a single training run
 If you want to perform a single run, use:
 ```bash
 sudo chmod -R 777 .
@@ -98,7 +98,7 @@ bash run_with_docker.sh
 ```
 ## 5. Launch training (multi-node via slurm)
 
-Use the job.sh in the mlperf-training/flux1/nemo folder to launch the training run. For example (update job.sh per your cluster configuration).
+Use the job.sh in the mlperf-training/flux1/nemo folder to launch the training run (update job.sh per your cluster/run configuration).
 ```
 sbatch job.sh
 ```

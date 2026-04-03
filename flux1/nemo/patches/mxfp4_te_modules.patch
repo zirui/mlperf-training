@@ -1,19 +1,24 @@
---- a/transformer_engine/pytorch/module/linear.py	2026-03-30 21:51:56.220901232 -0500
-+++ b/transformer_engine/pytorch/module/linear.py	2026-03-24 12:30:11.134713019 -0500
-@@ -74,6 +74,12 @@
+--- a/transformer_engine/pytorch/module/linear.py	2026-04-01 14:32:15.263822692 -0500
++++ b/transformer_engine/pytorch/module/linear.py	2026-04-01 14:41:50.849787704 -0500
+@@ -74,6 +74,17 @@
  from ...debug.pytorch.debug_state import TEDebugState
  from torch.utils.cpp_extension import IS_HIP_EXTENSION
  
 +
 +def _is_mxfp4_enabled():
-+    from megatron.core.fp4_utils import is_mxfp4_phase
-+    return is_mxfp4_phase()
++    if os.environ.get('FP4', 'false').lower() not in ('true', '1', 'yes'):
++        return False
++    try:
++        from megatron.core.fp4_utils import is_mxfp4_phase
++        return is_mxfp4_phase()
++    except (ImportError, AttributeError):
++        return True
 +
 +
  __all__ = ["Linear"]
  
  
-@@ -143,9 +149,8 @@
+@@ -143,9 +154,8 @@
              parallel_mode == "column" and sequence_parallel and not ub_overlap_ag_fprop
          )
  
@@ -25,7 +30,7 @@
          # Debug print for MXFP4 (rank 0 only)
          if is_mxfp4_enabled:
              debug_mxfp4 = os.environ.get('NVTE_MXFP4_DEBUG', '0').lower() in ['true', '1', 'yes']
-@@ -272,12 +277,19 @@
+@@ -272,12 +282,19 @@
          )
          
          if need_mxfp4_conversion:
@@ -45,12 +50,22 @@
 +                    weightmat = weight_quantizer.quantize(high_prec_weight)
 +                else:
 +                    weightmat = high_prec_weight
-+                if not _cache_disabled:
++                if not _cache_disabled and not weight.requires_grad:
 +                    module._mxfp4_weight_cache = weightmat
          
          if fp8 or debug:
              # Configure quantizer
-@@ -443,8 +455,9 @@
+@@ -433,8 +450,7 @@
+                 ):
+                     # All-gather is not supported with FP8 column-wise data
+                     inputmat.update_usage(rowwise_usage=True, columnwise_usage=False)
+-                else:
+-                    # Discard row-wise data since it is not needed in backward pass
++                elif not isinstance(inputmat, MXFP4TensorBase):
+                     inputmat.update_usage(rowwise_usage=False, columnwise_usage=True)
+ 
+             # Cached input tensor
+@@ -443,8 +459,9 @@
                  saved_inputmat = inputmat
  
              # Weight with column-wise usage is needed for dgrad GEMM while keeping fp8 weight transpose cache.
@@ -61,7 +76,7 @@
                      weightmat.update_usage(columnwise_usage=True)
  
              if cpu_offloading and saved_inputmat is not None:
-@@ -494,6 +507,8 @@
+@@ -494,6 +511,8 @@
              ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
              ctx.is_mxfp4_enabled = is_mxfp4_enabled
              ctx.need_mxfp4_conversion = need_mxfp4_conversion
@@ -70,7 +85,7 @@
              if fuse_wgrad_accumulation and weight.requires_grad:
                  # This check is needed to ensure that main_grad is not created
                  # during the forward pass when using MCore FSDP as it creates
-@@ -787,6 +802,26 @@
+@@ -787,6 +806,26 @@
                  elif ctx.ub_bulk_wgrad:
                      gemm_out = ub_obj_wgrad.get_buffer(local_chunk=False)
  
@@ -97,7 +112,7 @@
                  # dgrad GEMM
                  # Note: dx = dy * w
                  nvtx_range_push(f"{nvtx_label}.dgrad_gemm")
-@@ -807,6 +842,10 @@
+@@ -807,6 +846,10 @@
                  )
                  nvtx_range_pop(f"{nvtx_label}.dgrad_gemm")
  
@@ -108,7 +123,7 @@
                  # Skip FP8 transpose cache operations for MXFP4 tensors
                  if ctx.fp8 and not ctx.keep_fp8_weight_transpose_cache:
                      if not isinstance(weight_fp8, MXFP4TensorBase):
-@@ -1614,40 +1653,46 @@
+@@ -1614,8 +1657,8 @@
          return out
  
      def _get_quantizers(self, fp8_output, fp8_grad):
@@ -119,74 +134,44 @@
          if not self.fp8:
              if is_mxfp4_enabled:
                  return [None] * 7  # 7 quantizers for MXFP4
-             return [None] * 7
-         
+@@ -1624,8 +1667,6 @@
          if is_mxfp4_enabled:
-+            # MXFP4 quantizers
              from ..tensor.mxfp4_tensor import MXFP4Quantizer
--
+ 
 -            # Backward (wgrad) needs columnwise FP4 data for input and grad_output.
 -            # _get_quantizers is called per-forward, so this reflects the current context.
--            needs_wgrad = torch.is_grad_enabled()
--
-+            
-+            # Input: used as A in fprop, B in wgrad - can't pre-shuffle
+             needs_wgrad = torch.is_grad_enabled()
+ 
              input_quantizer = MXFP4Quantizer(
-                 rowwise=True,
--                columnwise=needs_wgrad,
--                shuffle_B_matrix_for_aiter=False,
-+                columnwise=False,
-+                shuffle_B_matrix_for_aiter=False
+@@ -1635,7 +1676,7 @@
              )
-+            
-+            # Weight: always used as B (fprop and dgrad) - can pre-shuffle
              weight_quantizer = MXFP4Quantizer(
                  rowwise=True,
 -                columnwise=needs_wgrad,
--                shuffle_B_matrix_for_aiter=True,
 +                columnwise=True,
-+                shuffle_B_matrix_for_aiter=True
+                 shuffle_B_matrix_for_aiter=True,
              )
--            output_quantizer = None
--            grad_input_quantizer = None
--            grad_weight_quantizer = None
-+            
-+            output_quantizer = None  # MXFP4 doesn't use output quantizer
-+            
-+            grad_input_quantizer = None  # MXFP4 doesn't use grad_input quantizer
-+            grad_weight_quantizer = None  # MXFP4 doesn't use separate grad_weight quantizer
-+            
-+            # Grad output quantizer for standard path
-             grad_output_quantizer = MXFP4Quantizer(
-                 rowwise=True,
--                columnwise=needs_wgrad,
--            )
-+                columnwise=False
-+            )  # No shuffle for grad
-+            
-+            # Separate MXFP4 quantizer for grad_output (for mixed precision scenarios)
-             grad_output_quantizer_mxfp4 = MXFP4Quantizer(
-                 rowwise=True,
--                columnwise=needs_wgrad,
-+                columnwise=False
-             )
-             
-             return (
---- a/transformer_engine/pytorch/module/layernorm_linear.py	2026-03-30 21:51:56.220901232 -0500
-+++ b/transformer_engine/pytorch/module/layernorm_linear.py	2026-03-24 12:30:11.134713019 -0500
-@@ -83,6 +83,11 @@
+             output_quantizer = None
+--- a/transformer_engine/pytorch/module/layernorm_linear.py	2026-04-01 14:32:15.267822622 -0500
++++ b/transformer_engine/pytorch/module/layernorm_linear.py	2026-04-01 14:41:50.853787635 -0500
+@@ -83,6 +83,16 @@
      from ..triton_kernels.norms_common import te_layernorm_bwd_triton, te_rmsnorm_bwd_triton
  
  
 +def _is_mxfp4_enabled():
-+    from megatron.core.fp4_utils import is_mxfp4_phase
-+    return is_mxfp4_phase()
++    if os.environ.get('FP4', 'false').lower() not in ('true', '1', 'yes'):
++        return False
++    try:
++        from megatron.core.fp4_utils import is_mxfp4_phase
++        return is_mxfp4_phase()
++    except (ImportError, AttributeError):
++        return True
 +
 +
  __all__ = ["LayerNormLinear"]
  
  
-@@ -172,9 +177,8 @@
+@@ -172,9 +182,8 @@
          backward_needs_input = is_grad_enabled and weight_requires_grad
          with_input_all_gather = parallel_mode == "column" and sequence_parallel
  
@@ -198,7 +183,7 @@
          # Debug print for MXFP4 (rank 0 only)
          if is_mxfp4_enabled:
              debug_mxfp4 = os.environ.get('NVTE_MXFP4_DEBUG', '0').lower() in ['true', '1', 'yes']
-@@ -367,11 +371,19 @@
+@@ -367,11 +376,19 @@
              and not isinstance(weight, MXFP4TensorBase)
          )
          if need_mxfp4_conversion:
@@ -217,12 +202,12 @@
 +                    weightmat = weight_quantizer.quantize(high_prec_weight)
 +                else:
 +                    weightmat = high_prec_weight
-+                if not _cache_disabled:
++                if not _cache_disabled and not weight.requires_grad:
 +                    module._mxfp4_weight_cache = weightmat
          
          if fp8 or debug:
              quantized_weight = not isinstance(weight, QuantizedTensorBase)
-@@ -584,6 +596,7 @@
+@@ -584,6 +601,7 @@
              ctx.input_quantizer = input_quantizer
              ctx.is_mxfp4_enabled = is_mxfp4_enabled
              ctx.need_mxfp4_conversion = need_mxfp4_conversion
@@ -230,7 +215,7 @@
              ctx.input_quantizer_mxfp4 = input_quantizer_mxfp4
              ctx.owns_input = inputmat is not inp
              ctx.weight = weight
-@@ -851,6 +864,26 @@
+@@ -851,6 +869,26 @@
              elif ctx.ub_bulk_wgrad:
                  gemm_out = ub_obj_wgrad.get_buffer(local_chunk=False)
  
@@ -257,7 +242,7 @@
              # dgrad GEMM
              # Note: dx = dy * w
              nvtx_range_push(f"{nvtx_label}.dgrad_gemm")
-@@ -871,6 +904,10 @@
+@@ -871,6 +909,10 @@
              )
              nvtx_range_pop(f"{nvtx_label}.dgrad_gemm")
  
@@ -268,25 +253,7 @@
              # Skip FP8 transpose cache operations for MXFP4 tensors
              if ctx.fp8 and not ctx.keep_fp8_weight_transpose_cache:
                  if not isinstance(weight, MXFP4TensorBase):
-@@ -1730,7 +1767,7 @@
-                 grad_input_quantizer,
-                 grad_weight_quantizer,
-                 grad_output_quantizer,
--                grad_output_quantizer_mxfp4,
-+                grad_output_quantizer_mxfp4,  # ADDED for MXFP4
-             ) = quantizers
- 
-             if torch.is_grad_enabled():
-@@ -1757,7 +1794,7 @@
-                 grad_input_quantizer,
-                 grad_weight_quantizer,
-                 grad_output_quantizer,
--                grad_output_quantizer_mxfp4,
-+                grad_output_quantizer_mxfp4,  # ADDED for MXFP4
-                 is_cpu_offload_enabled(),
-                 self.tp_group,
-                 self.tp_size,
-@@ -1806,34 +1843,30 @@
+@@ -1806,10 +1848,9 @@
      def _get_quantizers(self, fp8_output, fp8_grad):
          if not self.fp8:
              return [None] * 7
@@ -300,48 +267,25 @@
          grad_input_quantizer = None
          grad_weight_quantizer = None
          grad_output_quantizer = None
-         output_quantizer = None
--        grad_output_quantizer_mxfp4 = None
-+        grad_output_quantizer_mxfp4 = None  # ADDED for MXFP4
- 
+@@ -1819,14 +1860,13 @@
          if is_mxfp4_enabled:
              from ..tensor.mxfp4_tensor import MXFP4Quantizer
--
+ 
 -            # Backward (wgrad) needs columnwise FP4 data for input and grad_output.
--            needs_wgrad = torch.is_grad_enabled()
--
+             needs_wgrad = torch.is_grad_enabled()
+ 
              input_quantizer = MXFP4Quantizer(
--                rowwise=True, columnwise=needs_wgrad, shuffle_B_matrix_for_aiter=False,
-+                rowwise=True, columnwise=False, shuffle_B_matrix_for_aiter=False
+                 rowwise=True, columnwise=needs_wgrad, shuffle_B_matrix_for_aiter=False,
              )
              weight_quantizer = MXFP4Quantizer(
 -                rowwise=True, columnwise=needs_wgrad, shuffle_B_matrix_for_aiter=True,
-+                rowwise=True, columnwise=True, shuffle_B_matrix_for_aiter=True
++                rowwise=True, columnwise=True, shuffle_B_matrix_for_aiter=True,
              )
              grad_output_quantizer = MXFP4Quantizer(
--                rowwise=True, columnwise=needs_wgrad,
-+                rowwise=True, columnwise=False
-             )
-             grad_output_quantizer_mxfp4 = MXFP4Quantizer(
--                rowwise=True, columnwise=needs_wgrad,
-+                rowwise=True, columnwise=False
-             )
-+            # For MXFP4, grad_weight_quantizer is not used
-             grad_weight_quantizer = None
-         else:
-             input_quantizer = self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_INPUT]
-@@ -1855,7 +1888,7 @@
-             grad_input_quantizer,
-             grad_weight_quantizer,
-             grad_output_quantizer,
--            grad_output_quantizer_mxfp4,
-+            grad_output_quantizer_mxfp4,  # ADDED for MXFP4
-         )
- 
-     def _get_debug_quantizers(self, fp8_output, fp8_grad):
---- a/transformer_engine/pytorch/module/fp4_handler_gemm.py	2026-03-30 21:51:56.220901232 -0500
-+++ b/transformer_engine/pytorch/module/fp4_handler_gemm.py	2026-03-24 12:30:11.134713019 -0500
-@@ -1,70 +1,65 @@
+                 rowwise=True, columnwise=needs_wgrad,
+--- a/transformer_engine/pytorch/module/fp4_handler_gemm.py	2026-04-01 14:32:15.267822622 -0500
++++ b/transformer_engine/pytorch/module/fp4_handler_gemm.py	2026-04-01 14:41:50.853787635 -0500
+@@ -1,158 +1,140 @@
  # Copyright (c) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
  # See LICENSE for license information.
  
@@ -448,7 +392,14 @@
  
  
  def fp4_gemm_layout(
-@@ -78,81 +73,68 @@
+     A,
+     B,
+     layout: str = "TN",
+-    out_dtype: torch.dtype = torch.bfloat16,
++    out_dtype=torch.bfloat16,
+     bias=None,
+     out=None,
+     grad: bool = False,
      accumulate: bool = False,
  ):
      """FP4 GEMM using layout notation (TN/NN/NT).

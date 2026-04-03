@@ -95,8 +95,10 @@ from aiter.jit.core import get_args_of_build, build_module; \
   for m in ('module_rope_general_fwd','module_rope_general_bwd','module_gemm_a4w4_asm')]; \
 print('AITER RoPE+FP4 GEMM pre-compiled OK')"
 
+# MXFP4 weight cache + lazy columnwise quant (LoRA: no wgrad for base weights)
 # AITER fused RoPE: dispatch to aiter.ops.rope when available
-RUN cd TransformerEngine && git apply /workspace/deps/patches/aiter_fused_rope.patch
+RUN cd TransformerEngine && git apply /workspace/deps/patches/mxfp4_te_modules.patch \
+    && git apply /workspace/deps/patches/aiter_fused_rope.patch
 
 # Uninstall bitsandbytes to remove NVIDIA related warnings
 RUN pip uninstall -y bitsandbytes mlperf-logging megatron-energon mlperf-common
@@ -105,21 +107,21 @@ RUN pip install megatron-energon==7.1.0
 RUN pip install git+https://github.com/mlcommons/logging.git@34903058ee63d3a7c3bcc1a6ca04e2aa5ed6af9c
 RUN pip install git+https://github.com/NVIDIA/mlperf-common.git@b86d175a05849d650a8ff69c1e2c37b9f4e61d51
 
-# AINIC driver (Pensando ionic NIC support for multi-node RDMA)
-ARG AINIC_BUNDLE=ainic_bundle_1.117.5-a-45.tar.gz
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        jq dpkg-dev kmod xz-utils ethtool iproute2 \
-        libibverbs-dev ibverbs-utils infiniband-diags && \
-    rm -rf /var/lib/apt/lists/*
-COPY ${AINIC_BUNDLE} /tmp/ainic_bundle.tar.gz
-RUN cd /tmp && \
-    tar zxf ainic_bundle.tar.gz && \
-    cd ainic_bundle_* && \
-    tar zxf host_sw_pkg.tar.gz && \
-    cd host_sw_pkg && \
-    ./install.sh --domain=user -y && \
-    cd / && rm -rf /tmp/ainic_bundle* /tmp/ainic_bundle.tar.gz
+# AINIC driver (Pensando ionic NIC support for multi-node RDMA, optional)
+# Dockerfile is always present, so COPY never fails even if the tarball is missing.
+COPY Dockerfile ainic_bundle*.tar.gz /tmp/ainic/
+RUN if ls /tmp/ainic/ainic_bundle*.tar.gz 1>/dev/null 2>&1; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            jq dpkg-dev kmod xz-utils ethtool iproute2 \
+            libibverbs-dev ibverbs-utils infiniband-diags && \
+        rm -rf /var/lib/apt/lists/* && \
+        cd /tmp/ainic && tar zxf ainic_bundle*.tar.gz && \
+        cd ainic_bundle_* && tar zxf host_sw_pkg.tar.gz && \
+        cd host_sw_pkg && ./install.sh --domain=user -y; \
+    else \
+        echo "AINIC bundle not found, skipping multi-node RDMA support"; \
+    fi && rm -rf /tmp/ainic
 
 WORKDIR /workspace/code
 

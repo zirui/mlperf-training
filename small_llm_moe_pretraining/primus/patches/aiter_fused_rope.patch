@@ -1,0 +1,223 @@
+--- a/transformer_engine/pytorch/attention/rope.py	2026-03-30 21:51:56.216901294 -0500
++++ b/transformer_engine/pytorch/attention/rope.py	2026-03-24 12:30:11.134713019 -0500
+@@ -1,16 +1,53 @@
+ # Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ #
+ # See LICENSE for license information.
++#
++# Patched rope.py — robust AITER fused RoPE integration for TE 2.8.
++# Replaces: transformer_engine/pytorch/attention/rope.py
++#
++# Changes vs upstream:
++#   1. Catch Exception (not just ImportError) so that failures inside
++#      aiter's heavy __init__.py are not silently swallowed.
++#   2. Log the actual error when AITER RoPE import fails.
++#   3. Honour NVTE_USE_AITER_ROPE=0|1 env-var (default 1 = enabled).
+ 
+ """
+ Rotary Position Embedding implementation of different types along with helper functions
+ """
+ from typing import Optional, Tuple, Union, List
++import os
++import warnings
+ import torch
+ 
+ import transformer_engine_torch as tex
+ from transformer_engine.pytorch.cpp_extensions.fused_attn import QKVFormat
+ 
++# ---------------------------------------------------------------------------
++# AITER fused RoPE import — broadened exception handling
++# ---------------------------------------------------------------------------
++_aiter_rope_fwd = None
++_aiter_rope_bwd = None
++_HAVE_AITER_ROPE = False
++_USE_AITER_ROPE = os.environ.get("NVTE_USE_AITER_ROPE", "1") == "1"
++
++if _USE_AITER_ROPE:
++    try:
++        from aiter.ops.rope import rope_fwd as _aiter_rope_fwd, rope_bwd as _aiter_rope_bwd
++        _HAVE_AITER_ROPE = True
++    except Exception as _aiter_import_err:
++        _HAVE_AITER_ROPE = False
++        warnings.warn(
++            f"[TE-RoPE] AITER fused RoPE import failed "
++            f"({type(_aiter_import_err).__name__}: {_aiter_import_err}). "
++            f"Falling back to TE native kernels. "
++            f"Set NVTE_USE_AITER_ROPE=0 to silence this warning."
++        )
++
++if _HAVE_AITER_ROPE:
++    print("[TE-RoPE] Using AITER fused RoPE kernels (aiter.ops.rope)")
++else:
++    reason = "disabled via NVTE_USE_AITER_ROPE=0" if not _USE_AITER_ROPE else "import failed"
++    print(f"[TE-RoPE] AITER RoPE not active ({reason}), using TE native kernels")
+ 
+ __all__ = ["RotaryPositionEmbedding", "apply_rotary_pos_emb", "apply_fused_qkv_rotary_pos_emb"]
+ 
+@@ -115,6 +152,18 @@
+     """
+ 
+     @staticmethod
++    def _can_use_aiter(tensor_format, interleaved, cu_seqlens, cp_size, start_positions):
++        """Check if we can dispatch to AITER's faster rope kernel."""
++        return (
++            _HAVE_AITER_ROPE
++            and tensor_format == "sbhd"
++            and not interleaved
++            and cu_seqlens is None
++            and cp_size == 1
++            and start_positions is None
++        )
++
++    @staticmethod
+     def forward(
+         ctx,
+         t: torch.Tensor,
+@@ -135,21 +184,35 @@
+             "bshd",
+             "thd",
+         ), f"Unsupported tensor_format: {tensor_format}."
+-        output = tex.fused_rope_forward(
+-            t,
+-            freqs,
+-            start_positions,
+-            QKVFormat[tensor_format],
+-            interleaved,
+-            cu_seqlens,
+-            cp_size,
+-            cp_rank,
++
++        use_aiter = FusedRoPEFunc._can_use_aiter(
++            tensor_format, interleaved, cu_seqlens, cp_size, start_positions
+         )
++
++        if use_aiter:
++            rotate_style = 1 if interleaved else 0
++            output = _aiter_rope_fwd(
++                t, freqs, rotate_style,
++                False,  # reuse_freqs_front_part: False since TE freqs are already doubled
++                False,  # nope_first
++            )
++        else:
++            output = tex.fused_rope_forward(
++                t,
++                freqs,
++                start_positions,
++                QKVFormat[tensor_format],
++                interleaved,
++                cu_seqlens,
++                cp_size,
++                cp_rank,
++            )
+         ctx.save_for_backward(freqs, cu_seqlens)
+         ctx.tensor_format = tensor_format
+         ctx.cp_size = cp_size
+         ctx.cp_rank = cp_rank
+         ctx.interleaved = interleaved
++        ctx.use_aiter = use_aiter
+ 
+         return output
+ 
+@@ -157,15 +220,24 @@
+     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
+         """Fused RoPE backward."""
+         freqs, cu_seqlens = ctx.saved_tensors
+-        grad_input = tex.fused_rope_backward(
+-            grad_output,
+-            freqs,
+-            QKVFormat[ctx.tensor_format],
+-            ctx.interleaved,
+-            cu_seqlens,
+-            ctx.cp_size,
+-            ctx.cp_rank,
+-        )
++
++        if ctx.use_aiter:
++            rotate_style = 1 if ctx.interleaved else 0
++            grad_input = _aiter_rope_bwd(
++                grad_output, freqs, rotate_style,
++                False,  # reuse_freqs_front_part
++                False,  # nope_first
++            )
++        else:
++            grad_input = tex.fused_rope_backward(
++                grad_output,
++                freqs,
++                QKVFormat[ctx.tensor_format],
++                ctx.interleaved,
++                cu_seqlens,
++                ctx.cp_size,
++                ctx.cp_rank,
++            )
+ 
+         return grad_input, None, None, None, None, None, None, None
+ 
+@@ -301,22 +373,14 @@
+     max_seq_len = freqs.shape[0]
+     cur_seq_len = t.shape[1] if tensor_format == "bshd" else t.shape[0]
+ 
+-    # In case `start_positions` are provided, create a staggered `freqs` tensor
+-    # offset by the values in `start_positions`.
+-    # `start_positions` is only supported for `cp_size=1` and inference.
+     if start_positions is not None:
+         max_offset = torch.max(start_positions)
+         assert (
+             max_offset + cur_seq_len <= max_seq_len
+         ), f"Rotary Embeddings only suppported up to {max_seq_len} sequence length!"
+ 
+-        # Stack staggered rope embeddings along the batch dimension
+         freqs = torch.concatenate([freqs[i : i + cur_seq_len] for i in start_positions], dim=1)
+ 
+-        # Note that from this point, `freqs` has a shape `(s,b,1,d)`.
+-
+-    # Only apply the rotary embeddings up to the sequence length of the running
+-    # input.
+     assert (
+         cur_seq_len <= max_seq_len
+     ), f"Rotary Embeddings only supported up to {max_seq_len} sequence length!"
+@@ -326,16 +390,12 @@
+     # [seq, b, 1, dim] -> [b, seq, 1, dim]
+     if tensor_format == "bshd":
+         freqs = freqs.transpose(0, 1)
+-    # cos/sin first then dtype conversion for better precision
+     cos_ = torch.cos(freqs).to(t.dtype)
+     sin_ = torch.sin(freqs).to(t.dtype)
+ 
+     rot_dim = freqs.shape[-1]
+-    # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
+     t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+ 
+-    # first part is cosine component
+-    # second part is sine component, need to change signs with _rotate_half method
+     t = (t * cos_) + (_rotate_half(t, interleaved) * sin_)
+     return torch.cat((t, t_pass), dim=-1)
+ 
+@@ -420,7 +480,6 @@
+         Context parallel rank. Only valid when `tensor_format` is 'thd' and `fused` is True.
+     """
+ 
+-    # `start_positions` is only supported for `cp_size=1` and inference.
+     assert not (
+         cp_size > 1 and start_positions is not None
+     ), """start_positions != None with CP SIZE > 1 is not supported!"""
+@@ -439,12 +498,6 @@
+         cu_seqlens = cu_seqlens // cp_size
+         seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+ 
+-        # The following code essentially splits the `thd` tensor into corresponding
+-        # `s1hd` tensors (for each sequence) and applies rotary embedding to
+-        # those sequences individually.
+-        # Note that if `start_positions` is not `None`, then for each sequence,
+-        # it's corresponding rope offset is also supplied from `start_positions`
+-        # individually.
+         return torch.cat(
+             [
+                 _apply_rotary_pos_emb_base(
+@@ -534,7 +587,6 @@
+         Context parallel rank.
+     """
+ 
+-    # `start_positions` is only supported for `cp_size=1` and inference.
+     assert not (
+         cp_size > 1 and start_positions is not None
+     ), """start_positions != None with CP SIZE > 1 is not supported!"""
