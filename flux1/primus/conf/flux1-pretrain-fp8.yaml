@@ -1,0 +1,127 @@
+# =============================================================================
+# Flux1 Primus Training Configuration (MI355X, 1x8 GPUs)
+#
+# This is the single source of truth for all training parameters.
+# Loaded at runtime by src/train.py via src/config_loader.py.
+# Values use ${VAR:default} syntax — environment variables override defaults.
+# =============================================================================
+
+work_group: ${TEAM:amd}
+user_name: ${USER:root}
+exp_name: ${EXP_NAME:flux1_primus}
+workspace: ./output
+
+modules:
+  diffusion_trainer:
+    framework: megatron
+    config: diffusion_trainer.yaml
+
+    model: flux_schnell.yaml
+    overrides:
+
+      # Flux architecture
+      num_joint_layers: ${NUM_JOINT_LAYERS:19}
+      num_single_layers: ${NUM_SINGLE_LAYERS:38}
+      hidden_size: ${HIDDEN_SIZE:3072}
+      num_attention_heads: ${NUM_ATTENTION_HEADS:24}
+      in_channels: ${IN_CHANNELS:64}
+      context_dim: ${CONTEXT_DIM:4096}
+      model_channels: ${MODEL_CHANNELS:256}
+      vec_in_dim: ${VEC_IN_DIM:768}
+      guidance_embed: ${GUIDANCE_EMBED:false}
+
+      # mixed-precision
+      attention_softmax_in_fp32: false
+
+      # log
+      wandb_project: "Primus_Flux1"
+      stderr_sink_level: DEBUG
+      log_interval: ${LOG_INTERVAL:10}
+
+      # profile
+      profile: false
+      use_pytorch_profiler: false
+      profile_step_end: 7
+      profile_step_start: 6
+
+      # FP8 training
+      fp8: ${FP8:hybrid}
+      fp8_recipe: ${FP8_RECIPE:delayed}
+      fp8_margin: ${FP8_MARGIN:0}
+      fp8_amax_history_len: ${FP8_AMAX_HISTORY_LEN:1024}
+      fp8_amax_compute_algo: ${FP8_AMAX_COMPUTE_ALGO:max}
+
+      # hyper parameters
+      train_iters: ${MAX_STEPS:20000}
+      micro_batch_size: ${MBS:64}
+      global_batch_size: ${BATCHSIZE:512}
+      seed: ${SEED:1234}
+      lr: ${LEARNING_RATE:0.0002}
+      lr_warmup_iters: ${WARMUP_STEPS:1600}
+      lr_decay_style: constant
+      weight_decay: ${WEIGHT_DECAY:0.1}
+      optimizer: adam
+      use_distributed_optimizer: true
+      adam_beta1: 0.9
+      adam_beta2: 0.95
+      adam_eps: 1.0e-8
+      clip_grad: 1.0
+
+      # Dropout (disabled except CFG dropout handled in forward step)
+      hidden_dropout: 0.0
+      attention_dropout: 0.0
+
+      # parallel
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      ddp_bucket_size: 256000000
+
+      # data
+      mock_data: false
+      data_path: ${DATA_PATH:/dataset/energon}
+      empty_encodings_path: ${EMPTY_ENCODINGS_PATH:/dataset/energon/empty_encodings}
+      classifier_free_guidance_prob: ${CFG_PROB:0.1}
+      dataloader_type: cyclic
+
+      # fusion
+      gradient_accumulation_fusion: false
+      apply_rope_fusion: true
+
+      # activation checkpointing
+      activation_checkpointing: ${ACTIVATION_CHECKPOINTING:true}
+      checkpoint_every_n: ${CHECKPOINT_EVERY_N:3}
+
+      # CPU offloading
+      cpu_offloading: ${CPU_OFFLOADING:true}
+      cpu_offloading_activations: ${CPU_OFFLOADING:true}
+      cpu_offloading_weights: false
+
+      # CUDA graph
+      use_cuda_graph: ${USE_CUDA_GRAPH:false}
+
+      # ckpt
+      finetune: false
+      auto_continue_train: false
+      load: ${CKPT_PATH:null}
+      save: null
+      save_interval: 100000
+      disable_last_saving: true
+      exit_on_missing_checkpoint: false
+      ckpt_format: torch
+
+      # evaluation
+      eval_iters: ${EVAL_ITERS:64}
+      eval_interval: ${EVAL_INTERVAL:512}
+      target_val_loss: ${TARGET_ACCURACY:0.586}
+
+      # NaN detection
+      nan_detect: ${NAN_DETECT:1}
+      nan_detect_steps: ${NAN_DETECT_STEPS:50}
+
+      # Turbo features disabled
+      enable_primus_turbo: false
+      use_turbo_attention: false
+      use_turbo_grouped_mlp: false
+      turbo_sync_free_moe_stage: 0
