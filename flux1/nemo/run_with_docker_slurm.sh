@@ -1,5 +1,13 @@
 set -euxo pipefail
 
+# Use sudo for docker if current user doesn't have direct access
+if docker info >/dev/null 2>&1; then
+    DOCKER="docker"
+else
+    echo "Docker not accessible directly, using sudo docker"
+    DOCKER="sudo docker"
+fi
+
 # ======= Change to model dir  =======
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 cd $SCRIPT_DIR
@@ -11,7 +19,7 @@ cd $SCRIPT_DIR
 : "${LOGDIR:?LOGDIR not set}"
 
 # ======= Vars with defaults ========
-: "${NEXP:=1}"
+: "${NEXP:=10}"
 : "${CLEAR_CACHES:=1}"
 : "${CONT_NAME:=mlperf_flux1}"
 : "${LOG_FREQ:=0}"
@@ -58,7 +66,7 @@ _cont_mounts=(
 )
 
 echo "Stopping all existing containers ..."
-docker ps -q | xargs -r docker stop
+${DOCKER} ps -q | xargs -r ${DOCKER} stop
 
 # Get list of envvars to pass to docker
 mapfile -t _config_env < <(env -i bash -c ". ${_config_file} && compgen -e" | grep -E -v '^(PWD|SHLVL)')
@@ -74,20 +82,21 @@ mapfile -t _sbatch_env < <(
     rm -f /tmp/sbatch_exports.sh
 )
 
-# Combine and convert to Docker format
-mapfile -t _all_env < <(
-    printf '%s\n' "${_config_env[@]}" "${_sbatch_env[@]}" |
-    while read -r v; do echo "--env=$v"; done
-)
+# Combine and convert to Docker format with explicit values
+# (sudo strips the environment, so --env=NAME alone won't work)
+_all_env=()
+for v in "${_config_env[@]}" "${_sbatch_env[@]}"; do
+    _all_env+=("--env=$v=${!v}")
+done
 
 # =============== Cleanup function for Docker container ================
 cleanup_docker() {
-    docker container rm -f "${_cont_name}" || true
+    ${DOCKER} container rm -f "${_cont_name}" || true
 }
 cleanup_docker
 trap 'set -eux; cleanup_docker' EXIT
 
-docker run --rm --init --detach \
+${DOCKER} run --rm --init --detach \
       --net=host --uts=host \
       --ipc=host \
       --device /dev/dri \
@@ -111,14 +120,14 @@ if [[ $RUNTIME_TUNABLES == 1 ]]; then
   bash runtime_tunables.sh
 fi
 
-docker exec "${_cont_name}" true
+${DOCKER} exec "${_cont_name}" true
 
-# =============== Check for InfiniBand/RDMA devices in container ============
-echo "=== Checking for InfiniBand/RDMA devices in container ==="
-docker exec "${_cont_name}" bash -c "rdma link show 2>&1 || echo 'rdma link show: No InfiniBand devices found'" || true
-docker exec "${_cont_name}" bash -c "ibstat 2>&1 || echo 'ibstat: Command not found or no InfiniBand devices'" || true
-docker exec "${_cont_name}" bash -c "ls -la /dev/infiniband/ 2>&1 || echo 'No /dev/infiniband directory found'" || true
-docker exec "${_cont_name}" bash -c "ip link show | grep -i ib || echo 'No InfiniBand interfaces found'" || true
+# # =============== Check for InfiniBand/RDMA devices in container ============
+# echo "=== Checking for InfiniBand/RDMA devices in container ==="
+# ${DOCKER} exec "${_cont_name}" bash -c "rdma link show 2>&1 || echo 'rdma link show: No InfiniBand devices found'" || true
+# ${DOCKER} exec "${_cont_name}" bash -c "ibstat 2>&1 || echo 'ibstat: Command not found or no InfiniBand devices'" || true
+# ${DOCKER} exec "${_cont_name}" bash -c "ls -la /dev/infiniband/ 2>&1 || echo 'No /dev/infiniband directory found'" || true
+# ${DOCKER} exec "${_cont_name}" bash -c "ip link show | grep -i ib || echo 'No InfiniBand interfaces found'" || true
 
 # =============== Set up environment variables for NCCL and GLOO ============
 export NCCL_SOCKET_IFNAME=$(route | grep '^default' | grep -o '[^ ]*$')
@@ -133,21 +142,20 @@ echo "SLURM_NNODES: $SLURM_NNODES"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
 
 # =============== Run experiments  ================
-for _experiment_index in $(seq 0 $((NEXP-1))); do
+for _experiment_index in $(seq 1 $NEXP); do
 {
   echo "Beginning trial ${_experiment_index} of ${NEXP}"
   if [[ $CLEAR_CACHES == 1 ]]; then
     bash -c "echo -n 'Clearing cache on ' && hostname && sync && sudo /sbin/sysctl vm.drop_caches=3"
-    docker exec ${_cont_name} python -c "
+    ${DOCKER} exec ${_cont_name} python -c "
 from mlperf_logging import mllog
 mllogger = mllog.get_mllogger()
 mllogger.event(key=mllog.constants.CACHE_CLEAR, value=True)"
   fi
 
   export SEED=$(($ROOT_SEED - 1 + 10#$_experiment_index))
-  _all_env+=(--env=SEED=$SEED)
-  echo 'launching experiment using:' ${_all_env[@]} ${_cont_name} ./run_and_time.sh
-  docker exec \
+  echo 'launching experiment using:' ${_all_env[@]} --env=SEED=$SEED ${_cont_name} ./run_and_time.sh
+  ${DOCKER} exec \
     -e MASTER_ADDR=$MASTER_ADDR \
     -e MASTER_PORT=$MASTER_PORT \
     -e SLURM_NNODES=$SLURM_NNODES \
@@ -155,6 +163,7 @@ mllogger.event(key=mllog.constants.CACHE_CLEAR, value=True)"
     -e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME \
     -e GLOO_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME \
     ${_all_env[@]} \
+    --env=SEED=$SEED \
     ${_cont_name} \
     bash ./run_and_time.sh
 }

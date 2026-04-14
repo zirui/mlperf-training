@@ -10,7 +10,7 @@ export EXP_NAME=${EXP_NAME:-flux-train-$(date +%y%m%d%H%M%S%N)}
 # Validation interval in samples
 export VAL_CHECK_INTERVAL=${VAL_CHECK_INTERVAL:-262144}
 
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export GRAD_REDUCE_IN_FP32=${GRAD_REDUCE_IN_FP32:-False}
 

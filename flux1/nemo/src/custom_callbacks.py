@@ -34,14 +34,11 @@ class ThroughputTimer:
         self.stop_time = None
         self.elapsed_time = 0
 
-        self.start_global_time = None
         self.samples = 0
         self.gbs = gbs
 
     def start(self):
         self.start_time = time.time()
-        if self.start_global_time is None:
-            self.start_global_time = self.start_time
 
     def stop(self):
         if self.start_time is None:
@@ -56,14 +53,6 @@ class ThroughputTimer:
         # Currently throughput tracks entire training run (excluding validation)
         # For throughput of each batch, zero out elapsed time and gbs
         return self.samples / self.elapsed_time
-
-    def compute_combined_throughput(self):
-        if self.start_global_time is None:
-            return 0
-        # Combined throughput tracks entire training run (including validation time)
-        # For combined throughput of each batch, zero out elapsed time and gbs
-        total_elapsed_time = time.time() - self.start_global_time
-        return self.samples / total_elapsed_time
 
 
 class CustomCallback(LoggingCallback):
@@ -92,6 +81,9 @@ class CustomCallback(LoggingCallback):
             self.rpd = rpdTracerControl()
 
         self.timer_obj = ThroughputTimer(self.gbs)
+
+        # Timer set in on_train_batch_start to exclude warmup from reported TTT
+        self.train_start_time = None
 
     def __deepcopy__(self, memo):
         return CustomCallback(self.cfg)
@@ -142,6 +134,8 @@ class CustomCallback(LoggingCallback):
         super().on_train_start(trainer, pl_module)
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        if self.train_start_time is None:
+            self.train_start_time = time.time()
         self.timer_obj.start()
         if self.profiler == 'rpd':
             if self.rpd and not self.rpd_running and trainer.global_step >= self.profiler_warmup_steps:
@@ -193,34 +187,26 @@ class CustomCallback(LoggingCallback):
             self.rpd.stop()
             self.rpd = None
             self.rpd_running = False
-        return super().on_train_end(trainer, pl_module)
+
+        super().on_train_end(trainer, pl_module)
+
+        if self.train_start_time is not None and trainer.global_rank == 0:
+            duration_minutes = (time.time() - self.train_start_time) / 60.0
+            self.mllogger.event(
+                key="time_to_train_minutes",
+                value=duration_minutes,
+            )
 
     def on_validation_start(self, trainer, pl_module):
         if trainer.global_step > 0:
             self.log_throughput(trainer.global_step)
         return super().on_validation_start(trainer, pl_module)
 
-    def on_validation_end(self, trainer, pl_module):
-        if trainer.global_step > 0:
-            self.log_combined_throughput(trainer.global_step)
-        return super().on_validation_end(trainer, pl_module)
-
     def log_throughput(self, global_step):
         throughput = self.timer_obj.compute_throughput()
         self.mllogger.event(
             key="throughput",
             value=throughput,
-            metadata={
-                self.mllogger.constants.SAMPLES_COUNT: global_step * self.gbs,
-                "step": global_step,
-            },
-        )
-
-    def log_combined_throughput(self, global_step):
-        combined_throughput = self.timer_obj.compute_combined_throughput()
-        self.mllogger.event(
-            key="combined_throughput",
-            value=combined_throughput,
             metadata={
                 self.mllogger.constants.SAMPLES_COUNT: global_step * self.gbs,
                 "step": global_step,

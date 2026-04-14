@@ -2,11 +2,12 @@
 source $(dirname ${BASH_SOURCE[0]})/config_common.sh
 
 export MAX_STEPS=${MAX_STEPS:--1}
-export WARMUP_STEPS=${WARMUP_STEPS:-800}
 
-export BATCHSIZE=1024
-export LEARNING_RATE=${LEARNING_RATE:-"0.00023"}
-export MBS=32
+# MBS and GBS-dependent hyperparams (BATCHSIZE, LEARNING_RATE, WARMUP_STEPS)
+export MBS=${MBS:-32}
+export BATCHSIZE=${BATCHSIZE:-1024}
+source $(dirname ${BASH_SOURCE[0]})/config_gbs${BATCHSIZE}.sh
+
 export FP8_RECIPE="delayed"  # mxfp8 currently not working on AMD GPU
 # System parameters
 export DGXNNODES=4
@@ -50,4 +51,6 @@ export RCCL_STREAM_PRIORITY=1
 export WALLTIME_RUNANDTIME=200
 export WALLTIME=$((5 + ${NEXP:-1} * ($WALLTIME_RUNANDTIME + 5)))
 
-export USE_CUDA_GRAPH=False
+export CUDA_GRAPH_IMPL=local
+export CPU_OFFLOADING=False
+export CPU_OFFLOADING_ACTIVATIONS=False

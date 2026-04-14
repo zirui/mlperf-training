@@ -74,7 +74,7 @@ mllogger.event(key=mllog.constants.CACHE_CLEAR, value=True)"
     fi
     _config_env+=(--env=SEED=$RANDOM) # Reset random seed
     docker exec ${_config_env[@]} --env=HYDRA_FULL_ERROR ${_cont_name} ./run_and_time.sh
-  ) | grep --line-buffered -v "connected peer ranks" | tee "${_logfile_base}_${_experiment_index}.log"
+  ) | grep --line-buffered -v "connected peer ranks" | grep --line-buffered -v "Warning: Latency not found" | tee "${_logfile_base}_${_experiment_index}.log"
 
 done
 
