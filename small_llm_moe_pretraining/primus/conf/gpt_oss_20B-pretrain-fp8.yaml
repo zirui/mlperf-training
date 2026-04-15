@@ -43,10 +43,10 @@ modules:
       # log_avg_reset_interval: 50
 
       # profile
-      profile: false
+      profile: ${PRIMUS_PROFILE:false}
       use_pytorch_profiler: true
-      profile_step_end: 32
-      profile_step_start: 16
+      profile_step_end: ${PRIMUS_PROFILE_STEP_END:32}
+      profile_step_start: ${PRIMUS_PROFILE_STEP_START:16}
       
       # enable fp8 training
       fp8: hybrid  # E4M3 for activations/weights, E5M2 for gradients
@@ -97,7 +97,7 @@ modules:
       moe_permute_fusion: true
       gradient_accumulation_fusion: true
       moe_use_legacy_grouped_gemm: true # Sync-Free MoE stage 2 or 3 require PrimusTurboGroupedMLP, please set `moe_use_legacy_grouped_gemm=True
-      moe_use_fused_router_with_aux_score: true
+      moe_use_fused_router_with_aux_score: false
       multi_latent_attention: false # Flag config.ENABLE_EXPERIMENTAL not enabled
       apply_rope_fusion: true
 
@@ -115,12 +115,12 @@ modules:
       moe_apply_probs_on_input: false
       moe_aux_loss_coeff: 0.0 #0.9
       moe_deepep_num_sms: 20
-      moe_enable_deepep: true
+      moe_enable_deepep: false
       moe_expert_capacity_factor: null
       moe_extended_tp: false
       moe_ffn_hidden_size: 2880
       moe_flex_dispatcher_backend: deepep
-      moe_grouped_gemm: false
+      moe_grouped_gemm: true
       moe_hybridep_num_sms: 16
       moe_input_jitter_eps: null
       moe_latent_size: null
@@ -146,7 +146,7 @@ modules:
       moe_shared_expert_gate: false
       moe_shared_expert_intermediate_size: null
       moe_shared_expert_overlap: false
-      moe_token_dispatcher_type: flex # flex or alltoall
+      moe_token_dispatcher_type: alltoall
       moe_token_drop_policy: probs
       moe_token_dropping: false
       moe_z_loss_coeff: null
@@ -167,26 +167,26 @@ modules:
       eval_iters: 64  # 64 iters × 2 MBS × 8 GPUs = 1024 eval samples
       eval_interval: ${PRIMUS_EVAL_INTERVAL:768}
 
-      # Turbo (use_turbo_attention: false required for sliding window — turbo attention does not support it)
+      # Turbo
       enable_primus_turbo: true
-      use_turbo_attention: false # turbo attention does not support sliding window
-      use_turbo_grouped_mlp: true
+      use_turbo_attention: false
+      use_turbo_grouped_mlp: false
 
       # deepep
-      use_turbo_deepep: true
+      use_turbo_deepep: false
 
       # 64 or 80 for ep8, 32 for ep16-64 is best practice
-      turbo_deepep_num_cu: 80
+      turbo_deepep_num_cu: 64
       turbo_deepep_use_comm_stream: false
 
       # sync-free moe support stage 0-3, 0 means not use sync-free moe
       # stage 3 is completely no gpu-cpu sync in MoE, but cost more memory
       # stage 2 is recommended for better performance
-      turbo_sync_free_moe_stage: 2
+      turbo_sync_free_moe_stage: 0
 
       # Cross entropy flags
-      # cross_entropy_fusion_impl: "te"
-      # cross_entropy_loss_fusion: true
+      cross_entropy_fusion_impl: "te"
+      cross_entropy_loss_fusion: true
 
       # tensorboard logging, set 'disable_tensorboard: false' to enable tensorboard logging
       disable_tensorboard: true
