@@ -44,7 +44,7 @@ modules:
 
       # profile
       profile: ${PRIMUS_PROFILE:false}
-      use_pytorch_profiler: true
+      use_pytorch_profiler: ${PRIMUS_PROFILE:false}
       profile_step_end: ${PRIMUS_PROFILE_STEP_END:32}
       profile_step_start: ${PRIMUS_PROFILE_STEP_START:16}
       
@@ -52,6 +52,7 @@ modules:
       fp8: hybrid  # E4M3 for activations/weights, E5M2 for gradients
       fp8_recipe: delayed  # delayed for TE layers; MoE experts use blockwise FP8 internally
       clip_grad: 1.0  # Gradient clipping (already default, but explicit)
+      check_for_nan_in_loss_and_grad: false
       
       # hyper parameters
       train_iters: ${PRIMUS_TRAIN_ITERS:1200000}
@@ -86,6 +87,7 @@ modules:
       expert_model_parallel_size: ${PRIMUS_EP:8}
       overlap_grad_reduce: true
       overlap_param_gather: true
+      ddp_num_buckets: 8
 
       # data
       mock_data: false
@@ -164,13 +166,13 @@ modules:
       disable_last_saving: true
       exit_on_missing_checkpoint: false
       ckpt_format: torch
-      eval_iters: 64  # 64 iters × 2 MBS × 8 GPUs = 1024 eval samples
+      eval_iters: ${EVAL_ITERS:64}  # eval_samples = eval_iters * GBS = 1024; set EVAL_ITERS in config shell (1024/GBS).
       eval_interval: ${PRIMUS_EVAL_INTERVAL:768}
 
       # Turbo
       enable_primus_turbo: true
       use_turbo_attention: false
-      use_turbo_grouped_mlp: false
+      use_turbo_grouped_mlp: true
 
       # deepep
       use_turbo_deepep: false

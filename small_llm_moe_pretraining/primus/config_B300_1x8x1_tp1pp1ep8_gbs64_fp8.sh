@@ -15,6 +15,7 @@ export MODEL=/model
 
 export PRIMUS_MICRO_BATCH_SIZE=2
 export PRIMUS_GLOBAL_BATCH_SIZE=64
+export EVAL_ITERS=$((1024 / PRIMUS_GLOBAL_BATCH_SIZE))  # MLPerf closed: eval_iters * GBS = 1024 eval samples
 export PRIMUS_LR=1.0e-3
 export PRIMUS_MIN_LR=1.0e-4 # Set to 10% of max LR
 export PRIMUS_TRAIN_ITERS=1200000

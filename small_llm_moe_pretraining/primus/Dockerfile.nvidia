@@ -36,7 +36,7 @@ ENV PYTHONPATH="/workspace/deps/Primus:/workspace/deps/Primus/third_party/Megatr
 WORKDIR /workspace/code
 COPY . .
 
-ARG MLPERF_PAT
-RUN pip install git+https://x-access-token:${MLPERF_PAT}@github.com/AMD-MLPerf/primus-mllog.git@gyuzakor/rpd
+COPY primus_mllog-0.1.9-py3-none-any.whl /tmp/primus_mllog-0.1.9-py3-none-any.whl
+RUN pip install /tmp/primus_mllog-0.1.9-py3-none-any.whl && rm /tmp/primus_mllog-0.1.9-py3-none-any.whl
 
 RUN pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@v1.1.4

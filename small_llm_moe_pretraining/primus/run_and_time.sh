@@ -7,6 +7,9 @@ mkdir -p /results
 
 cd /workspace/code
 
+echo "Applying runtime patches..."
+python3 /workspace/code/patches/triton_fp8_hybrid_dtypes.py
+
 echo "============================================"
 echo "MLPerf GPT-OSS-20B Training"
 echo "============================================"

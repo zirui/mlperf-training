@@ -27,6 +27,7 @@ export MODEL=/model
 # -----------------------------------------------------------------------------
 export PRIMUS_MICRO_BATCH_SIZE=2
 export PRIMUS_GLOBAL_BATCH_SIZE=64
+export EVAL_ITERS=$((1024 / PRIMUS_GLOBAL_BATCH_SIZE))  # MLPerf closed: eval_iters * GBS = 1024 eval samples
 export PRIMUS_LR=1.0e-3
 export PRIMUS_MIN_LR=1.0e-4 # Set to 10% of max LR
 export PRIMUS_TRAIN_ITERS=1200000
@@ -59,6 +60,7 @@ export HSA_FORCE_FINE_GRAIN_PCIE=1
 export HSA_KERNARG_POOL_SIZE=12582912
 export TORCH_NCCL_HIGH_PRIORITY=1
 export ENABLE_NUMA_BINDING=1
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 # -----------------------------------------------------------------------------
 # NVTE — FP8 & Cast Transpose
@@ -92,7 +94,8 @@ export NVTE_FMHA_BACKEND_SWA_BWD=ck       # SWA bwd:   ck | aotriton (no ck_v3 s
 # -----------------------------------------------------------------------------
 # MLPerf Logging
 # -----------------------------------------------------------------------------
-export MLLOG_TRAIN_LOSS_LOG_FREQ=32
+export LOG_INTERVAL=999999
+export MLLOG_TRAIN_LOSS_LOG_FREQ=0
 export MLLOG_TARGET_EVAL_LOSS=3.34
 export MLLOG_OUTPUT_FILE=/results/mlperf_output.log
 export MLLOG_SAVE_TO_FILE=0
@@ -100,3 +103,8 @@ export MLLOG_SUBMISSION_BENCHMARK=gpt_oss_20b
 export MLLOG_SUBMISSION_DIVISION=closed
 export MLLOG_SUBMISSION_ORG=AMD
 export MLLOG_SUBMISSION_PLATFORM=MI355X
+
+# -----------------------------------------------------------------------------
+# Synthetic Warmup (kernel pre-compilation)
+# -----------------------------------------------------------------------------
+export SYNTH_WARMUP_STEPS=3

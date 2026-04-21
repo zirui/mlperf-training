@@ -100,10 +100,11 @@ diff --git a/transformer_engine/pytorch/attention/dot_product_attention/backends
  
  class FP8EmulationFunc(torch.autograd.Function):
      """
-@@ -1153,6 +1245,13 @@
+@@ -1153,6 +1245,14 @@
          is_input_fp8 = isinstance(q, Float8Tensor)
          is_output_fp8 = fp8_output
  
++
 +        # --- FMHA backend override (SWA vs Dense) ---
 +        _is_swa = _is_swa_window(window_size)
 +        _bk_ov, _v3_ov = _get_fmha_override(_is_swa, is_fwd=True)

@@ -165,7 +165,7 @@ modules:
       disable_last_saving: true
       exit_on_missing_checkpoint: false
       ckpt_format: torch
-      eval_iters: 64  # 64 iters × 2 MBS × 8 GPUs = 1024 eval samples
+      eval_iters: ${EVAL_ITERS:64}  # eval_samples = eval_iters * GBS = 1024; set EVAL_ITERS in config shell (1024/GBS).
       eval_interval: ${PRIMUS_EVAL_INTERVAL:768}
 
       # Turbo features disabled for NVIDIA

@@ -19,7 +19,7 @@ RUN pip uninstall amd-aiter aiter -y 2>/dev/null || true && \
 # Transformer Engine
 RUN pip uninstall transformer-engine transformer_engine -y 2>/dev/null || true
 
-ARG TE_COMMIT=2aa87bf4e30917b69ff1ca33e7f71c4bf735ce3a
+ARG TE_COMMIT=575447c5b424489b58870110b63bbacc4dff5c21
 RUN git clone --recursive https://github.com/ROCm/TransformerEngine.git \
     && cd TransformerEngine && git checkout ${TE_COMMIT} \
     && git submodule sync \
@@ -58,5 +58,13 @@ RUN pip install -r requirements.txt
 # Copy the current state of the code inside the image
 COPY . .
 
-COPY primus_mllog-0.1.1-py3-none-any.whl /tmp/primus_mllog-0.1.1-py3-none-any.whl
-RUN pip install /tmp/primus_mllog-0.1.1-py3-none-any.whl && rm /tmp/primus_mllog-0.1.1-py3-none-any.whl
+COPY primus_mllog-0.1.9-py3-none-any.whl /tmp/primus_mllog-0.1.9-py3-none-any.whl
+RUN pip install /tmp/primus_mllog-0.1.9-py3-none-any.whl && rm /tmp/primus_mllog-0.1.9-py3-none-any.whl
+
+# Primus PR #670: update triton permutation (feat/te/update_permutation)
+COPY patches/primus_te_permutation/permutation.py \
+     /workspace/Primus/primus/backends/transformer_engine/pytorch/permutation.py
+COPY patches/primus_te_permutation/triton/permutation.py \
+     /workspace/Primus/primus/backends/transformer_engine/pytorch/triton/permutation.py
+COPY patches/primus_te_permutation/common/triton/permutation.py \
+     /workspace/Primus/primus/backends/transformer_engine/pytorch/common/triton/permutation.py
