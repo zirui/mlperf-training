@@ -14,7 +14,8 @@
 
 from itertools import repeat
 import logging
-from typing import Dict, Optional, Tuple
+import os
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -46,10 +47,65 @@ from custom_weight_inits import (
 logger = logging.getLogger(__name__)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _maybe_cudagraph_mark_step_begin():
+    if not _env_flag("COMPILE_DIT", False):
+        return
+    if not _env_flag("COMPILE_DIT_MARK_STEP", True):
+        return
+    if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+        torch.compiler.cudagraph_mark_step_begin()
+
+
+def _rank_zero() -> bool:
+    return int(os.getenv("RANK", "0")) == 0
+
+
+def _configure_compile_debugging() -> Dict[str, str]:
+    if not _env_flag("COMPILE_DIT_DEBUG", False):
+        return {}
+
+    debug_settings: Dict[str, str] = {}
+    os.environ.setdefault("TORCH_LOGS", "graph_breaks,recompiles")
+    os.environ.setdefault("TORCHDYNAMO_VERBOSE", "1")
+    debug_settings["TORCH_LOGS"] = os.environ["TORCH_LOGS"]
+    debug_settings["TORCHDYNAMO_VERBOSE"] = os.environ["TORCHDYNAMO_VERBOSE"]
+
+    try:
+        import torch._dynamo.config as dynamo_config
+
+        dynamo_config.verbose = True
+        dynamo_config.suppress_errors = False
+    except Exception as exc:  # pragma: no cover - best effort safeguard
+        logger.warning("Failed to enable torch.compile debug observability: %s", exc)
+
+    return debug_settings
+
+
+def _format_compile_kwargs(compile_kwargs: Dict[str, object]) -> str:
+    return ", ".join(f"{key}={value}" for key, value in compile_kwargs.items())
+
+
 class CustomFlux(Flux):
     def __init__(self, config: FluxConfig, **kwargs):
         super().__init__(config, **kwargs)
+        self._compile_strategy = "disabled"
+        self._compile_kwargs: Dict[str, object] = {}
+        self._compile_debug_settings: Dict[str, str] = {}
+        self._compiled_regions: list[str] = []
+        self._double_block_stack_runner: Callable = self._run_double_block_stack
+        self._single_block_stack_runner: Callable = self._run_single_block_stack
+        self._output_head_runner: Callable = self._run_output_head
+        self._full_dit_runner: Callable = self._run_full_dit
+        self._controlnet_fallback_logged = False
         self.init_weights()
+        self.maybe_configure_dit_compile()
 
     def init_weights(self):
         linear_weight_init(self.img_embed)
@@ -68,6 +124,262 @@ class CustomFlux(Flux):
         nn.init.constant_(self.proj_out.weight, 0)
         nn.init.constant_(self.proj_out.bias, 0)
         self.norm_out.norm.reset_parameters()
+
+    def _build_compile_kwargs(self) -> Dict[str, object]:
+        compile_kwargs: Dict[str, object] = {
+            "backend": os.getenv("TORCH_COMPILE_BACKEND", "inductor"),
+            "fullgraph": _env_flag("TORCH_COMPILE_FULLGRAPH", False),
+            "dynamic": _env_flag("TORCH_COMPILE_DYNAMIC", False),
+            "mode": os.getenv("TORCH_COMPILE_MODE", "default"),
+        }
+        return compile_kwargs
+
+    def _compile_region(self, fn: Callable, region_name: str) -> Callable:
+        self._compiled_regions.append(region_name)
+        return torch.compile(fn, **self._compile_kwargs)
+
+    def _log_compile_configuration(self):
+        if not _rank_zero():
+            return
+
+        logger.info(
+            "COMPILE_DIT enabled: strategy=%s, compiled_regions=%s, compile_kwargs=(%s), "
+            "enable_cuda_graph=%s, cpu_offloading=%s, cpu_offloading_activations=%s",
+            self._compile_strategy,
+            self._compiled_regions or ["none"],
+            _format_compile_kwargs(self._compile_kwargs),
+            self.config.enable_cuda_graph,
+            getattr(self.config, "cpu_offloading", None),
+            getattr(self.config, "cpu_offloading_activations", None),
+        )
+        if self._compile_debug_settings:
+            logger.info(
+                "COMPILE_DIT debug observability active: %s",
+                ", ".join(
+                    f"{key}={value}" for key, value in self._compile_debug_settings.items()
+                ),
+            )
+
+    def maybe_configure_dit_compile(self):
+        self._double_block_stack_runner = self._run_double_block_stack
+        self._single_block_stack_runner = self._run_single_block_stack
+        self._output_head_runner = self._run_output_head
+        self._full_dit_runner = self._run_full_dit
+        self._compiled_regions = []
+        self._compile_kwargs = {}
+        self._compile_debug_settings = {}
+
+        if not _env_flag("COMPILE_DIT", False):
+            return
+
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("COMPILE_DIT is set but torch.compile is unavailable")
+
+        raw_strategy = os.getenv("COMPILE_DIT_STRATEGY", "stack")
+        self._compile_strategy = raw_strategy.strip().lower()
+        valid_strategies = {"per_block", "single_stack", "double_stack", "stack", "full_dit"}
+
+        if self._compile_strategy not in valid_strategies:
+            raise ValueError(
+                f"Unsupported COMPILE_DIT_STRATEGY={raw_strategy!r}. "
+                f"Expected one of {sorted(valid_strategies)}."
+            )
+        self._compile_debug_settings = _configure_compile_debugging()
+        self._compile_kwargs = self._build_compile_kwargs()
+
+        if self._compile_strategy == "per_block":
+            for idx, layer in enumerate(self.double_blocks):
+                self.double_blocks[idx] = torch.compile(layer, **self._compile_kwargs)
+            for idx, layer in enumerate(self.single_blocks):
+                self.single_blocks[idx] = torch.compile(layer, **self._compile_kwargs)
+            self._compiled_regions.extend(
+                [
+                    f"double_blocks[{len(self.double_blocks)}]",
+                    f"single_blocks[{len(self.single_blocks)}]",
+                ]
+            )
+        elif self._compile_strategy == "single_stack":
+            self._single_block_stack_runner = self._compile_region(
+                self._run_single_block_stack, "single_block_stack"
+            )
+        elif self._compile_strategy == "double_stack":
+            self._double_block_stack_runner = self._compile_region(
+                self._run_double_block_stack, "double_block_stack"
+            )
+        elif self._compile_strategy == "stack":
+            self._double_block_stack_runner = self._compile_region(
+                self._run_double_block_stack, "double_block_stack"
+            )
+            self._single_block_stack_runner = self._compile_region(
+                self._run_single_block_stack, "single_block_stack"
+            )
+        elif self._compile_strategy == "full_dit":
+            self._full_dit_runner = self._compile_region(
+                self._run_full_dit, "full_dit"
+            )
+
+        if _env_flag("COMPILE_DIT_OUTPUT_HEAD", False) and self._compile_strategy in {
+            "single_stack",
+            "double_stack",
+            "stack",
+        }:
+            self._output_head_runner = self._compile_region(
+                self._run_output_head, "output_head"
+            )
+
+        self._log_compile_configuration()
+
+    def _run_double_block_stack(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        vec_emb: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        for block in self.double_blocks:
+            hidden_states, encoder_hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                rotary_pos_emb=rotary_pos_emb,
+                emb=vec_emb,
+            )
+        return hidden_states, encoder_hidden_states
+
+    def _run_single_block_stack(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        vec_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        for block in self.single_blocks:
+            hidden_states, _ = block(
+                hidden_states=hidden_states,
+                rotary_pos_emb=rotary_pos_emb,
+                emb=vec_emb,
+            )
+        return hidden_states
+
+    def _run_output_head(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        vec_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states[encoder_hidden_states.shape[0] :, ...]
+        hidden_states = self.norm_out(hidden_states, vec_emb)
+        return self.proj_out(hidden_states)
+
+    def _run_full_dit(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        vec_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states, encoder_hidden_states = self._run_double_block_stack(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            rotary_pos_emb=rotary_pos_emb,
+            vec_emb=vec_emb,
+        )
+        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=0)
+        hidden_states = self._run_single_block_stack(
+            hidden_states=hidden_states,
+            rotary_pos_emb=rotary_pos_emb,
+            vec_emb=vec_emb,
+        )
+        return self._run_output_head(hidden_states, encoder_hidden_states, vec_emb)
+
+    def forward(
+        self,
+        img: torch.Tensor,
+        txt: torch.Tensor = None,
+        y: torch.Tensor = None,
+        timesteps: torch.LongTensor = None,
+        img_ids: torch.Tensor = None,
+        txt_ids: torch.Tensor = None,
+        guidance: torch.Tensor = None,
+        controlnet_double_block_samples: torch.Tensor = None,
+        controlnet_single_block_samples: torch.Tensor = None,
+    ):
+        if self._compile_strategy in {"disabled", "per_block"}:
+            return super().forward(
+                img=img,
+                txt=txt,
+                y=y,
+                timesteps=timesteps,
+                img_ids=img_ids,
+                txt_ids=txt_ids,
+                guidance=guidance,
+                controlnet_double_block_samples=controlnet_double_block_samples,
+                controlnet_single_block_samples=controlnet_single_block_samples,
+            )
+
+        if (
+            controlnet_double_block_samples is not None
+            or controlnet_single_block_samples is not None
+        ):
+            if not self._controlnet_fallback_logged and _rank_zero():
+                logger.info(
+                    "ControlNet samples detected; falling back to eager Flux.forward for "
+                    "COMPILE_DIT_STRATEGY=%s compatibility.",
+                    self._compile_strategy,
+                )
+                self._controlnet_fallback_logged = True
+            return super().forward(
+                img=img,
+                txt=txt,
+                y=y,
+                timesteps=timesteps,
+                img_ids=img_ids,
+                txt_ids=txt_ids,
+                guidance=guidance,
+                controlnet_double_block_samples=controlnet_double_block_samples,
+                controlnet_single_block_samples=controlnet_single_block_samples,
+            )
+
+        hidden_states = self.img_embed(img)
+        encoder_hidden_states = self.txt_embed(txt)
+
+        timesteps = timesteps.to(img.dtype) * 1000
+        vec_emb = self.timestep_embedding(timesteps)
+
+        if guidance is not None:
+            vec_emb = vec_emb + self.guidance_embedding(
+                self.timestep_embedding.time_proj(guidance * 1000)
+            )
+        vec_emb = vec_emb + self.vector_embedding(y)
+
+        ids = torch.cat((txt_ids, img_ids), dim=1)
+        rotary_pos_emb = self.pos_embed(ids)
+
+        if self._compile_strategy == "full_dit":
+            with self.get_fp8_context():
+                return self._full_dit_runner(
+                    hidden_states,
+                    encoder_hidden_states,
+                    rotary_pos_emb,
+                    vec_emb,
+                )
+
+        with self.get_fp8_context():
+            hidden_states, encoder_hidden_states = self._double_block_stack_runner(
+                hidden_states,
+                encoder_hidden_states,
+                rotary_pos_emb,
+                vec_emb,
+            )
+
+        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=0)
+
+        with self.get_fp8_context():
+            hidden_states = self._single_block_stack_runner(
+                hidden_states,
+                rotary_pos_emb,
+                vec_emb,
+            )
+
+        return self._output_head_runner(hidden_states, encoder_hidden_states, vec_emb)
 
 
 class CustomFluxConfig(FluxConfig):
@@ -342,6 +654,7 @@ class CustomMegatronFluxModel(MegatronFluxModel):
             self.autocast_dtype in (torch.half, torch.bfloat16),
             dtype=self.autocast_dtype,
         ):
+            _maybe_cudagraph_mark_step_begin()
             noise_pred = self.forward(
                 img=packed_noisy_model_input,
                 txt=prompt_embeds,

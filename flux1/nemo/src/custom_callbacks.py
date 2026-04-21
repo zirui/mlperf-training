@@ -31,28 +31,19 @@ logger = get_rank_zero_logger(__name__, rank)
 class ThroughputTimer:
     def __init__(self, gbs):
         self.start_time = None
-        self.stop_time = None
-        self.elapsed_time = 0
-
-        self.samples = 0
         self.gbs = gbs
 
     def start(self):
-        self.start_time = time.time()
+        if self.start_time is None:
+            self.start_time = time.time()
 
-    def stop(self):
+    def compute_throughput(self, global_steps):
         if self.start_time is None:
             raise ValueError("Timer has not been started.")
-        self.stop_time = time.time()
-        self.samples += self.gbs
-        self.elapsed_time += self.stop_time - self.start_time
-
-    def compute_throughput(self):
-        if self.elapsed_time == 0:
-            return 0
-        # Currently throughput tracks entire training run (excluding validation)
-        # For throughput of each batch, zero out elapsed time and gbs
-        return self.samples / self.elapsed_time
+        elapsed_time = time.time() - self.start_time
+        samples = global_steps * self.gbs
+        throughput = samples / elapsed_time
+        return throughput
 
 
 class CustomCallback(LoggingCallback):
@@ -154,7 +145,6 @@ class CustomCallback(LoggingCallback):
         return super().on_train_batch_start(trainer, pl_module, batch, batch_idx)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        self.timer_obj.stop()
         if trainer.global_rank == 0:
             if self.enable_perf_debug:
                 torch.cuda.synchronize()
@@ -197,13 +187,14 @@ class CustomCallback(LoggingCallback):
                 value=duration_minutes,
             )
 
-    def on_validation_start(self, trainer, pl_module):
+    def on_validation_end(self, trainer, pl_module):
+        result = super().on_validation_end(trainer, pl_module)
         if trainer.global_step > 0:
             self.log_throughput(trainer.global_step)
-        return super().on_validation_start(trainer, pl_module)
+        return result
 
     def log_throughput(self, global_step):
-        throughput = self.timer_obj.compute_throughput()
+        throughput = self.timer_obj.compute_throughput(global_step)
         self.mllogger.event(
             key="throughput",
             value=throughput,
@@ -212,6 +203,7 @@ class CustomCallback(LoggingCallback):
                 "step": global_step,
             },
         )
+
 
 class MetricsLogger(MLPerfLogger):
     def __init__(

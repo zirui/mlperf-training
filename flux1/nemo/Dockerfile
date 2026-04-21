@@ -47,19 +47,18 @@ RUN pip3 install -r requirements.txt
 RUN python -m ensurepip || apt-get install -y python3-venv \
 && pip install cmake==3.28.3
 
-# ROCm Transformer Engine
-ARG TE_COMMIT=773ed1192a52a463669dff9633c9f3b306294179
+# ROCm Transformer Engine - ct_opt branch
+ARG TE_COMMIT=575447c5b424489b58870110b63bbacc4dff5c21
 RUN git clone --recursive https://github.com/ROCm/TransformerEngine.git \
     && cd TransformerEngine && git checkout ${TE_COMMIT} \
     && git submodule sync \
     && git submodule update --init --recursive
 
 RUN cd TransformerEngine \
-    && PREBUILT_URL="" \
+    && git apply /workspace/deps/patches/rmsnorm_tuned_kernels.patch \
     && NVTE_PROJECT_BUILDING=1 NVTE_USE_ROCM=1 NVTE_FUSED_ATTN_AOTRITON=0 \
     NVTE_ROCM_ARCH="gfx942;gfx950" GPU_ARCHS="gfx942;gfx950" \
     NVTE_FRAMEWORK='pytorch' \
-    NVTE_AITER_PREBUILT_BASE_URL="${PREBUILT_URL}" \
     NVTE_USE_HIPBLASLT=1 MAX_JOBS=128 PYTORCH_ROCM_ARCH="gfx942;gfx950" CU_NUM=304 \
     pip install --no-build-isolation -e . -v
 

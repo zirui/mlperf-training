@@ -86,7 +86,7 @@ export CONT=rocm/amd-mlperf:flux1_training_6.0
 Source the appropriate config for your GPU and precision:
 
 ```bash
-source config_MI355X_01x08x16.sh
+source config_MI355X_01x08x64.sh
 ```
 
 ### Launch a single training run
