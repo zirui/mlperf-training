@@ -31,6 +31,7 @@ modules:
 
       # mixed-precision
       attention_softmax_in_fp32: false
+      grad_reduce_in_bf16: ${PRIMUS_GRAD_REDUCE_IN_BF16:true}
 
       # log
       wandb_project: "Primus_GPT_OSS_20B"
@@ -173,6 +174,7 @@ modules:
       enable_primus_turbo: true
       use_turbo_attention: false
       use_turbo_grouped_mlp: true
+      use_turbo_rms_norm: ${USE_TURBO_RMS_NORM:true}
 
       # deepep
       use_turbo_deepep: false

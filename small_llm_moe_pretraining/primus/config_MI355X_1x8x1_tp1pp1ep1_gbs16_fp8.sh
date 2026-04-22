@@ -52,6 +52,8 @@ export PRIMUS_EP=1
 export PRIMUS_APPLY_ROPE_FUSION=True
 export PRIMUS_FP8_RECIPE=hybrid
 export PRIMUS_TURBO_GROUPED_GEMM_BACKEND=TRITON
+export PRIMUS_GRAD_REDUCE_IN_BF16=true
+export USE_TURBO_RMS_NORM=true
 
 # -----------------------------------------------------------------------------
 # ROCm / System Runtime
@@ -111,3 +113,11 @@ export MLLOG_SUBMISSION_PLATFORM=MI355X
 # Synthetic Warmup (kernel pre-compilation)
 # -----------------------------------------------------------------------------
 export SYNTH_WARMUP_STEPS=3
+
+# -----------------------------------------------------------------------------
+# MoE Token Dispatcher
+# -----------------------------------------------------------------------------
+# Skip sort_chunks_by_idxs when the per-local-expert index is an identity
+# permutation (fires at EP=1/TP=1). Set to 0 to run the original path; useful
+# for A/B measurements. See patches/megatron_moe_skip_identity_sort.patch.
+export MOE_SKIP_IDENTITY_SORT=1

@@ -51,6 +51,8 @@ export PRIMUS_EP=8
 # -----------------------------------------------------------------------------
 export PRIMUS_APPLY_ROPE_FUSION=True
 export PRIMUS_FP8_RECIPE=hybrid
+export PRIMUS_GRAD_REDUCE_IN_BF16=true
+export USE_TURBO_RMS_NORM=true
 
 # -----------------------------------------------------------------------------
 # ROCm / System Runtime

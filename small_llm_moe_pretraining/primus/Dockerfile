@@ -48,7 +48,22 @@ RUN cd /workspace/Primus/third_party/Megatron-LM && \
     git apply /workspace/deps/patches/megatron_cuda_sync_model_init.patch && \
     git apply /workspace/deps/patches/megatron_te_general_gemm_workspace_compat.patch && \
     git apply /workspace/deps/patches/megatron_te_bshd_layout.patch && \
+    git apply /workspace/deps/patches/megatron_moe_skip_identity_sort.patch && \
     pip install -e . --no-deps --no-build-isolation
+
+# Primus patches
+# 1. primus_turbo_te_compat: fix pre-existing dist_group_type import path and
+#    FP8GlobalStateManager.fp8_autocast_{enter,exit} -> .autocast_{enter,exit}
+#    rename so turbo-related Primus patches actually load against the shipped TE.
+# 2. turbo_rms_norm: swap stock TE RMSNorm and fused TELayerNormColumnParallelLinear
+#    for Triton-backed PrimusTurbo equivalents at the Primus patch-runner level.
+RUN cd /workspace/Primus && \
+    git apply /workspace/deps/patches/primus_turbo_te_compat.patch && \
+    git apply /workspace/deps/patches/turbo_rms_norm.patch
+
+# Ship the Triton RMSNorm kernel alongside the patched primus_turbo module.
+COPY patches/triton_rmsnorm.py \
+     /workspace/Primus/primus/backends/megatron/core/extensions/triton_rmsnorm.py
 
 WORKDIR /workspace/code
 
@@ -58,8 +73,8 @@ RUN pip install -r requirements.txt
 # Copy the current state of the code inside the image
 COPY . .
 
-COPY primus_mllog-0.1.9-py3-none-any.whl /tmp/primus_mllog-0.1.9-py3-none-any.whl
-RUN pip install /tmp/primus_mllog-0.1.9-py3-none-any.whl && rm /tmp/primus_mllog-0.1.9-py3-none-any.whl
+COPY primus_mllog-0.1.10-py3-none-any.whl /tmp/primus_mllog-0.1.10-py3-none-any.whl
+RUN pip install /tmp/primus_mllog-0.1.10-py3-none-any.whl && rm /tmp/primus_mllog-0.1.10-py3-none-any.whl
 
 # Primus PR #670: update triton permutation (feat/te/update_permutation)
 COPY patches/primus_te_permutation/permutation.py \
