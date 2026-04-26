@@ -1,0 +1,17 @@
+num_nodes: 1
+gpus_per_node: 8
+model_name: llama2_sft/nemo
+docker_image: rocm/mlperf:llama2_70b_training_5.0_2025-09-10-18-44-16_dev
+sbatch_template: launcher/templates/sbatch.sh.j2
+experiment_type: 'train'
+num_experiments: 1
+model_store:
+  store_name: mlperf_training
+  experiment_logdir: '/mlperf/training/llama2_sft_nemo/experiments/'
+  cache:
+    model_dir: /mlperf/training/llama2_sft_nemo/model/
+    data_dir: /mlperf/training/llama2_sft_nemo/data/
+megatron_config:
+  cp: 1
+  tp: 1
+  pp: 1
