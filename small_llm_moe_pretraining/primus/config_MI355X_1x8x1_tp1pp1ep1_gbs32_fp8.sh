@@ -121,3 +121,16 @@ export SYNTH_WARMUP_STEPS=3
 # permutation (fires at EP=1/TP=1). Set to 0 to run the original path; useful
 # for A/B measurements. See patches/megatron_moe_skip_identity_sort.patch.
 export MOE_SKIP_IDENTITY_SORT=1
+
+# -----------------------------------------------------------------------------
+# Run-log verbosity
+# -----------------------------------------------------------------------------
+# MLPerf run-log verbosity. Default 0 keeps only :::MLLOG + ``run_and_time.sh``
+# banners on stdout. Set to 1 to restore the full framework output (Primus
+# loguru banners / Megatron / TE / aiter / Gloo / torchrun / hipify / ...)
+# when debugging. See src/_log_suppression.py for the full strategy.
+export MLPERF_VERBOSE_LOGS=${MLPERF_VERBOSE_LOGS:-0}
+
+# fused rms and swiglu no cat
+export PRIMUS_FUSED_RESIDUAL_NORM=1
+export PRIMUS_MOE_SWIGLU_NOCAT=1

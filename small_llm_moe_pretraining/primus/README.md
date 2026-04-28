@@ -106,6 +106,40 @@ bash run_with_docker.sh
 
 After completion, logs will be available under `$LOGDIR`.
 
+## Run-log Verbosity
+
+By default the run log contains only `:::MLLOG ...` lines and the three
+`run_and_time.sh` banners (`STARTING TIMING RUN ...`, `ENDING TIMING RUN
+...`, `RESULT,GPT_OSS_20B,...`). All other framework output is suppressed
+to keep submission logs clean. The suppression is owned by
+`src/_log_suppression.py`, which `src/train.py` imports before any
+Primus / Megatron / TransformerEngine import. It works in three layers:
+
+1. **Env vars** (`AITER_LOG_LEVEL=ERROR`, `PYTHONWARNINGS=ignore`,
+   `TRANSFORMERS_VERBOSITY=error`, `HF_HUB_DISABLE_PROGRESS_BARS=1`,
+   and `OMP_NUM_THREADS=1` pre-set by `run_and_time.sh` to silence the
+   `torchrun` advisory) honoured by each noisy library.
+2. **Python `logging` levels** raised to `ERROR` for the `aiter`,
+   `megatron.*`, `primus*`, `torch.distributed.*`, and
+   `transformer_engine` logger trees — re-applied after the Primus
+   trainer is constructed because Primus installs a loguru
+   `InterceptHandler` on the root logger.
+3. **FD-level filter** (last resort) for native `std::cout` and raw
+   `print()` sources that bypass Python logging: the aiter JIT /
+   TE-RoPE / hipify / Gloo peer-connect banners and the
+   `[MLPerf Train] ...` status prints. Stderr is redirected wholesale
+   to `/dev/null` in quiet mode since everything on FD 2 (Primus loguru
+   sink, `warnings.warn`, hipify) is informational.
+
+Set `MLPERF_VERBOSE_LOGS=1` to restore the full framework output for
+debugging. The variable defaults to `0` in every
+`config_MI355X_1x8x1_*_fp8.sh` and can be overridden at the shell:
+
+```bash
+export MLPERF_VERBOSE_LOGS=1
+bash run_with_docker.sh
+```
+
 # 4. Quality Metrics
 
 ## Quality Metric

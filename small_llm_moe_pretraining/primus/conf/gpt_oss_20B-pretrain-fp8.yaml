@@ -50,8 +50,8 @@ modules:
       profile_step_start: ${PRIMUS_PROFILE_STEP_START:16}
       
       # enable fp8 training
-      fp8: hybrid  # E4M3 for activations/weights, E5M2 for gradients
-      fp8_recipe: delayed  # delayed for TE layers; MoE experts use blockwise FP8 internally
+      fp8: e4m3
+      fp8_recipe: tensorwise
       clip_grad: 1.0  # Gradient clipping (already default, but explicit)
       check_for_nan_in_loss_and_grad: false
       

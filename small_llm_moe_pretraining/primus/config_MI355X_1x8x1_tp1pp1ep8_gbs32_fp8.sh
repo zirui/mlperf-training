@@ -110,3 +110,12 @@ export MLLOG_SUBMISSION_PLATFORM=MI355X
 # Synthetic Warmup (kernel pre-compilation)
 # -----------------------------------------------------------------------------
 export SYNTH_WARMUP_STEPS=3
+
+# -----------------------------------------------------------------------------
+# Run-log verbosity
+# -----------------------------------------------------------------------------
+# MLPerf run-log verbosity. Default 0 keeps only :::MLLOG + ``run_and_time.sh``
+# banners on stdout. Set to 1 to restore the full framework output (Primus
+# loguru banners / Megatron / TE / aiter / Gloo / torchrun / hipify / ...)
+# when debugging. See src/_log_suppression.py for the full strategy.
+export MLPERF_VERBOSE_LOGS=${MLPERF_VERBOSE_LOGS:-0}

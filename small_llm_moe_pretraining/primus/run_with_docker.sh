@@ -113,6 +113,8 @@ fi
 
 # Make sure container has time to finish initialization
 sleep 5
+
+bash runtime_tunables.sh
 docker exec "${_cont_name}" true
 
 # Run experiments

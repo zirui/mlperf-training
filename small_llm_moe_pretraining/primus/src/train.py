@@ -1,3 +1,14 @@
+# ---------------------------------------------------------------------------
+# Non-MLLOG log suppression. Must be imported BEFORE any other import that
+# may log/print at import time (Primus, Megatron, TE, aiter, primus_mllog,
+# ...). See ``_log_suppression.py`` for the full strategy; the short
+# version is that non-MLLOG output is gated behind ``MLPERF_VERBOSE_LOGS=1``
+# via Python logging levels + env vars + an FD-level stdout filter for
+# native C++ writes that bypass the above.
+# ---------------------------------------------------------------------------
+import _log_suppression as _log_suppression  # noqa: F401
+# ---------------------------------------------------------------------------
+
 import argparse
 import os
 import sys
@@ -16,6 +27,14 @@ if MEGATRON_PATH not in sys.path:
 from primus.core.launcher.config import PrimusConfig
 from primus.core.launcher.parser import load_primus_config, add_pretrain_parser
 from primus_mllog import MLPerfMegatronPretrainTrainer
+
+# Primus reconfigures stdlib ``logging`` via loguru ``InterceptHandler`` during
+# trainer init, which resets the per-logger levels installed by
+# ``_log_suppression`` at import time. Re-apply the quiet levels after the
+# Primus imports so the "Setting RerunStateMachine mode" / Megatron
+# deprecation / torch.distributed banners stay hidden. No-op in verbose mode.
+if not _log_suppression.VERBOSE_LOGS:
+    _log_suppression.reapply_quiet_logger_levels()
 
 def setup_environment(data_path: Optional[str] = None) -> None:
     """Setup HuggingFace home and other environment variables."""
