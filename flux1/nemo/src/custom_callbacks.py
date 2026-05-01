@@ -160,16 +160,7 @@ class CustomCallback(LoggingCallback):
                 print("memory profile written to /results/flux.pickle")
 
         if trainer.global_step % self.log_every_n_steps == 0:
-            self.mllogger.event(
-                key="tracked_stats",
-                value={"train_loss": outputs["loss"].item()},
-                metadata={
-                    self.mllogger.constants.SAMPLES_COUNT: trainer.global_step
-                    * self.gbs,
-                    "lr": trainer.optimizers[0].param_groups[0]["lr"],
-                    "step": trainer.global_step,
-                },
-            )
+            logger.info(f"train_loss: {outputs['loss'].item()}, lr: {trainer.optimizers[0].param_groups[0]['lr']}, step: {trainer.global_step}, samples_count: {trainer.global_step * self.gbs}")
 
     def on_train_end(self, trainer, pl_module):
         if self.rpd_running:
@@ -195,14 +186,18 @@ class CustomCallback(LoggingCallback):
 
     def log_throughput(self, global_step):
         throughput = self.timer_obj.compute_throughput(global_step)
-        self.mllogger.event(
-            key="throughput",
-            value=throughput,
-            metadata={
-                self.mllogger.constants.SAMPLES_COUNT: global_step * self.gbs,
-                "step": global_step,
-            },
-        )
+        logger.info(f"Throughput: {throughput}, step: {global_step}, samples_count: {global_step * self.gbs}")
+
+    # Overriding the base class methods to avoid logging to MLPerf logger
+    def log_custom_timedelta(self, value_key, step: int = 0):
+        return
+
+    def _log_train_step_time(
+        self,
+        trainer_step: int,
+        train_batch_size: int,
+    ) -> None:
+        return
 
 
 class MetricsLogger(MLPerfLogger):

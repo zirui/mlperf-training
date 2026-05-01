@@ -75,11 +75,20 @@ def run_training_warmup(trainer, warmup_train_steps, warmup_validation_steps):
 
 
 def reset_fp8_state(model):
-    """Sets `fp8_initialized` flag to False in every TE layer which will force reinitialization."""
+    """Sets `fp8_initialized` to False on TE layers to force reinitialization on next forward."""
     def reset_fp8(m):
-        if hasattr(m, "fp8_initialized"):
-            m.fp8_initialized = False
-            m.reset_fp8_meta_tensors()
+        if not hasattr(m, "fp8_initialized"):
+            return
+        m.fp8_initialized = False
+        # MX recipes (MXFP4/MXFP8) use RecipeState without `.scale`; TE's
+        # reset_fp8_meta_tensors assumes DelayedScaling-style state and raises.
+        fp8_meta = getattr(m, "fp8_meta", None) or {}
+        for key in ("scaling_fwd", "scaling_bwd"):
+            state = fp8_meta.get(key)
+            if state is not None and not hasattr(state, "scale"):
+                return
+        m.reset_fp8_meta_tensors()
+
     model.apply(reset_fp8)
 
 

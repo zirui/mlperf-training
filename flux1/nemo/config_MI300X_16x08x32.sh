@@ -2,17 +2,19 @@
 source $(dirname ${BASH_SOURCE[0]})/config_common.sh
 
 export MAX_STEPS=${MAX_STEPS:--1}
+export WARMUP_STEPS=${WARMUP_STEPS:-100}
 
-# MBS and GBS-dependent hyperparams (BATCHSIZE, LEARNING_RATE, WARMUP_STEPS)
-export MBS=${MBS:-32}
-export BATCHSIZE=${BATCHSIZE:-2048}
-source $(dirname ${BASH_SOURCE[0]})/config_gbs${BATCHSIZE}.sh
-
-export FP8_RECIPE="delayed"  # mxfp8 currently not working on AMD GPU
+export BATCHSIZE=4096
+export LEARNING_RATE=${LEARNING_RATE:-"0.0004"}
+export MBS=32
+export FP8_RECIPE="delayed"
 # System parameters
-export DGXNNODES=8
+export DGXNNODES=16
 export DGXNGPU=8
-export SEGMENT=${DGXNNODES:-8}
+export SEGMENT=${DGXNNODES:-16}
+
+export MLPERF_SUBMISSION_ORG="AMD"
+export MLPERF_SUBMISSION_PLATFORM="MI300X"
 
 export NVTE_RS_STRIDED_ATOMIC=2
 export NVTE_FP8_DPA_BWD=1
@@ -34,21 +36,18 @@ export NVTE_LOG_CK_CONFIG=0
 export NVTE_LOG_FUSED_ATTN_CONFIG=0
 export CHECK_FOR_NAN_IN_GRAD=0
 
-export FUSED_SOFTMAX=0              # not in TE
-export RMSNORM_CAST=0               # not in TE
-export ENABLE_TRANSPOSE_CACHE=0     # check
+export FUSED_SOFTMAX=0
+export RMSNORM_CAST=0
+export ENABLE_TRANSPOSE_CACHE=0
 
 export USE_HIPBLASLT=1
 export TORCH_BLAS_PREFER_HIPBLASLT=1
 
-# RCCL-specific optimizations for multinode (NCCL settings are in config_common.sh)
-export RCCL_ENABLE_MULTI_STREAM=1
-export RCCL_STREAM_PRIORITY=1
-#export NCCL_DEBUG=INFO
-
 # Walltime
 export WALLTIME_RUNANDTIME=200
 export WALLTIME=$((5 + ${NEXP:-1} * ($WALLTIME_RUNANDTIME + 5)))
+
+export HSA_NO_SCRATCH_RECLAIM=1
 
 export CUDA_GRAPH_IMPL=local
 export CPU_OFFLOADING=False

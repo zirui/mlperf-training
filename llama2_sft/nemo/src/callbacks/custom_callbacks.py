@@ -1,19 +1,16 @@
 import os
 import time
-from typing import Any, List
+import logging
 from math import ceil
+from typing import Any, List
 
 import lightning as pl
 import numpy as np
 import torch
-from custom_llama import reset_fp8_state, run_training_warmup
+import transformer_engine.common.recipe
 import transformer_engine.pytorch as te
 import transformer_engine_torch as tex
-from transformer_engine.pytorch.tensor.float8_tensor import Float8Tensor, Float8Quantizer
-from transformer_engine.pytorch.tensor.mxfp4_tensor import MXFP4Quantizer
-from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
-
-import transformer_engine.common.recipe
+from custom_llama import reset_fp8_state, run_training_warmup
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.num_microbatches_calculator import (
@@ -21,7 +18,45 @@ from megatron.core.num_microbatches_calculator import (
 )
 from mlperf_common.callbacks import LoggingCallback, MLPerfLogger
 from omegaconf import DictConfig, OmegaConf
-from prof_handler import TOTAL_WARMUP_STEPS, TOTAL_ACTIVE_STEPS
+from prof_handler import TOTAL_ACTIVE_STEPS, TOTAL_WARMUP_STEPS
+from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
+from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer, Float8Tensor
+from transformer_engine.pytorch.tensor.mxfp4_tensor import MXFP4Quantizer
+
+class RankZeroFilter(logging.Filter):
+    def __init__(self, rank):
+        self.rank = rank
+
+    def filter(self, record):
+        return self.rank == 0
+
+rank = int(os.environ.get("RANK", "0"))
+logger = logging.getLogger(__name__)
+logger.addFilter(RankZeroFilter(rank))        
+
+def _env_enabled(name: str) -> bool:
+    val = os.getenv(name, "").strip().lower()
+    if val in {"1", "true", "yes", "on"}:
+        return True
+    if val in {"0", "false", "no", "off"}:
+        return False
+    return False
+
+
+def _uniform_recompute_chunk_size(num_layers_per_pp_rank: int, preferred: int = 72) -> int:
+    """Chunk size for Megatron ``recompute_method=uniform``.
+
+    Each checkpoint segment is ``[layer_idx, layer_idx + recompute_num_layers)``. The loop
+    advances ``layer_idx`` by ``recompute_num_layers`` until ``layer_idx < num_layers``;
+    if ``num_layers`` is not divisible by ``recompute_num_layers``, the last segment still
+    uses a full-sized span and indexes past ``layers[-1]`` (e.g. 80 layers and chunk 72
+    runs ``range(72, 144)`` → ``index 80 is out of range``).
+    """
+    cap = min(preferred, num_layers_per_pp_rank)
+    for c in range(cap, 0, -1):
+        if num_layers_per_pp_rank % c == 0:
+            return c
+    return 1
 
 
 def get_context_parallel_world_size_override():
@@ -95,16 +130,48 @@ class CustomCallback(LoggingCallback):
 
         self.rpd = None
         self.rpd_status = None
-        self.profiler = os.getenv("PROFILER", '')
+        self.profiler = os.getenv("PROFILER", "")
 
-        if self.profiler == 'rpd':
+        if self.profiler == "rpd":
             from rpdTracerControl import rpdTracerControl
-            rpdTracerControl.setFilename(name=f"trace.rpd", append=True)
-            self.rpd = rpdTracerControl()
 
+            rpdTracerControl.setFilename(name="trace.rpd", append=True)
+            self.rpd = rpdTracerControl()
 
     def __deepcopy__(self, memo):
         return CustomCallback(self.cfg)
+
+    @staticmethod
+    def _gpu_mem_mb():
+        return torch.cuda.memory_allocated() / 1e6, torch.cuda.memory_reserved() / 1e6
+
+    def _reset_full_iteration_cuda_graphs(self, trainer) -> None:
+        """Drop Megatron full-iteration CUDA graph captures before FP8 healing (MLPerf pattern).
+
+        After MXFP4→FP8 weight swap and recipe change, replaying old graphs is invalid.
+        Always clears stored graphs and results. If ``reset_cg_after_healing`` is true,
+        also resets per-stage warmup step counters so ``FullCudaGraphWrapper`` re-runs
+        ``cuda_graph_warmup_steps`` before re-capture.
+        """
+        try:
+            from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+        except ImportError:
+            if trainer.global_rank == 0:
+                print(
+                    "[healing] FullCudaGraphWrapper unavailable — skip full-iteration "
+                    "CUDA graph reset",
+                    flush=True,
+                )
+            return
+
+        FullCudaGraphWrapper.cuda_graph["training"] = None
+        FullCudaGraphWrapper.cuda_graph["validation"] = None
+        FullCudaGraphWrapper.result["training"] = None
+        FullCudaGraphWrapper.result["validation"] = None
+
+        if bool(getattr(self.cfg.model, "reset_cg_after_healing", False)):
+            FullCudaGraphWrapper.curr_iteration["training"] = 0
+            FullCudaGraphWrapper.curr_iteration["validation"] = 0
 
     def _healing_setup(self):
         if self.healing_precision == "FP8_DS":
@@ -121,25 +188,34 @@ class CustomCallback(LoggingCallback):
 
     def _pre_quantize_model(self, trainer, pl_module):
         """Pre-quantize model: store FP8 clones on CPU for healing, replace weights with MXFP4."""
+        _t0 = time.time()
         device = next(_extract_module(trainer.model).parameters()).device
 
         # Clone current FP8 weights to CPU for healing.
         # Must happen BEFORE MXFP4 replacement since we reference the live FP8 params.
+        # NOTE: this stays on even when HEALING_ITER<=0. Skipping it caused the
+        # MXFP4 path that follows to produce different post-quant weights
+        # (~12 init eval vs ~3.7 with the FP8 clone), so we eat the ~28s /
+        # ~142GB CPU-RAM cost for parity even when the snapshot is unused.
         self.fp8_quantizer = Float8Quantizer(
             scale=torch.ones(1, dtype=torch.float32, device=device),
             amax=torch.zeros(1, dtype=torch.float32, device=device),
             fp8_dtype=tex.DType.kFloat8E4M3,
+            rowwise=True,
+            columnwise=_env_enabled("ENABLE_TRANSPOSE_CACHE"),
         )
         self.fp8_cpu_params = self._get_quantized_params_cpu(
             trainer.model, self.fp8_quantizer, "FP8_DS"
         )
 
-        _use_hadamard = os.environ.get("NVTE_MXFP4_USE_HADAMARD", "0") == "1"
+        # Replace weights with MXFP4 (both orientations for fwd + bwd GEMMs)
         self.mxfp4_quantizer = MXFP4Quantizer(
             rowwise=True,
             columnwise=True,
-            shuffle_B_matrix_for_aiter=True,
-            use_hadamard=_use_hadamard,
+            shuffle_rowwise_data=True,
+            shuffle_columnwise_data=True,
+            with_gemm_swizzled_scales=True,
+            use_hadamard=_env_enabled("NVTE_MXFP4_USE_HADAMARD"),
         )
         self._get_quantized_params_cpu(
             trainer.model, self.mxfp4_quantizer, "MXFP4", replace=True
@@ -156,15 +232,18 @@ class CustomCallback(LoggingCallback):
         quantized_params = []
         for layer_idx, layer in enumerate(layers):
             if self.first_last_layers_bf16:
-                if layer_idx < self.num_layers_at_start_in_bf16 or layer_idx >= layer_count - self.num_layers_at_end_in_bf16:
+                if (
+                    layer_idx < self.num_layers_at_start_in_bf16
+                    or layer_idx >= layer_count - self.num_layers_at_end_in_bf16
+                ):
                     quantized_params.append([])
                     continue
 
             quantized_layer_params = []
             for name, module in layer.named_modules():
-                if not isinstance(module, (te.Linear, te.LayerNormLinear)):
+                if not isinstance(module, (te.Linear, te.LayerNormLinear, te.LayerNormMLP)):
                     continue
-                if not hasattr(module, 'weight'):
+                if not hasattr(module, "weight"):
                     continue
                 param = module.weight
                 with torch.no_grad():
@@ -195,7 +274,7 @@ class CustomCallback(LoggingCallback):
 
                     if replace:
                         qparam.requires_grad = False
-                        module._parameters['weight'] = qparam
+                        module._parameters["weight"] = qparam
                     else:
                         qparam = qparam.clone()
                         if not self.store_quantized_params_on_gpu:
@@ -217,20 +296,32 @@ class CustomCallback(LoggingCallback):
         layer_count = len(layers)
         dev = torch.cuda.current_device()
 
-        # Use a dedicated CUDA stream for async CPU→GPU transfers so they
-        # overlap with the GIL-released main-stream work (op-fuser rebuilds).
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
         xfer_stream = torch.cuda.Stream()
 
         for layer_idx, layer in enumerate(layers):
             if self.first_last_layers_bf16:
-                if layer_idx < self.num_layers_at_start_in_bf16 or layer_idx >= layer_count - self.num_layers_at_end_in_bf16:
+                if (
+                    layer_idx < self.num_layers_at_start_in_bf16
+                    or layer_idx >= layer_count - self.num_layers_at_end_in_bf16
+                ):
                     continue
 
-            for name, module in layer.named_modules():
-                if not isinstance(module, (te.Linear, te.LayerNormLinear)):
+            target_modules = []
+            for _name, module in layer.named_modules():
+                if not isinstance(module, (te.Linear, te.LayerNormLinear, te.LayerNormMLP)):
                     continue
-                if not hasattr(module, 'weight'):
+                if not hasattr(module, "weight"):
                     continue
+                target_modules.append(module)
+
+            with torch.no_grad():
+                for module in target_modules:
+                    module._parameters["weight"] = None
+
+            for module in target_modules:
                 with torch.no_grad():
                     weight = cpu_params[layer_idx].pop(0)
 
@@ -239,7 +330,10 @@ class CustomCallback(LoggingCallback):
                             if qtype == "FP8_DS":
                                 weight._data = weight._data.to(dev, non_blocking=True)
                                 if weight._transpose is not None:
-                                    weight._transpose = weight._transpose.to(dev, non_blocking=True)
+                                    if _env_enabled("ENABLE_TRANSPOSE_CACHE"):
+                                        weight._transpose = weight._transpose.to(dev, non_blocking=True)
+                                    else:
+                                        weight._transpose = None
                             elif qtype == "MXFP4":
                                 weight._rowwise_data = weight._rowwise_data.to(dev, non_blocking=True)
                                 weight._columnwise_data = weight._columnwise_data.to(dev, non_blocking=True)
@@ -247,23 +341,21 @@ class CustomCallback(LoggingCallback):
                                 raise ValueError(f"Unsupported quantization type: {qtype}")
 
                     weight.requires_grad = False
-                    module._parameters['weight'] = weight
+                    module._parameters["weight"] = weight
 
             if self.cfg.model.use_transformer_engine_op_fuser:
                 layer.mlp._fused_impl = (layer.mlp._make_fused_impl(),)
-                layer.self_attention.linear_proj._fused_branches = layer.self_attention.linear_proj._make_fused_branches()
-                layer.self_attention.linear_qkv._fused_branches = layer.self_attention.linear_qkv._make_fused_branches()
+                layer.self_attention.linear_proj._fused_branches = (
+                    layer.self_attention.linear_proj._make_fused_branches()
+                )
+                layer.self_attention.linear_qkv._fused_branches = (
+                    layer.self_attention.linear_qkv._make_fused_branches()
+                )
 
-        # Single sync for all async transfers
         xfer_stream.synchronize()
 
     def _pre_ttt_fp8_warmup(self, trainer):
-        """Pre-compile FP8 kernels (Triton, hipBLASLt) before the TTT timer.
-
-        Loads FP8 weights alongside MXFP4, runs one synthetic training step
-        in FP8 mode with aggressive recompute (72/80 layers) to fit both
-        weight sets, then restores MXFP4 state. Saves ~10s on step 310.
-        """
+        """Pre-compile FP8 kernels before the timed training window."""
         import megatron.core.fp4_utils
 
         if not self.fp8_cpu_params:
@@ -271,32 +363,37 @@ class CustomCallback(LoggingCallback):
         if not self.cfg.model.healing_iter or self.cfg.model.healing_iter <= 0:
             return
 
+        _t0 = time.time()
+
         extracted = _extract_module(trainer.model)
         layers = extracted.decoder.layers
         layer_count = len(layers)
         dev = torch.cuda.current_device()
 
-        # Load FP8 weights from CPU alongside MXFP4 via async stream
         saved_weights = []
         xfer_stream = torch.cuda.Stream()
         for layer_idx, layer in enumerate(layers):
             if self.first_last_layers_bf16:
-                if (layer_idx < self.num_layers_at_start_in_bf16
-                        or layer_idx >= layer_count - self.num_layers_at_end_in_bf16):
+                if (
+                    layer_idx < self.num_layers_at_start_in_bf16
+                    or layer_idx >= layer_count - self.num_layers_at_end_in_bf16
+                ):
                     continue
 
             param_idx = 0
             for _n, mod in layer.named_modules():
-                if not isinstance(mod, (te.Linear, te.LayerNormLinear)):
+                if not isinstance(mod, (te.Linear, te.LayerNormLinear, te.LayerNormMLP)):
                     continue
-                if not hasattr(mod, 'weight'):
+                if not hasattr(mod, "weight"):
                     continue
 
                 cpu_fp8 = self.fp8_cpu_params[layer_idx][param_idx]
                 with torch.no_grad(), torch.cuda.stream(xfer_stream):
                     gpu_data = cpu_fp8._data.to(dev, non_blocking=True)
-                    gpu_tp = (cpu_fp8._transpose.to(dev, non_blocking=True)
-                              if cpu_fp8._transpose is not None else None)
+                    if cpu_fp8._transpose is not None and _env_enabled("ENABLE_TRANSPOSE_CACHE"):
+                        gpu_tp = cpu_fp8._transpose.to(dev, non_blocking=True)
+                    else:
+                        gpu_tp = None
                     gpu_fp8 = Float8Tensor(
                         shape=cpu_fp8.shape,
                         dtype=cpu_fp8.dtype,
@@ -309,65 +406,109 @@ class CustomCallback(LoggingCallback):
                     gpu_fp8.requires_grad = False
 
                 saved_weights.append((mod, mod.weight))
-                mod._parameters['weight'] = gpu_fp8
+                mod._parameters["weight"] = gpu_fp8
                 param_idx += 1
 
         xfer_stream.synchronize()
 
-        # Switch to FP8 mode
         saved_mxfp4_phase = megatron.core.fp4_utils._mxfp4_phase
         saved_recipe = megatron.core.fp4_utils.get_fp4_recipe
         megatron.core.fp4_utils._mxfp4_phase = False
         megatron.core.fp4_utils.get_fp4_recipe = self.healing_lambda
 
-        # Aggressive recompute: both weight sets on GPU (~142GB), need headroom
-        saved_recompute_n = extracted.config.recompute_num_layers
-        extracted.config.recompute_num_layers = 72
+        if not _env_enabled("ENABLE_TRANSPOSE_CACHE"):
+            for m in trainer.model.modules():
+                if isinstance(m, (te.Linear, te.LayerNormLinear, te.LayerNormMLP)):
+                    m.keep_fp8_weight_transpose_cache = False
+
+        cfg = extracted.config
+        saved_recompute_n = cfg.recompute_num_layers
+        saved_rg = cfg.recompute_granularity
+        saved_rm = cfg.recompute_method
+        saved_cgi = cfg.cuda_graph_impl
+        saved_ecg = cfg.enable_cuda_graph
+        saved_xcg = cfg.external_cuda_graph
+        per_rank = cfg.num_layers // max(cfg.pipeline_model_parallel_size, 1)
+        # Megatron only uses recompute_num_layers when recompute_granularity == "full"
+        # (checkpointed forward in transformer_block). If the user turned off
+        # recomputation for CUDA graphs, forcing recompute_num_layers alone does nothing
+        # and the forward stores full activations — OOM with FP8 weights resident.
+        # For this synthetic warmup step only: disable CUDA graphs (full recompute is
+        # incompatible with them in TransformerConfig) and enable full uniform
+        # checkpointing. Restore everything before real training.
+        cleared_graphs_for_warmup = False
+        skip_forward = False
+        if saved_rg is None:
+            if cfg.cpu_offloading:
+                skip_forward = True
+            else:
+                cleared_graphs_for_warmup = True
+                cfg.cuda_graph_impl = "none"
+                cfg.enable_cuda_graph = False
+                cfg.external_cuda_graph = False
+                cfg.recompute_granularity = "full"
+                cfg.recompute_method = "uniform"
+                cfg.recompute_num_layers = _uniform_recompute_chunk_size(per_rank)
+        elif saved_rg == "full":
+            cfg.recompute_num_layers = _uniform_recompute_chunk_size(per_rank)
+        # selective: leave recompute_num_layers as None (Megatron requirement)
 
         optimizer = trainer.strategy.optimizers[0]
         try:
-            trainer.model.training_step(trainer.model.get_synthetic_input())
-            optimizer.zero_grad(set_to_none=True)
-        except Exception:
-            pass
+            if not skip_forward:
+                trainer.model.training_step(trainer.model.get_synthetic_input())
+                optimizer.zero_grad(set_to_none=True)
+        except Exception as e:
+            if trainer.global_rank == 0:
+                print(f"[pre_ttt_fp8_warmup] Error (non-fatal): {e}", flush=True)
 
-        # Restore MXFP4 state
         megatron.core.fp4_utils._mxfp4_phase = saved_mxfp4_phase
         megatron.core.fp4_utils.get_fp4_recipe = saved_recipe
-        extracted.config.recompute_num_layers = saved_recompute_n
+        cfg.recompute_num_layers = saved_recompute_n
+        if cleared_graphs_for_warmup:
+            cfg.recompute_granularity = saved_rg
+            cfg.recompute_method = saved_rm
+            cfg.cuda_graph_impl = saved_cgi
+            cfg.enable_cuda_graph = saved_ecg
+            cfg.external_cuda_graph = saved_xcg
 
         for mod, orig_weight in saved_weights:
-            mod._parameters['weight'] = orig_weight
+            mod._parameters["weight"] = orig_weight
 
         reset_fp8_state(trainer.lightning_module)
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
+
     def on_train_start(self, trainer, pl_module):
 
         self._healing_setup()
+
+        if not self.cfg.model.fp4:
+            import megatron.core.fp4_utils
+
+            megatron.core.fp4_utils._mxfp4_phase = False
+            megatron.core.fp4_utils.get_fp4_recipe = self.healing_lambda
+
         if self.pre_quantized_model:
             self._pre_quantize_model(trainer, pl_module)
         super().on_train_start(trainer, pl_module)
 
-        # Flush async GPU work from warmup before starting TTT timer
         torch.cuda.synchronize()
 
-        # Pre-pay Lightning val_loop init cost (setup_data/reset) before TTT timer.
-        # Without this, the first real eval at step 192 incurs a ~65s one-time GPU stall.
+        _t0 = time.time()
         trainer.warmup = True
         try:
             trainer.fit_loop.epoch_loop.val_loop.run()
-        except Exception:
-            pass
+        except Exception as e:
+            if trainer.global_rank == 0:
+                print(f"[pre_val_warmup] FAILED: {e}", flush=True)
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
-        if self.cfg.model.healing_iter and self.cfg.model.healing_iter > 0:
-            if hasattr(trainer.strategy, 'optimizers') and len(trainer.strategy.optimizers) > 0:
-                self._pre_ttt_fp8_warmup(trainer)
+        # if self.cfg.model.healing_iter and self.cfg.model.healing_iter > 0:
+        #     self._pre_ttt_fp8_warmup(trainer)
 
-        # Timer set in on_train_batch_start to exclude warmup from reported TTT
         self.train_start_time = None
 
     def on_train_end(self, trainer, pl_module):
@@ -403,7 +544,6 @@ class CustomCallback(LoggingCallback):
             self.train_start_time = time.time()
             if trainer.global_rank == 0:
                 torch.cuda.reset_peak_memory_stats()
-
 
         self.throughput_timer.start()
 
@@ -442,7 +582,9 @@ class CustomCallback(LoggingCallback):
         flagged = 0
         for layer in reversed(layers):
             for name, m in layer.named_modules():
-                if isinstance(m, (te.Linear, te.LayerNormLinear)) and hasattr(m, 'weight'):
+                if isinstance(m, (te.Linear, te.LayerNormLinear, te.LayerNormMLP)) and hasattr(
+                    m, "weight"
+                ):
                     if flagged < max_modules:
                         m._mxfp4_persist_columnwise = True
                         flagged += 1
@@ -469,37 +611,64 @@ class CustomCallback(LoggingCallback):
                 key="tracked_stats",
                 value={"train_loss": outputs["loss"].item()},
                 metadata={
-                    self.mllogger.constants.SAMPLES_COUNT: trainer.global_step
-                    * self.gbs,
+                    self.mllogger.constants.SAMPLES_COUNT: trainer.global_step * self.gbs,
                     "lr": trainer.optimizers[0].param_groups[0]["lr"],
                     "step": trainer.global_step,
                 },
             )
 
         if trainer.global_step + 1 == self.cfg.model.healing_iter:
+
             torch.distributed.barrier()
+
+            self._reset_full_iteration_cuda_graphs(trainer)
 
             if self.pre_quantized_model:
                 assert self.fp8_cpu_params, "FP8 parameters not found"
                 self._set_quantized_params_cpu(trainer.model, self.fp8_cpu_params, self.healing_precision)
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
 
             import megatron.core.fp4_utils
+
             megatron.core.fp4_utils.get_fp4_recipe = self.healing_lambda
             megatron.core.fp4_utils._mxfp4_phase = False
 
-            # FP8 phase has VRAM headroom — disable recomputation
+            if not _env_enabled("ENABLE_TRANSPOSE_CACHE"):
+                _reset = 0
+                for m in trainer.model.modules():
+                    if isinstance(m, (te.Linear, te.LayerNormLinear, te.LayerNormMLP)):
+                        m.keep_fp8_weight_transpose_cache = False
+                        _reset += 1
+
             extracted = _extract_module(trainer.model)
             if extracted.config.recompute_granularity is not None:
                 extracted.config.recompute_granularity = None
                 extracted.config.recompute_num_layers = None
                 extracted.config.recompute_method = None
 
-            # Invalidate MXFP4 weight cache and persistent columnwise flags
+            _cleared = 0
             for m in trainer.model.modules():
-                if hasattr(m, '_mxfp4_weight_cache'):
+                if hasattr(m, "_mxfp4_weight_cache"):
                     del m._mxfp4_weight_cache
-                if hasattr(m, '_mxfp4_persist_columnwise'):
+                    _cleared += 1
+                if hasattr(m, "_mxfp4_persist_columnwise"):
                     del m._mxfp4_persist_columnwise
+
+            # Force TE to re-initialize fp8_meta under the new (DelayedScaling/MXFP8)
+            # recipe on the next forward. Without this, modules keep their old
+            # MXFP4BlockScalingRecipeState while the recipe + weights changed under
+            # them, and the next GEMM dereferences scale/amax pointers from the
+            # wrong RecipeState type — observed as a HIP "Memory access fault on (nil)".
+            #
+            # NOTE: TE's set_meta_tensor() detects RecipeState type mismatch on its
+            # own and overwrites fp8_meta["scaling_fwd"|"scaling_bwd"]. We must NOT
+            # pop those keys here, otherwise its early-return branch (gated by
+            # fp8_meta_tensors_initialized=True) raises KeyError: 'scaling_fwd'.
+            reset_fp8_state(trainer.lightning_module)
+
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
             self.mllogger.event(
                 key="healing",
@@ -510,10 +679,11 @@ class CustomCallback(LoggingCallback):
         return super().on_train_batch_end(trainer, pl_module, outputs, batch, batch_idx)
 
     def on_validation_start(self, trainer, pl_module):
-        _is_warmup = getattr(trainer, 'warmup', False)
+        _is_warmup = getattr(trainer, "warmup", False)
         if not _is_warmup:
             torch.cuda.synchronize()
             import megatron.core.fp4_utils
+
             if megatron.core.fp4_utils._mxfp4_phase:
                 torch.cuda.empty_cache()
             self._log_throughput(trainer.global_step)
@@ -521,8 +691,8 @@ class CustomCallback(LoggingCallback):
         super().on_validation_start(trainer, pl_module)
 
         if not _is_warmup:
-            trainer.val_check_interval = ceil(int(os.environ.get("VAL_CHECK_INTERVAL", 384)) / self.gbs)
-            trainer.val_check_batch = ceil(int(os.environ.get("VAL_CHECK_INTERVAL", 384)) / self.gbs)
+            trainer.val_check_interval = ceil(int(os.environ.get("VAL_CHECK_INTERVAL", "384")) / self.gbs)
+            trainer.val_check_batch = ceil(int(os.environ.get("VAL_CHECK_INTERVAL", "384")) / self.gbs)
 
         if self.cfg.model.eval_cp:
             trainer.model.config.context_parallel_size = self.cfg.model.eval_cp
@@ -585,10 +755,9 @@ class CustomCallback(LoggingCallback):
 
     def warmup(self, trainer, pl_module):
         if self.cfg.model.custom.warmup:
-            # Free val_loop MXFP4 cache and disable caching during warmup.
             for m in trainer.model.modules():
                 m._mxfp4_cache_disabled = True
-                if hasattr(m, '_mxfp4_weight_cache'):
+                if hasattr(m, "_mxfp4_weight_cache"):
                     del m._mxfp4_weight_cache
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -599,17 +768,15 @@ class CustomCallback(LoggingCallback):
                     self.cfg.model.custom.warmup_train_steps,
                     self.cfg.model.custom.warmup_validation_steps,
                 )
-                if (
-                    self.cfg.model.fp8
-                    and self.cfg.model.custom.reset_fp8_stats_after_warmup
-                ):
+                if self.cfg.model.fp8 and self.cfg.model.custom.reset_fp8_stats_after_warmup:
                     reset_fp8_state(pl_module)
-            except Exception:
-                pass
+            except Exception as e:
+                if trainer.global_rank == 0:
+                    print(f"[training_warmup] FAILED (non-fatal): {e}", flush=True)
             for m in trainer.model.modules():
-                if hasattr(m, '_mxfp4_cache_disabled'):
+                if hasattr(m, "_mxfp4_cache_disabled"):
                     del m._mxfp4_cache_disabled
-                if hasattr(m, '_mxfp4_weight_cache'):
+                if hasattr(m, "_mxfp4_weight_cache"):
                     del m._mxfp4_weight_cache
             torch.cuda.empty_cache()
 
@@ -650,9 +817,7 @@ class MetricsLogger(MLPerfLogger):
             self.mllogger.constants.EVAL_SAMPLES: np.load(
                 f"{self.cfg.data_root}/validation.npy", allow_pickle=True
             ).shape[0],
-            self.mllogger.constants.GRADIENT_ACCUMULATION_STEPS: int(
-                os.getenv("MINIBS", "1")
-            )
+            self.mllogger.constants.GRADIENT_ACCUMULATION_STEPS: int(os.getenv("MINIBS", "1"))
             // self.mbs,
         }
 

@@ -2,16 +2,18 @@
 source $(dirname ${BASH_SOURCE[0]})/config_common.sh
 
 export MAX_STEPS=${MAX_STEPS:--1}
-export WARMUP_STEPS=${WARMUP_STEPS:-1600}
+export WARMUP_STEPS=${WARMUP_STEPS:-0}
 
-export BATCHSIZE=512
-export LEARNING_RATE=${LEARNING_RATE:-"0.0002"}
+export BATCHSIZE=2048
+export LEARNING_RATE=${LEARNING_RATE:-"0.0003"}
 export MBS=32
-export FP8_RECIPE="delayed"  # mxfp8 currently not working on AMD GPU
-# System parameters
-export DGXNNODES=1
+export FP8_RECIPE="delayed"
+export DGXNNODES=8
 export DGXNGPU=8
-export SEGMENT=${DGXNNODES:-1}
+export SEGMENT=${DGXNNODES:-8}
+
+export MLPERF_SUBMISSION_ORG="AMD"
+export MLPERF_SUBMISSION_PLATFORM="MI325X"
 
 export NVTE_RS_STRIDED_ATOMIC=2
 export NVTE_FP8_DPA_BWD=1
@@ -33,9 +35,9 @@ export NVTE_LOG_CK_CONFIG=0
 export NVTE_LOG_FUSED_ATTN_CONFIG=0
 export CHECK_FOR_NAN_IN_GRAD=0
 
-export FUSED_SOFTMAX=0              # not in TE
-export RMSNORM_CAST=0               # not in TE
-export ENABLE_TRANSPOSE_CACHE=0     # check
+export FUSED_SOFTMAX=0
+export RMSNORM_CAST=0
+export ENABLE_TRANSPOSE_CACHE=0
 
 export USE_HIPBLASLT=1
 export TORCH_BLAS_PREFER_HIPBLASLT=1
@@ -44,10 +46,10 @@ export TORCH_BLAS_PREFER_HIPBLASLT=1
 export WALLTIME_RUNANDTIME=200
 export WALLTIME=$((5 + ${NEXP:-1} * ($WALLTIME_RUNANDTIME + 5)))
 
+export HSA_NO_SCRATCH_RECLAIM=1
+
 export CUDA_GRAPH_IMPL=local
 export CPU_OFFLOADING=False
 export CPU_OFFLOADING_ACTIVATIONS=False
 export COMPILE_DIT=1
 export COMPILE_DIT_STRATEGY=stack
-
-export HSA_NO_SCRATCH_RECLAIM=1

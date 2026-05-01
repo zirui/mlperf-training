@@ -23,8 +23,8 @@ cd $SCRIPT_DIR
 : "${CLEAR_CACHES:=1}"
 : "${CONT_NAME:=mlperf_flux1}"
 : "${LOG_FREQ:=0}"
-: "${ROOT_SEED:=${ROOT_SEED}}"
 : "${NGPU:=1}"
+: "${RUNTIME_TUNABLES:=1}"
 
 # ======= Experiment variables with defaults =======
 ## Profiler
@@ -50,8 +50,6 @@ cd $SCRIPT_DIR
 
 : "${ENABLE_TRAINING_METRICS_COLLECTION:=0}"
 
-echo "ROOT SEED IS: $ROOT_SEED"
-
 # ======== Get Environment Variables from config ========
 readonly _config_file="./config_${DGXSYSTEM}.sh"
 readonly _cont_name="${CONT_NAME}"
@@ -67,6 +65,20 @@ _cont_mounts=(
 
 echo "Stopping all existing containers ..."
 ${DOCKER} ps -q | xargs -r ${DOCKER} stop
+
+# ======= Pre-pull image on this node =======
+echo "[$(hostname)] pulling ${CONT}"
+for _attempt in 1 2 3; do
+    if ${DOCKER} pull "${CONT}"; then
+        break
+    fi
+    if [[ ${_attempt} -eq 3 ]]; then
+        echo "[$(hostname)] ERROR: failed to pull ${CONT} after 3 attempts" >&2
+        exit 1
+    fi
+    echo "[$(hostname)] pull attempt ${_attempt} failed, retrying in 10s..." >&2
+    sleep 10
+done
 
 # Get list of envvars to pass to docker
 mapfile -t _config_env < <(env -i bash -c ". ${_config_file} && compgen -e" | grep -E -v '^(PWD|SHLVL)')
@@ -141,6 +153,22 @@ echo "SLURM_NODEID: $SLURM_NODEID"
 echo "SLURM_NNODES: $SLURM_NNODES"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
 
+# Shared-filesystem barrier using per-node touch files under LOGDIR.
+# LOGDIR is on shared storage, so every node sees the same files.
+_barrier() {
+  local _dir="${LOGDIR}/.barriers/${SLURM_JOB_ID:-nojob}/$1"
+  local _timeout="${2:-600}"
+  mkdir -p "${_dir}"
+  touch "${_dir}/${SLURM_NODEID}.tmp" && mv "${_dir}/${SLURM_NODEID}.tmp" "${_dir}/${SLURM_NODEID}"
+  local _start; _start=$(date +%s)
+  while (( $(find "${_dir}" -maxdepth 1 -type f -not -name '*.tmp' | wc -l) < ${SLURM_NNODES:-1} )); do
+    if (( $(date +%s) - _start > _timeout )); then
+      echo "[$(hostname)] ERROR: barrier '$1' timed out after ${_timeout}s" >&2; return 1
+    fi
+    sleep 2
+  done
+}
+
 # =============== Run experiments  ================
 for _experiment_index in $(seq 1 $NEXP); do
 {
@@ -153,8 +181,11 @@ mllogger = mllog.get_mllogger()
 mllogger.event(key=mllog.constants.CACHE_CLEAR, value=True)"
   fi
 
-  export SEED=$(($ROOT_SEED - 1 + 10#$_experiment_index))
+  export SEED=$RANDOM
   echo 'launching experiment using:' ${_all_env[@]} --env=SEED=$SEED ${_cont_name} ./run_and_time.sh
+  # Barrier here ensures all nodes enter torchrun together,
+  # after any per-node work (e.g. cache clearing) has completed.
+  #_barrier "trial_${_experiment_index}" 900
   ${DOCKER} exec \
     -e MASTER_ADDR=$MASTER_ADDR \
     -e MASTER_PORT=$MASTER_PORT \

@@ -3,6 +3,12 @@ export HYDRA_FULL_ERROR=1
 export TQDM_DISABLE=True
 export DISABLE_PRINT=${DISABLE_PRINT:-True} # filter out nemo prints. Set to False to debug.
 
+# MLPerf run-log verbosity. Default 0 keeps only :::MLLOG + ``run_and_time.sh``
+# banners on stdout. Set to 1 to restore the full framework output (NeMo /
+# Lightning / TE / aiter / Gloo / hipify / ... banners) when debugging.
+export MLPERF_VERBOSE_LOGS=${MLPERF_VERBOSE_LOGS:-0}
+export LOG_EVERY_N_STEPS=100
+
 export MODEL=${MODEL:-schnell}
 export DATA=${DATA:-cc12m}
 export TARGET_ACCURACY=${TARGET_ACCURACY:-0.586}

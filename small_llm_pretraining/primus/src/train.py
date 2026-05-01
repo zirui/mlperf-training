@@ -1,3 +1,5 @@
+import _log_suppression  # noqa: F401  # must precede all other imports
+
 import argparse
 import os
 import sys
@@ -15,6 +17,8 @@ if MEGATRON_PATH not in sys.path:
 from primus.core.launcher.config import PrimusConfig
 from primus.core.launcher.parser import load_primus_config, add_pretrain_parser
 from primus_mllog import MLPerfMegatronPretrainTrainer
+
+_log_suppression.reapply_quiet_logger_levels()
 
 
 def setup_environment(data_path: Optional[str] = None) -> None:

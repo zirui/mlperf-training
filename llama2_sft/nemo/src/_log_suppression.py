@@ -72,6 +72,8 @@ QUIET_LOGGER_NAMES = (
     # Multi-storage client chatter.
     "multistorageclient",
     "multistorageclient.config",
+    # Llama2-local loggers used by custom_callbacks
+    "callbacks.custom_callbacks",
 )
 
 

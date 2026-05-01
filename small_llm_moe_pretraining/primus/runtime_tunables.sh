@@ -1,4 +1,5 @@
 #!/bin/bash
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 echo 3 | sudo tee /proc/sys/vm/drop_caches
 sudo modprobe amdgpu

@@ -25,12 +25,12 @@ export MODEL=/model
 # -----------------------------------------------------------------------------
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
-export PRIMUS_MICRO_BATCH_SIZE=2
-export PRIMUS_GLOBAL_BATCH_SIZE=16
+export PRIMUS_MICRO_BATCH_SIZE=4
+export PRIMUS_GLOBAL_BATCH_SIZE=32
 export EVAL_ITERS=$((1024 / PRIMUS_GLOBAL_BATCH_SIZE))  # MLPerf closed: eval_iters * GBS = 1024 eval samples
-export PRIMUS_LR=4.0e-4
-export PRIMUS_MIN_LR=4.0e-5 # Set to 10% of max LR
-export PRIMUS_TRAIN_ITERS=1200000      # 1.2M iters × 16 GBS = 19.2B samples
+export PRIMUS_LR=8.0e-4
+export PRIMUS_MIN_LR=8.0e-5 # Set to 10% of max LR
+export PRIMUS_TRAIN_ITERS=1200000
 export PRIMUS_LR_WARMUP_ITERS=128
 export PRIMUS_LR_DECAY_ITERS=$((PRIMUS_TRAIN_ITERS-PRIMUS_LR_WARMUP_ITERS)) # 1200000 - 128 = 1199872
 # export SEED=30279
@@ -76,16 +76,12 @@ export NVTE_USE_OPTIMIZED_HIPIFIED_CAST_TRANSPOSE=1
 # -----------------------------------------------------------------------------
 # NVTE — FMHA / CK Backend
 # -----------------------------------------------------------------------------
-export NVTE_FLASH_ATTN=0                   # Disable FlashAttention so FusedAttention (CK/ASM) is used
-export NVTE_CK_USES_FWD_V3=0              # Global default off; patch overrides per-call
-export NVTE_CK_USES_BWD_V3=0              # Global default off; patch overrides per-call
-export NVTE_FMHA_USE_BSHD=1                # Convert SBHD→BSHD in TEDotProductAttention for CK backends
-export NVTE_CK_IS_V3_ATOMIC_FP32=0
+export NVTE_FLASH_ATTN=0                  # Disable FlashAttention so FusedAttention (CK/ASM) is used
+export NVTE_CK_USES_FWD_V3=1              # Globally on; aiter selects v3 vs CK-tile internally
+export NVTE_CK_USES_BWD_V3=1              # Globally on; aiter selects v3 vs CK-tile internally
+export NVTE_FMHA_USE_BSHD=1               # Convert SBHD→BSHD in TEDotProductAttention for CK backends (mandatory: aiter SBHD bwd corrupts grads on this aiter SHA)
+export NVTE_CK_IS_V3_ATOMIC_FP32=0        # 0=a16 (atomic fp16), 1=a32 (atomic fp32) 
 export NVTE_CK_V3_BF16_CVT=2              # 0=RTNE (default on gfx950), 1=RTNA, 2=RTZ (1,2 deprecated on gfx950)
-export NVTE_FMHA_BACKEND_DENSE_FWD=ck     # Dense fwd: ck (CK-tile)
-export NVTE_FMHA_BACKEND_DENSE_BWD=ck_v3  # Dense bwd: v3 ASM (23 min e2e boost)
-export NVTE_FMHA_BACKEND_SWA_FWD=ck       # SWA fwd:   ck (CK-tile, v3 doesn't support SWA)
-export NVTE_FMHA_BACKEND_SWA_BWD=ck       # SWA bwd:   ck (CK-tile, v3 doesn't support SWA)
 
 # -----------------------------------------------------------------------------
 # NVTE — Debug (disable for production runs)
@@ -134,3 +130,4 @@ export MLPERF_VERBOSE_LOGS=${MLPERF_VERBOSE_LOGS:-0}
 # fused rms and swiglu no cat
 export PRIMUS_FUSED_RESIDUAL_NORM=1
 export PRIMUS_MOE_SWIGLU_NOCAT=1
+export MLLOG_BLOCK_TPUT_LOG=0

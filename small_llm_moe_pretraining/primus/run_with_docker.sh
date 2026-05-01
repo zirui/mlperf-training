@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -82,33 +82,17 @@ cleanup_docker() {
 cleanup_docker
 trap 'set -eux; cleanup_docker' EXIT
 
-# Setup container
-# Use DGXSYSTEM to determine hardware type (MI* = AMD/ROCm, otherwise NVIDIA)
-if [[ "${DGXSYSTEM}" == MI* ]]; then
-  echo "Using AMD/ROCm container flags"
-  docker run --rm --init --detach \
-      --net=host --uts=host --ipc=host \
-      --device /dev/dri --device /dev/kfd --device=/dev/infiniband \
-      --cap-add=SYS_PTRACE --cap-add=CAP_SYS_ADMIN \
-      --security-opt=seccomp=unconfined \
-      --group-add video \
-      --privileged \
-      --name="${_cont_name}" "${_cont_mounts[@]}" \
-      -e IMAGE_NAME="${CONT}" \
-      "${CONT}" sleep infinity
-else
-  echo "Using NVIDIA container flags"
-  docker run --rm --init --detach \
-      --net=host --uts=host \
-      --ipc=host --gpus all \
-      --ulimit memlock=-1 \
-      --ulimit stack=67108864 \
-      --device=/dev/infiniband \
-      --security-opt=seccomp=unconfined \
-      --name="${_cont_name}" "${_cont_mounts[@]}" \
-      -e IMAGE_NAME="${CONT}" \
-      "${CONT}" sleep infinity
-fi
+# Setup container (AMD/ROCm)
+docker run --rm --init --detach \
+    --net=host --uts=host --ipc=host \
+    --device /dev/dri --device /dev/kfd --device=/dev/infiniband \
+    --cap-add=SYS_PTRACE --cap-add=CAP_SYS_ADMIN \
+    --security-opt=seccomp=unconfined \
+    --group-add video \
+    --privileged \
+    --name="${_cont_name}" "${_cont_mounts[@]}" \
+    -e IMAGE_NAME="${CONT}" \
+    "${CONT}" sleep infinity
 
 
 # Make sure container has time to finish initialization

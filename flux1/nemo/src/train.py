@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# ---------------------------------------------------------------------------
+# Non-MLLOG log suppression. Must be imported BEFORE any other import that
+# may log/print at import time (lightning_optimized, NeMo, Lightning, TE,
+# aiter, the diffusion VAE blocks module, ...). See ``_log_suppression.py``
+# for the full strategy; the short version is that non-MLLOG output is
+# gated behind ``MLPERF_VERBOSE_LOGS=1`` via Python logging levels + env
+# vars + an FD-level stdout filter for native C++ writes that bypass the
+# above.
+# ---------------------------------------------------------------------------
+import _log_suppression as _log_suppression  # noqa: F401
+# ---------------------------------------------------------------------------
+
 import os
 import math
 
@@ -127,6 +139,16 @@ def instantiate_optimizer_config(cfg: DictConfig):
 
 @hydra.main(version_base=None, config_path="../conf", config_name="flux1_schnell")
 def main(cfg: DictConfig) -> None:
+    # Hydra reconfigures the root logger when ``@hydra.main`` fires (resetting
+    # it to INFO with the ``[DATE][name][LEVEL] - msg`` formatter), which
+    # undoes the level suppression installed by ``_log_suppression`` at
+    # import time. Re-apply it here so lines like
+    # ``[DATE][root][INFO] - Vae not provided...`` or
+    # ``[DATE][root][INFO] - rank N world_size 8 ...`` stay hidden in quiet
+    # mode. Under ``MLPERF_VERBOSE_LOGS=1`` this is a no-op.
+    if not _log_suppression.VERBOSE_LOGS:
+        _log_suppression.reapply_quiet_logger_levels()
+
     OmegaConf.resolve(cfg)
     if cfg.disable_print:
         disable_print()

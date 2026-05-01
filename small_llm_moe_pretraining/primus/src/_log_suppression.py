@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
 # ---------------------------------------------------------------------------
 # Non-MLLOG log suppression for the GPT-OSS-20B MoE pretraining benchmark.
 #

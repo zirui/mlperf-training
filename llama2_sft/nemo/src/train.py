@@ -218,6 +218,40 @@ def get_rank():
     return int(os.getenv("SLURM_PROCID", os.getenv("RANK", 0)))
 
 
+def _env_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _megatron_cuda_graph_kwargs(cfg: DictConfig) -> dict:
+    """Map MCORE / LAYER env booleans to ``cuda_graph_impl`` only.
+
+    Megatron migrates ``enable_cuda_graph`` / ``external_cuda_graph`` to
+    ``cuda_graph_impl`` in ``__post_init__`` but does not clear the legacy
+    flags. NeMo's strategy calls ``config.__post_init__`` again on connect; the
+    migration block then requires ``cuda_graph_impl == "none"`` whenever a
+    legacy flag is true, which fails after the first run. Passing
+    ``cuda_graph_impl`` and keeping both legacy flags false avoids that.
+    """
+    mcore = bool(cfg.model.enable_cuda_graph)
+    layer = bool(cfg.model.external_cuda_graph)
+    if mcore and layer:
+        raise ValueError(
+            "enable_cuda_graph (MCORE_CUDA_GRAPH) and external_cuda_graph "
+            "(LAYER_CUDA_GRAPH) cannot both be enabled."
+        )
+    if mcore:
+        impl = "local"
+    elif layer:
+        impl = "transformer_engine"
+    else:
+        impl = "none"
+    return {
+        "enable_cuda_graph": False,
+        "external_cuda_graph": False,
+        "cuda_graph_impl": impl,
+    }
+
+
 def prepare_dataset(
     cfg: DictConfig = None,
     tokenizer: AutoTokenizer = None,
@@ -359,6 +393,9 @@ def prepare_model(tokenizer: AutoTokenizer, cfg: DictConfig):
         gradient_accumulation_fusion=False,
         bias_dropout_fusion=True,
         disable_parameter_transpose_cache=False,
+        keep_fp8_weight_transpose_cache=_env_enabled("ENABLE_TRANSPOSE_CACHE"),
+        **_megatron_cuda_graph_kwargs(cfg),
+        cuda_graph_scope=cfg.model.cuda_graph_scope,
         cpu_offloading=cfg.model.cpu_offloading,
         cpu_offloading_num_layers=cfg.model.cpu_offloading_num_layers,
         cpu_offloading_activations=cfg.model.cpu_offloading_activations,
@@ -369,6 +406,8 @@ def prepare_model(tokenizer: AutoTokenizer, cfg: DictConfig):
         recompute_num_layers=cfg.model.recompute_num_layers,
         distribute_saved_activations=cfg.model.distribute_saved_activations,
         recompute_modules=cfg.model.recompute_modules,
+        use_transformer_engine_op_fuser=cfg.model.use_transformer_engine_op_fuser,
+        fused_single_qkv_rope=cfg.model.fused_single_qkv_rope,
         fp4_param=cfg.model.fp4_param,
         fp4=cfg.model.fp4,
     )
@@ -391,6 +430,7 @@ def prepare_model(tokenizer: AutoTokenizer, cfg: DictConfig):
 def prepare_training_strategy(
     cfg: DictConfig,
 ) -> tuple[nl.MegatronStrategy, nl.MegatronMixedPrecision, MegatronCommOverlapCallback]:
+    keep_fp8_transpose_cache = _env_enabled("ENABLE_TRANSPOSE_CACHE")
     def validation_step_patch(self, dataloader_iter, *args, **kwargs):
         with self.precision_plugin.val_step_context():
             out = self.model.validation_step(dataloader_iter, *args, **kwargs)
@@ -431,6 +471,7 @@ def prepare_training_strategy(
             overlap_param_gather=cfg.ddp.overlap_param_gather,
             fp8_param_gather=cfg.ddp.fp8_param_gather,
             average_in_collective=cfg.ddp.average_in_collective,
+            keep_fp8_transpose_cache=keep_fp8_transpose_cache,
             use_distributed_optimizer=cfg.optim.use_distributed_optimizer,
             use_custom_fsdp=cfg.model.fsdp == "megatron",
             data_parallel_sharding_strategy=data_parallel_sharding_strategy,
@@ -439,12 +480,15 @@ def prepare_training_strategy(
         ),
     )
 
-    if cfg.model.fp8 and cfg.model.fp4:
-        fp8_type = "hybrid"
-        fp4_type = None
-    else:
-        fp8_type = "hybrid" if cfg.model.fp8 else None
-        fp4_type = "e2m1" if cfg.model.fp4 else None
+    fp4_type = "e2m1" if cfg.model.fp4 else None
+    # fp4 and fp8 are mutually exclusive in transformer_block (fp8 takes
+    # precedence). The callback monkey-patches get_fp4_recipe to swap in
+    # the FP8 DelayedScaling recipe at healing_iter, so the fp4 codepath
+    # handles both phases. Force fp8_type to None whenever fp4 is on,
+    # otherwise weights end up MXFP4 while activations get quantized to
+    # FP8 → 'Float8TensorStorage has no attribute _rowwise_data' in
+    # mxfp4_gemm.
+    fp8_type = None if fp4_type is not None else ("hybrid" if cfg.model.fp8 else None)
 
     precision = nl.MegatronMixedPrecision(
         precision="bf16-mixed",

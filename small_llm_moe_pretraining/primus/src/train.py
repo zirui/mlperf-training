@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
 # ---------------------------------------------------------------------------
 # Non-MLLOG log suppression. Must be imported BEFORE any other import that
 # may log/print at import time (Primus, Megatron, TE, aiter, primus_mllog,

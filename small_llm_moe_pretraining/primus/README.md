@@ -81,10 +81,10 @@ Set appropriate configuration and system-specific hyperparameters:
 
 | Config File | System | GPUs |
 |-------------|--------|------|
-| `config_MI355X_1x8x1_tp1pp1ep8_gbs16_fp8.sh` | MI355X | 1 node × 8 GPUs |
+| `config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh` | MI355X | 1 node × 8 GPUs |
 
 ```bash
-source config_MI355X_1x8x1_tp1pp1ep8_gbs16_fp8.sh
+source config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh
 ```
 
 ## Launch Training
@@ -93,7 +93,7 @@ source config_MI355X_1x8x1_tp1pp1ep8_gbs16_fp8.sh
 
 ```bash
 export NEXP=1
-export CONFIG_NAME=config_MI355X_1x8x1_tp1pp1ep8_gbs16_fp8.sh
+export CONFIG_NAME=config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh
 bash run_with_docker.sh
 ```
 
@@ -132,8 +132,8 @@ Primus / Megatron / TransformerEngine import. It works in three layers:
    sink, `warnings.warn`, hipify) is informational.
 
 Set `MLPERF_VERBOSE_LOGS=1` to restore the full framework output for
-debugging. The variable defaults to `0` in every
-`config_MI355X_1x8x1_*_fp8.sh` and can be overridden at the shell:
+debugging. The variable defaults to `0` in
+`config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh` and can be overridden at the shell:
 
 ```bash
 export MLPERF_VERBOSE_LOGS=1
@@ -152,7 +152,7 @@ Validation log perplexity = **3.34**
 
 ## Evaluation Frequency
 
-Evaluation every **768 iterations** (12,288 samples with GBS=16)
+Evaluation every **384 iterations** (12,288 samples with GBS=32)
 
 ## Evaluation Thoroughness
 
@@ -166,15 +166,15 @@ We evaluate using **1024 sequences** from the validation dataset.
 | Architecture | GPT with Mixture of Experts |
 | Sequence Length | 8192 |
 | Precision | BF16 / FP8 hybrid |
-| Expert Parallelism | 8 |
+| Expert Parallelism | 1 |
 
 # 6. Training Configuration
 
 | Hyperparameter | Value |
 |----------------|-------|
-| Micro Batch Size | 2 |
-| Global Batch Size | 16 |
-| Learning Rate | 4e-4 |
+| Micro Batch Size | 4 |
+| Global Batch Size | 32 |
+| Learning Rate | 8e-4 |
 | LR Schedule | Cosine decay with warmup |
 | Weight Decay | 0.1 |
 | Adam β1, β2 | 0.9, 0.95 |
@@ -183,16 +183,15 @@ We evaluate using **1024 sequences** from the validation dataset.
 # 7. Directory Structure
 
 ```
-gpt-oss-20b/primus/
-├── conf/                       # Configuration files
-│   └── gpt_oss_20B-pretrain.yaml
-├── dev/                        # Development scripts
+small_llm_moe_pretraining/primus/
+├── conf/                                       # Configuration files
+│   └── gpt_oss_20B-pretrain-fp8.yaml
+├── dev/                                        # Development scripts
 │   ├── build_docker.sh
 │   ├── run_docker.sh
 │   └── run_and_time.sh
-├── src/                        # Training source code
+├── src/                                        # Training source code
 │   └── train.py
-├── config_MI355X_1x8x1.sh      # System configuration
-├── Dockerfile
-└── requirements.txt            # Python dependencies (includes primus-mllog)
+├── config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh      # System configuration
+└── Dockerfile
 ```

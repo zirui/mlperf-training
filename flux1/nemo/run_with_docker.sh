@@ -74,7 +74,7 @@ mllogger.event(key=mllog.constants.CACHE_CLEAR, value=True)"
     fi
     _config_env+=(--env=SEED=$RANDOM) # Reset random seed
     docker exec ${_config_env[@]} --env=HYDRA_FULL_ERROR ${_cont_name} ./run_and_time.sh
-  ) 2>&1| grep --line-buffered -v "connected peer ranks" | grep --line-buffered -v "Returning latency value" | tee "${_logfile_base}_${_experiment_index}.log"
+  ) 2>&1 | tee "${_logfile_base}_${_experiment_index}.log"
 
 done
 

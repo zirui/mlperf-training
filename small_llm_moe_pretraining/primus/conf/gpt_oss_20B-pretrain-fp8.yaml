@@ -48,6 +48,7 @@ modules:
       use_pytorch_profiler: ${PRIMUS_PROFILE:false}
       profile_step_end: ${PRIMUS_PROFILE_STEP_END:32}
       profile_step_start: ${PRIMUS_PROFILE_STEP_START:16}
+      profile_ranks: [0,1,2,3,4,5,6,7]
       
       # enable fp8 training
       fp8: e4m3
@@ -100,7 +101,7 @@ modules:
       moe_permute_fusion: true
       gradient_accumulation_fusion: true
       moe_use_legacy_grouped_gemm: true # Sync-Free MoE stage 2 or 3 require PrimusTurboGroupedMLP, please set `moe_use_legacy_grouped_gemm=True
-      moe_use_fused_router_with_aux_score: false
+      moe_use_fused_router_with_aux_score: true
       multi_latent_attention: false # Flag config.ENABLE_EXPERIMENTAL not enabled
       apply_rope_fusion: true
 
@@ -175,6 +176,7 @@ modules:
       use_turbo_attention: false
       use_turbo_grouped_mlp: true
       use_turbo_rms_norm: ${USE_TURBO_RMS_NORM:true}
+      use_turbo_fused_act_with_probs : true
 
       # deepep
       use_turbo_deepep: false

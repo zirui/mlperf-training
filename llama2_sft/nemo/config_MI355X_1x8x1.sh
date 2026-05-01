@@ -27,7 +27,7 @@ export NVTE_FUSED_ATTN_AOTRITON=1
 export NVTE_DEBUG=0
 export NVTE_DEBUG_LEVEL=0
 export NVTE_USE_HIPBLASLT=1
-export NVTE_USE_CAST_TRANSPOSE_TRITON=1
+export NVTE_USE_CAST_TRANSPOSE_TRITON=0
 export NVTE_USE_OPTIMIZED_HIPIFIED_CAST_TRANSPOSE=0
 export USE_TE_SWIGLU=1
 
@@ -39,14 +39,14 @@ export LORA_A2A=1
 export POSSIBLE_USER_WARNINGS=0
 export CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=0
 
-export MAX_STEPS=1024
+export MAX_STEPS=1
 export TP=1
 export PP=1
 export CP=1
 export SP=False
 export VBOOST_VALUE=1
 export MBS=1
-export LR=0.0004
+export LR=0.0006
 export MINIBS=1
 export SKIP_EVALS=3
 export VAL_CHECK_INTERVAL=384
@@ -72,26 +72,42 @@ export TORCH_BLAS_PREFER_HIPBLASLT=1
 export MLPERF_SUBMISSION_ORG="AMD"
 export MLPERF_SUBMISSION_PLATFORM="MI355X"
 
-export NVTE_USE_RMSNORM_TRITON=1
+export NVTE_USE_RMSNORM_TRITON=0
 export ENABLE_TRANSPOSE_CACHE=0
 export NVIDIA_PYTORCH_VERSION=25.04 
 export OMP_NUM_THREADS=1
 
 export LOGGING_INTERVAL=5000
-export FP4=False
-export USE_HADAMARD=False
+export FP4=True
+export FP4_RECIPE=mxfp4
+export NVTE_MXFP4_USE_HADAMARD=1
+export MAX_STEPS=550
 export NEXP=1
 
 export LOAD_CKPT=True
 export HEALING_PRECISION=FP8_DS
-export HEALING_ITER=0
-export PRE_QUANTIZED_MODEL=False
+export MCORE_CUDA_GRAPH=False
+export RESET_CG_AFTER_HEALING=False
+
+# Healing: switch from MXFP4 to FP8 at this step (0 = no healing, pure MXFP4)
+export HEALING_ITER=340
+export PRE_QUANTIZED_MODEL=True
+
+# Activation recompute during MXFP4 phase (disabled at healing for FP8)
+export RECOMPUTE_GRANULARITY=null
+export RECOMPUTE_METHOD=null
+export RECOMPUTE_NUM_LAYERS=null
 
 export FP8_ACT=0
 
+export AITER_CONFIG_GEMM_A4W4=/workspace/code/a4w4_tuned_gemms.csv
+export AITER_LOG_TUNED_CONFIG=0
+
+# FP4 GEMM tuning: log kernel selection (set 1 for debug, 0 for perf runs)
+export NVTE_FP4_LOG_GEMM_SHAPES=0
+
 export AITER_LOG_LEVEL=ERROR
 export AITER_LOG_MORE=0
-
 # MLPerf run-log verbosity. Default 0 keeps only :::MLLOG + ``run_and_time.sh``
 # banners on stdout. Set to 1 to restore the full framework output (NeMo /
 # Lightning / TE / aiter / Gloo / hipify / ... banners) when debugging.
