@@ -1,0 +1,17 @@
+num_nodes: 1
+gpus_per_node: 8
+model_name: small_llm_pretraining/nemo
+docker_image: rocm/mlperf:llama31_8b_training_5.1_2025-08-22-07-31-23
+sbatch_template: launcher/templates/sbatch.sh.j2
+experiment_type: 'train'
+num_experiments: 1
+model_store:
+  store_name: mlperf_training
+  experiment_logdir: '/mlperf/training/small_llm_pretraining_nemo/experiments/'
+  cache:
+    model_dir: /mlperf/training/small_llm_pretraining_nemo/model/
+    data_dir: /mlperf/training/small_llm_pretraining_nemo/data/
+megatron_config:
+  cp: 1
+  tp: 1
+  pp: 1
