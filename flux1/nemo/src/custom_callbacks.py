@@ -177,6 +177,13 @@ class CustomCallback(LoggingCallback):
                 key="time_to_train_minutes",
                 value=duration_minutes,
             )
+            if duration_minutes > 0 and trainer.global_step > 0:
+                samples = trainer.global_step * self.gbs
+                self.mllogger.event(
+                    key="throughput_samples_per_second",
+                    value=samples / (duration_minutes * 60.0),
+                    metadata={"samples_count": samples},
+                )
 
     def on_validation_end(self, trainer, pl_module):
         result = super().on_validation_end(trainer, pl_module)

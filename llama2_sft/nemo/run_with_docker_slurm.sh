@@ -55,6 +55,7 @@ _cont_mounts=(
     "--volume=${DATADIR}:/data"
     "--volume=${MODELDIR}:/ckpt"
     "--volume=${LOGDIR}:/logs"
+    "--volume=$(pwd)/../../utilities:/workspace/utilities"
 )
 
 echo "Stopping all existing containers ..."
@@ -139,4 +140,6 @@ for _experiment_index in $(seq 0 $((NEXP-1))); do
     ${_cont_name} \
     bash ./run_and_time_slurm.sh
 } 
-done 
+done
+
+bash "${SCRIPT_DIR}/../../utilities/submission/write_software_stack_slurm.sh" "${_cont_name}" /logs docker

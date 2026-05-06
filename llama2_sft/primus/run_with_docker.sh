@@ -39,8 +39,6 @@ _config_env+=(DGXSYSTEM)
 _config_env+=(PROFILER)
 _config_env+=(LOGDIR)
 _config_env+=(HF_TOKEN)
-_config_env+=(SEED)
-
 mapfile -t _config_env < <(for v in "${_config_env[@]}"; do echo "--env=$v"; done)
 _base_config_env=("${_config_env[@]}")
 
@@ -83,10 +81,12 @@ docker exec "${_cont_name}" true
 
 for _experiment_index in $(seq 1 "${NEXP}"); do
   (
+    echo "Beginning trial ${_experiment_index} of ${NEXP}"
     if [[ $CLEAR_CACHES == 1 ]]; then
       bash -c "echo -n 'Clearing cache on ' && hostname && sync && sudo /sbin/sysctl vm.drop_caches=3"
     fi
     _run_config_env=("${_base_config_env[@]}" --env=SEED="$RANDOM")
+    echo "launching experiment using: ${_run_config_env[*]} ${_cont_name} /workspace/code/run_and_time.sh"
     docker exec "${_run_config_env[@]}" "${_cont_name}" bash /workspace/code/run_and_time.sh
   ) | grep --line-buffered -v "connected peer ranks" | tee "${_logfile_base}_${_experiment_index}.log"
 

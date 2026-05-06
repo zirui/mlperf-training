@@ -77,7 +77,7 @@ for _experiment_index in $(seq 0 $((NEXP-1))); do
   fi
   _current_log_file="${LOGDIR}/result_${_experiment_index}.txt"
   (
-    _config_env+=(--env=SEED=$RANDOM) # Reset random seed
+    _config_env+=(--env=SEED=$RANDOM)
     echo 'launching experiment using:'  ${_config_env[@]} ${_cont_name} bash ./run_and_time.sh
     docker exec ${_config_env[@]} ${_cont_name} bash ./run_and_time.sh 
   ) | tee ${_current_log_file}

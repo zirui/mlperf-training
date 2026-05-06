@@ -5,8 +5,7 @@ FROM ${BASE_IMAGE}
 WORKDIR /workspace/deps
 
 ARG PRIMUS_REPO=https://github.com/AMD-AGI/Primus.git
-# tip of mpo branch
-ARG PRIMUS_REF=724c01fac52a4952c7a3a6021e5082852a2b3ff7
+ARG PRIMUS_REF=893c18aad4769805b5f9ae1efbabdf7b505580c8
 RUN rm -rf /workspace/Primus && \
     git clone --recursive "${PRIMUS_REPO}" /workspace/Primus && \
     cd /workspace/Primus && \
@@ -16,8 +15,7 @@ RUN rm -rf /workspace/Primus && \
 
 
 ARG PRIMUS_TURBO_REPO=https://github.com/AMD-AGI/Primus-Turbo.git
-# tip of mpo branch
-ARG PRIMUS_TURBO_REF=a4897f7bd6b00b2e95dd43c7cbc6fa9bcce3a68c
+ARG PRIMUS_TURBO_REF=d372005bf487380b517044c8845031f4867d4389
 RUN git clone --recursive "${PRIMUS_TURBO_REPO}" /workspace/deps/Primus-Turbo && \
     cd /workspace/deps/Primus-Turbo && \
     git checkout "${PRIMUS_TURBO_REF}" && \
@@ -25,26 +23,35 @@ RUN git clone --recursive "${PRIMUS_TURBO_REPO}" /workspace/deps/Primus-Turbo &&
     git submodule update --init --recursive
 
 RUN pip uninstall amd-aiter aiter -y 2>/dev/null || true && \
+    cd /opt && git clone -b release/3.7.x https://github.com/triton-lang/triton.git && \
+    cd triton && pip3 install ninja cmake && \
+    MAX_JOBS=8 pip3 install --no-build-isolation -v . && rm -rf /opt/triton && \
     cd /workspace/deps/Primus-Turbo && \
     pip3 install -r requirements.txt && \
     PYTORCH_ROCM_ARCH="gfx950;gfx942" GPU_ARCHS="gfx950;gfx942" pip3 install --no-build-isolation . -v
 
 RUN pip uninstall transformer-engine transformer_engine -y 2>/dev/null || true
 
-ARG TE_COMMIT=261eda6ab09e603d816af78d31ba793f643f28fd
-RUN git clone --recursive https://github.com/ROCm/TransformerEngine.git \
-    && cd TransformerEngine && git checkout ${TE_COMMIT} \
-    && git submodule sync \
-    && git submodule update --init --recursive
-
-COPY patches/aiter_fwd_v3_silent_fallback.patch /tmp/aiter_fwd_v3_silent_fallback.patch
+ARG TE_REPO=https://github.com/ROCm/TransformerEngine.git
+ARG TE_COMMIT=5235bae2cc683a0ad4bf15221c746ab3c1e229e7
+ARG AITER_COMMIT=c4b33df03faae1c4e470420d950f8a9589e9634d
+RUN git clone --recursive "${TE_REPO}" TransformerEngine \
+ && cd TransformerEngine \
+ && git checkout "${TE_COMMIT}" \
+ && git submodule update --init --recursive \
+ && AITER_DIR=3rdparty/QoLA/3rdparty/aiter \
+ && git -C "${AITER_DIR}" fetch origin "${AITER_COMMIT}" \
+ && git -C "${AITER_DIR}" checkout "${AITER_COMMIT}" \
+ && git -C "${AITER_DIR}" submodule update --init --recursive \
+ && sed -i "s|^aiter_commit = .*|aiter_commit = \"${AITER_COMMIT}\"|" \
+        transformer_engine/common/ck_fused_attn/qola_manifest.toml
 
 RUN cd TransformerEngine && \
-    git apply /tmp/aiter_fwd_v3_silent_fallback.patch && \
     NVTE_FUSED_ATTN_AOTRITON=0 \
     NVTE_CK_FUSED_ATTN_PATH="" \
     NVTE_BUILD_MAX_JOBS=128 NVTE_FRAMEWORK=pytorch NVTE_ROCM_ARCH="gfx950;gfx942" \
     NVTE_USE_HIPBLASLT=1 PYTORCH_ROCM_ARCH="gfx950;gfx942" CU_NUM=304 \
+    NVTE_SKIP_SUBMODULE_CHECKS_DURING_BUILD=1 \
     pip install --no-build-isolation -e . -v
 
 RUN cd /workspace/Primus/third_party/Megatron-LM && \

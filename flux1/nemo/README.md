@@ -16,13 +16,13 @@ This file contains the instructions for running the AMD text-to-image FLUX PyTor
 
 ### 3.1 Build the container
 
-Replace `<docker/registry>` with your container registry and build:
+Build the image and tag it for your docker registry:
 
 ```bash
-docker build -t rocm/amd-mlperf:flux1_training_6.0 .
+docker build -t <docker-registry>/amd-mlperf:flux1_training_6.0 .
 ```
 
-make sure that container is accessible on your Slurm system.
+Make sure the image is accessible on every node of the intended run environment (especially for multi-node runs).
 
 ### 3.2 Download dataset and preprocess
 
@@ -49,7 +49,7 @@ python /workspace/code/scripts/to_webdataset.py --input_path /dataset/coco_prepr
 cd energon
 energon prepare --split-parts 'train:train/.*' --split-parts 'val:val/.*' ./
 # Select y for duplicate keys
-# Select y for creadint interactively
+# Select y for creating interactively
 # Select class 11
 
 # copy over empty_encodings
@@ -73,12 +73,12 @@ Exit the container.
 
 ### Set Environment
 
-Set the directory for the data and results. Ensure that `$LOGDIR` has write access for the results to be written by running `sudo chmod -R 777 $LOGDIR`, In this example we use `/data/mlperf_flux1/results` as the results directory, so please make sure to create this directory.
+Set the directories for the data and results. Make sure `$LOGDIR` exists and is writable by the container UID (`mkdir -p "$LOGDIR" && sudo chmod 777 "$LOGDIR"`). In this example, we use `/data/mlperf_flux1/results` as the results directory, so please make sure to create this directory.
 
 ```bash
 export DATADIR=/data/mlperf_flux1/data
 export LOGDIR=/data/mlperf_flux1/results
-export CONT=rocm/amd-mlperf:flux1_training_6.0
+export CONT=<docker-registry>/amd-mlperf:flux1_training_6.0
 ```
 
 ### Set Configuration

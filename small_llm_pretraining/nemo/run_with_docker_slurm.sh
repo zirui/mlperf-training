@@ -56,6 +56,7 @@ _cont_mounts=(
     "--volume=${MODELDIR}:/model"
     "--volume=${LOGDIR}:/results"
     "--volume=$(pwd):/workspace/code"
+    "--volume=$(pwd)/../../utilities:/workspace/utilities"
     "--volume=${DATADIR}/npy_indices:/npy_indices"
 )
 
@@ -142,3 +143,6 @@ for _experiment_index in $(seq 0 $((NEXP-1))); do
     bash ./run_and_time_slurm.sh
 }
 done
+
+bash "${SCRIPT_DIR}/../../utilities/submission/write_software_stack_slurm.sh" "${_cont_name}" /results docker
+

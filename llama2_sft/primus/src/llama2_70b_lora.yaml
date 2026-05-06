@@ -1,6 +1,6 @@
-# Custom recipe from Primus (can be modified without changing Megatron-Bridge code)
+# Custom MXFP4 LoRA recipe from Primus
 recipe: primus.recipes.llama2_custom
-flavor: llama2_70b_lora_config
+flavor: llama2_70b_lora_mxfp4_config
 hf_path: meta-llama/Llama-2-70b-hf
 
 dataset:

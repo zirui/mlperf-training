@@ -111,6 +111,7 @@ class CustomCallback(LoggingCallback):
         self.cp_global_ranks = None
         self.cp_stream = None
         self.logging_interval = int(os.environ.get("LOGGING_INTERVAL", "10"))
+        self._train_loss_log_freq = int(os.environ.get("MLLOG_TRAIN_LOSS_LOG_FREQ", "0"))
 
         self.throughput_timer = ThroughputTimer(self.gbs)
         self.train_start_time = None
@@ -480,6 +481,24 @@ class CustomCallback(LoggingCallback):
         torch.cuda.empty_cache()
 
 
+    def on_train_epoch_start(self, trainer, pl_module):
+        from mlperf_logging.mllog import constants
+
+        if not hasattr(trainer, "warmup") or trainer.warmup:
+            self.warmup(trainer, pl_module)
+            trainer.warmup = False
+
+        if not self.train_block_started:
+            self.mllogger.log_init_stop_run_start()
+            self.mllogger.start(
+                constants.EPOCH_START,
+                metadata={constants.SAMPLES_COUNT: 0},
+            )
+            self._start_train_block(
+                trainer,
+                self.get_train_step_samples_count(trainer, pl_module),
+            )
+
     def on_train_start(self, trainer, pl_module):
 
         self._healing_setup()
@@ -495,19 +514,7 @@ class CustomCallback(LoggingCallback):
         super().on_train_start(trainer, pl_module)
 
         torch.cuda.synchronize()
-
-        _t0 = time.time()
-        trainer.warmup = True
-        try:
-            trainer.fit_loop.epoch_loop.val_loop.run()
-        except Exception as e:
-            if trainer.global_rank == 0:
-                print(f"[pre_val_warmup] FAILED: {e}", flush=True)
-        torch.cuda.synchronize()
         torch.cuda.empty_cache()
-
-        # if self.cfg.model.healing_iter and self.cfg.model.healing_iter > 0:
-        #     self._pre_ttt_fp8_warmup(trainer)
 
         self.train_start_time = None
 
@@ -520,22 +527,41 @@ class CustomCallback(LoggingCallback):
             self._end_train_block(trainer, self.get_train_step_samples_count(trainer, pl_module))
 
         if self.train_start_time is not None:
+            from mlperf_logging.mllog import constants
+
             duration_sec = time.time() - self.train_start_time
             train_batch_size = self.get_train_step_samples_count(trainer, pl_module)
+            total_samples = trainer.global_step * train_batch_size
+
             if (hasattr(trainer, "target_reached") and trainer.target_reached) or self.force_success:
                 status = self.mllogger.constants.SUCCESS
             else:
                 status = self.mllogger.constants.ABORTED
+
+            self.mllogger.end(
+                constants.EPOCH_STOP,
+                metadata={constants.SAMPLES_COUNT: total_samples},
+            )
             self.mllogger.end(
                 self.mllogger.constants.RUN_STOP,
                 metadata={
-                    "step": trainer.global_step,
-                    self.mllogger.constants.SAMPLES_COUNT: trainer.global_step * train_batch_size,
+                    self.mllogger.constants.SAMPLES_COUNT: total_samples,
                     "status": status,
-                    "duration": f"{duration_sec} sec -> {duration_sec / 60.0} minutes",
                 },
             )
             trainer.run_stop_logged = True
+
+            overall_throughput = total_samples / duration_sec if duration_sec > 0 else 0.0
+            self.mllogger.event(
+                key="run_duration",
+                value=f"{round(duration_sec, 2)}s -> {round(duration_sec / 60.0, 2)} minutes",
+                metadata={"samples": total_samples},
+            )
+            self.mllogger.event(
+                key="throughput",
+                value=round(overall_throughput, 2),
+                metadata={"samples": total_samples},
+            )
 
         super().on_train_end(trainer, pl_module)
 
@@ -606,7 +632,7 @@ class CustomCallback(LoggingCallback):
             if trainer.global_step == 3 and self.enable_mem_profile:
                 torch.cuda.memory._dump_snapshot("/results/lora.pickle")
 
-        if trainer.global_step % self.logging_interval == 0:
+        if self._train_loss_log_freq > 0 and trainer.global_step % self._train_loss_log_freq == 0:
             self.mllogger.event(
                 key="tracked_stats",
                 value={"train_loss": outputs["loss"].item()},
@@ -670,12 +696,6 @@ class CustomCallback(LoggingCallback):
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-            self.mllogger.event(
-                key="healing",
-                value=trainer.global_step + 1,
-                metadata={"samples_count": trainer.global_step * self.gbs},
-            )
-
         return super().on_train_batch_end(trainer, pl_module, outputs, batch, batch_idx)
 
     def on_validation_start(self, trainer, pl_module):
@@ -686,9 +706,17 @@ class CustomCallback(LoggingCallback):
 
             if megatron.core.fp4_utils._mxfp4_phase:
                 torch.cuda.empty_cache()
-            self._log_throughput(trainer.global_step)
 
-        super().on_validation_start(trainer, pl_module)
+            train_batch_size = self.get_train_step_samples_count(trainer, pl_module)
+            if self.train_block_started:
+                self._end_train_block(trainer, train_batch_size)
+            self.mllogger.start(
+                self.mllogger.constants.EVAL_START,
+                metadata={
+                    self.mllogger.constants.SAMPLES_COUNT: trainer.global_step * train_batch_size,
+                    "step": trainer.global_step,
+                },
+            )
 
         if not _is_warmup:
             trainer.val_check_interval = ceil(int(os.environ.get("VAL_CHECK_INTERVAL", "384")) / self.gbs)
@@ -751,7 +779,18 @@ class CustomCallback(LoggingCallback):
                 data_parallel_size=trainer.train_dataloader.batch_sampler.data_parallel_size,
             )
 
-        super().on_validation_end(trainer, pl_module)
+        _is_warmup = getattr(trainer, "warmup", False)
+        if not _is_warmup:
+            train_batch_size = self.get_train_step_samples_count(trainer, pl_module)
+            self.mllogger.end(
+                self.mllogger.constants.EVAL_STOP,
+                metadata={
+                    self.mllogger.constants.SAMPLES_COUNT: trainer.global_step * train_batch_size,
+                    "step": trainer.global_step,
+                },
+            )
+            if not trainer.should_stop:
+                self._start_train_block(trainer, train_batch_size)
 
     def warmup(self, trainer, pl_module):
         if self.cfg.model.custom.warmup:

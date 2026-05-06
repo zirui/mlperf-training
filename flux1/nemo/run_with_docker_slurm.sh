@@ -17,6 +17,7 @@ cd $SCRIPT_DIR
 : "${CONT:?CONT not set}"
 : "${DATADIR:?DATADIR not set}"
 : "${LOGDIR:?LOGDIR not set}"
+: "${ROOT_SEED:?ROOT_SEED not set}"
 
 # ======= Vars with defaults ========
 : "${NEXP:=10}"
@@ -84,18 +85,18 @@ done
 mapfile -t _config_env < <(env -i bash -c ". ${_config_file} && compgen -e" | grep -E -v '^(PWD|SHLVL)')
 _config_env+=(DGXSYSTEM)
 
-# ========= Get sbatch environment variables =========
-# Extract only the export statements from sbatch.sh and source them
+# Optional: extra exports from ./sbatch.sh if available
+_sbatch_env=()
 readonly _sbatch_file="./sbatch.sh"
-mapfile -t _sbatch_env < <(
-    # Create a temp script with only export statements
-    grep '^export ' "${_sbatch_file}" > /tmp/sbatch_exports.sh
-    env -i bash -c ". /tmp/sbatch_exports.sh && compgen -e" | grep -E -v '^(PWD|SHLVL)'
-    rm -f /tmp/sbatch_exports.sh
-)
+if [[ -f "${_sbatch_file}" ]]; then
+    _sbatch_exports="$(mktemp)"
+    grep '^export ' "${_sbatch_file}" > "${_sbatch_exports}" || true
+    mapfile -t _sbatch_env < <(
+        env -i bash -c ". ${_sbatch_exports} && compgen -e" | grep -E -v '^(PWD|SHLVL)'
+    )
+    rm -f "${_sbatch_exports}"
+fi
 
-# Combine and convert to Docker format with explicit values
-# (sudo strips the environment, so --env=NAME alone won't work)
 _all_env=()
 for v in "${_config_env[@]}" "${_sbatch_env[@]}"; do
     _all_env+=("--env=$v=${!v}")
@@ -107,6 +108,9 @@ cleanup_docker() {
 }
 cleanup_docker
 trap 'set -eux; cleanup_docker' EXIT
+
+# ensure gpus are idle
+bash "${SCRIPT_DIR}/scripts/check_gpus_idle.sh"
 
 ${DOCKER} run --rm --init --detach \
       --net=host --uts=host \
@@ -134,13 +138,6 @@ fi
 
 ${DOCKER} exec "${_cont_name}" true
 
-# # =============== Check for InfiniBand/RDMA devices in container ============
-# echo "=== Checking for InfiniBand/RDMA devices in container ==="
-# ${DOCKER} exec "${_cont_name}" bash -c "rdma link show 2>&1 || echo 'rdma link show: No InfiniBand devices found'" || true
-# ${DOCKER} exec "${_cont_name}" bash -c "ibstat 2>&1 || echo 'ibstat: Command not found or no InfiniBand devices'" || true
-# ${DOCKER} exec "${_cont_name}" bash -c "ls -la /dev/infiniband/ 2>&1 || echo 'No /dev/infiniband directory found'" || true
-# ${DOCKER} exec "${_cont_name}" bash -c "ip link show | grep -i ib || echo 'No InfiniBand interfaces found'" || true
-
 # =============== Set up environment variables for NCCL and GLOO ============
 export NCCL_SOCKET_IFNAME=$(route | grep '^default' | grep -o '[^ ]*$')
 export GLOO_SOCKET_IFNAME=$(route | grep '^default' | grep -o '[^ ]*$')
@@ -152,22 +149,6 @@ echo "SLURM_PROCID: $SLURM_PROCID"
 echo "SLURM_NODEID: $SLURM_NODEID"
 echo "SLURM_NNODES: $SLURM_NNODES"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
-
-# Shared-filesystem barrier using per-node touch files under LOGDIR.
-# LOGDIR is on shared storage, so every node sees the same files.
-_barrier() {
-  local _dir="${LOGDIR}/.barriers/${SLURM_JOB_ID:-nojob}/$1"
-  local _timeout="${2:-600}"
-  mkdir -p "${_dir}"
-  touch "${_dir}/${SLURM_NODEID}.tmp" && mv "${_dir}/${SLURM_NODEID}.tmp" "${_dir}/${SLURM_NODEID}"
-  local _start; _start=$(date +%s)
-  while (( $(find "${_dir}" -maxdepth 1 -type f -not -name '*.tmp' | wc -l) < ${SLURM_NNODES:-1} )); do
-    if (( $(date +%s) - _start > _timeout )); then
-      echo "[$(hostname)] ERROR: barrier '$1' timed out after ${_timeout}s" >&2; return 1
-    fi
-    sleep 2
-  done
-}
 
 # =============== Run experiments  ================
 for _experiment_index in $(seq 1 $NEXP); do
@@ -181,11 +162,8 @@ mllogger = mllog.get_mllogger()
 mllogger.event(key=mllog.constants.CACHE_CLEAR, value=True)"
   fi
 
-  export SEED=$RANDOM
+  export SEED=$(( ROOT_SEED + 10#${SLURM_ARRAY_TASK_ID:-0} * 100 + 10#${_experiment_index} ))
   echo 'launching experiment using:' ${_all_env[@]} --env=SEED=$SEED ${_cont_name} ./run_and_time.sh
-  # Barrier here ensures all nodes enter torchrun together,
-  # after any per-node work (e.g. cache clearing) has completed.
-  #_barrier "trial_${_experiment_index}" 900
   ${DOCKER} exec \
     -e MASTER_ADDR=$MASTER_ADDR \
     -e MASTER_PORT=$MASTER_PORT \
@@ -199,5 +177,3 @@ mllogger.event(key=mllog.constants.CACHE_CLEAR, value=True)"
     bash ./run_and_time.sh
 }
 done
-
-

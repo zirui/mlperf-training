@@ -79,7 +79,7 @@ export NVTE_USE_OPTIMIZED_HIPIFIED_CAST_TRANSPOSE=1
 export NVTE_FLASH_ATTN=0                  # Disable FlashAttention so FusedAttention (CK/ASM) is used
 export NVTE_CK_USES_FWD_V3=1              # Globally on; aiter selects v3 vs CK-tile internally
 export NVTE_CK_USES_BWD_V3=1              # Globally on; aiter selects v3 vs CK-tile internally
-export NVTE_FMHA_USE_BSHD=1               # Convert SBHD→BSHD in TEDotProductAttention for CK backends (mandatory: aiter SBHD bwd corrupts grads on this aiter SHA)
+export NVTE_FMHA_USE_BSHD=0               # Native SBHD path (aiter c4b33df0 supports it; skips Megatron's SBHD↔BSHD shim transposes)
 export NVTE_CK_IS_V3_ATOMIC_FP32=0        # 0=a16 (atomic fp16), 1=a32 (atomic fp32) 
 export NVTE_CK_V3_BF16_CVT=2              # 0=RTNE (default on gfx950), 1=RTNA, 2=RTZ (1,2 deprecated on gfx950)
 
@@ -98,7 +98,7 @@ export NVTE_CK_V3_BF16_CVT=2              # 0=RTNE (default on gfx950), 1=RTNA, 
 export LOG_INTERVAL=999999
 export MLLOG_TRAIN_LOSS_LOG_FREQ=0
 export MLLOG_TARGET_EVAL_LOSS=3.34
-export MLLOG_OUTPUT_FILE=/results/mlperf_output.log
+export MLLOG_OUTPUT_FILE=/results/mlperf_logging.out
 export MLLOG_SAVE_TO_FILE=0
 export MLLOG_SUBMISSION_BENCHMARK=gpt_oss_20b
 export MLLOG_SUBMISSION_DIVISION=closed

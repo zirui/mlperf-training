@@ -7,7 +7,7 @@ export WARMUP_STEPS=${WARMUP_STEPS:-800}
 export BATCHSIZE=1024
 export LEARNING_RATE=${LEARNING_RATE:-"0.00025"}
 export MBS=64
-export FP8_RECIPE="delayed_short"
+export FP8_RECIPE="delayed"
 
 # System parameters
 export DGXNNODES=2

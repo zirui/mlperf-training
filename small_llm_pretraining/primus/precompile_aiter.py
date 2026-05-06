@@ -4,10 +4,11 @@ os.environ.setdefault("GPU_ARCHS", "gfx950")
 
 from aiter.jit.core import get_args_of_build, build_module
 
-# Only module_aiter_enum is JIT-compiled at runtime by primus (~8s penalty).
-# RoPE and FP4 GEMM kernels load from prebuilt .co files, not JIT.
 MODULES = [
     "module_aiter_enum",
+    "module_rope_general_fwd",
+    "module_rope_general_bwd",
+    "module_gemm_a4w4_asm",
 ]
 
 for name in MODULES:

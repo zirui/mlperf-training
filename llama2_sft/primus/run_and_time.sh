@@ -16,12 +16,22 @@ if [ -n "${PRETRAINED_CHECKPOINT}" ]; then
     POSTTRAIN_CLI_EXTRA="modules.post_trainer.overrides.pretrained_checkpoint=${PRETRAINED_CHECKPOINT}"
 fi
 
-# Launch training via primus-cli
-./runner/primus-cli direct train posttrain \
-    --config ${EXP} \
-    ${POSTTRAIN_CLI_EXTRA}
-
-ret_code=$?
+# Launch training via primus-cli.
+# In quiet mode (default), filter stdout to only pass :::MLLOG lines and
+# genuine errors; suppress hook/pip/framework noise that bypasses
+# PRIMUS_LOG_LEVEL.  Set MLLOG_VERBOSE_LOGS=1 to restore full output.
+if [[ "${MLLOG_VERBOSE_LOGS:-0}" == "1" ]]; then
+    ./runner/primus-cli direct train posttrain \
+        --config ${EXP} \
+        ${POSTTRAIN_CLI_EXTRA}
+    ret_code=$?
+else
+    ./runner/primus-cli direct train posttrain \
+        --config ${EXP} \
+        ${POSTTRAIN_CLI_EXTRA} 2>/dev/null \
+        | grep --line-buffered -E ':::MLLOG |^RESULT,|Training failed'
+    ret_code=${PIPESTATUS[0]}
+fi
 
 # End timing
 end=$(date +%s)
