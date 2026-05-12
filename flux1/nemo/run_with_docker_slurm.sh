@@ -123,6 +123,7 @@ ${DOCKER} run --rm --init --detach \
       --cap-add IPC_LOCK \
       --privileged \
       --ulimit memlock=-1:-1 \
+      --ulimit nofile=1048576:1048576 \
       --security-opt seccomp=unconfined \
       --name="${_cont_name}" "${_cont_mounts[@]}" \
       -e IMAGE_NAME="${CONT}" \

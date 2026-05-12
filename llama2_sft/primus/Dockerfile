@@ -2,7 +2,7 @@ ARG BASE_IMAGE=docker.io/rocm/primus:v26.2
 FROM ${BASE_IMAGE}
 
 # Install library dependencies
-WORKDIR /workspace/deps
+WORKDIR /workspace
 
 ## Unset NVTE_CK_FUSED_ATTN_PATH from base image so TE's cmake uses prebuilt download
 ENV NVTE_CK_FUSED_ATTN_PATH=""
@@ -25,11 +25,12 @@ RUN cd TransformerEngine \
 
 # AITER
 ARG AITER_COMMIT=77455e3ecf4f0d28756afc452e914940c45b944b
-RUN rm -rf /workspace/deps/aiter \
+RUN rm -rf /workspace/aiter \
     && git clone --recursive https://github.com/ROCm/aiter.git \
-    && cd aiter && git checkout ${AITER_COMMIT} \
-    && git submodule update --init --recursive
-ENV PYTHONPATH="/workspace/deps/aiter:${PYTHONPATH}"
+    && cd aiter && git checkout ${AITER_COMMIT}
+ENV PYTHONPATH="/workspace/aiter:${PYTHONPATH}"
+RUN echo "/workspace/aiter" > \
+    $(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")/aiter_workspace.pth
 
 # Pre-compile AITER JIT modules
 RUN pip install psutil
@@ -38,7 +39,7 @@ RUN python3 /tmp/precompile_aiter.py
 
 # Primus
 ARG PRIMUS_REPO=https://github.com/AMD-AGI/Primus.git
-ARG PRIMUS_BRANCH=480641d05eaa794c4d262fe33151d73eb6a6db56
+ARG PRIMUS_BRANCH=689ae9dcc77c7cb7b2ca05a0a7d8993199c38ba4
 
 RUN rm -rf /workspace/Primus && \
     git clone --recurse-submodules ${PRIMUS_REPO} /workspace/Primus && \
@@ -74,7 +75,7 @@ RUN pip install "onnx==1.20.0rc1" "datasets>=2.14.0" "transformers==4.57.6" \
     && rm -rf /root/.cache
 
 # Stub modelopt package: Megatron-Bridge imports modelopt.torch.* at module level
-# for NVIDIA distillation/quantization features unused on ROCm.
+# for unused features.
 RUN mkdir -p /opt/venv/lib/python3.12/site-packages/modelopt/torch/distill/plugins \
              /opt/venv/lib/python3.12/site-packages/modelopt/torch/opt/plugins \
              /opt/venv/lib/python3.12/site-packages/modelopt/torch/quantization \
@@ -95,18 +96,18 @@ RUN mkdir -p /opt/venv/lib/python3.12/site-packages/modelopt/torch/distill/plugi
     && cp /opt/venv/lib/python3.12/site-packages/modelopt/torch/opt/__init__.py \
           /opt/venv/lib/python3.12/site-packages/modelopt/torch/opt/plugins/__init__.py
 
-# Install model preset and custom recipe not present in v26.2 base image
+# Install model preset and custom recipe
 COPY src/llama2_70b_lora.yaml /workspace/Primus/primus/configs/models/megatron_bridge/llama2_70b_lora.yaml
 COPY src/llama2_custom.py /workspace/Primus/primus/recipes/llama2_custom.py
 COPY src/_log_suppression.py /workspace/Primus/primus/recipes/_log_suppression.py
 
 WORKDIR /workspace/code
 
+COPY . .
+
 COPY requirements.txt requirements.txt
 RUN pip install -r requirements.txt
 
-COPY . .
-
 #Install primus_mllog for MLPerf logging
-COPY primus_mllog-0.1.19-py3-none-any.whl /tmp/primus_mllog-0.1.19-py3-none-any.whl
-RUN pip install /tmp/primus_mllog-0.1.19-py3-none-any.whl && rm /tmp/primus_mllog-0.1.19-py3-none-any.whl
+COPY primus_mllog-0.1.21-py3-none-any.whl /tmp/primus_mllog-0.1.21-py3-none-any.whl
+RUN pip install /tmp/primus_mllog-0.1.21-py3-none-any.whl && rm /tmp/primus_mllog-0.1.21-py3-none-any.whl

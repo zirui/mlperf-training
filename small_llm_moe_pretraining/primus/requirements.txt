@@ -1,0 +1,1 @@
+git+https://github.com/mlcommons/logging.git@6.0.0-rc5

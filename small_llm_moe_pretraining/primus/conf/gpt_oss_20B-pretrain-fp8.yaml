@@ -90,6 +90,7 @@ modules:
       overlap_grad_reduce: true
       overlap_param_gather: true
       ddp_num_buckets: 8
+      ddp_average_in_collective: true
 
       # data
       mock_data: false

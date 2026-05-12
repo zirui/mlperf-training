@@ -103,6 +103,8 @@ Use the job.sh in the mlperf-training/flux1/nemo folder to launch the training r
 sbatch job.sh
 ```
 
+Note: For MI355X multi-node runs, we are using the AINIC bundle version 1.117.5-a-77.
+
 ## 6. Evaluation
 
 ### Quality metric

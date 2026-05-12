@@ -1,19 +1,54 @@
-# LLama2 70B LoRA SFT — Data & Model Preparation (Primus)
+# Running AMD LLama2-70B LoRA PyTorch MLPerf Benchmark (Primus)
 
-This guide covers how to prepare **all** data, model weights, and checkpoints
-**before** launching training so that nothing is downloaded on-the-fly.
+This benchmark represents a LLama2-70B LoRA finetuning on the [GovReport](https://gov-report-data.github.io/) dataset.
 
 ## Prerequisites
 
 - Access to the `meta-llama/Llama-2-70b-hf` model on HuggingFace
-  (requires signing the LLAMA 2 COMMUNITY LICENSE AGREEMENT)
+(requires signing the LLAMA 2 COMMUNITY LICENSE AGREEMENT)
 - A HuggingFace access token (`HF_TOKEN`)
 - ~270 GB free disk space for model download + conversion
-- Docker with the Primus image (or the dev image)
 
-## Quick Reference — Final Directory Layout
+## Step 1: Build the Docker Image
 
-After completing all steps, your data directory should look like this:
+Run the following build command from the root of the repository. The build process will take a while to complete. Ensure that all scripts have write access by running `sudo chmod -R 777'.
+
+```bash
+docker build -t rocm/amd-mlperf:llama2_70b_training_6.0 .
+```
+
+## Step 2: Prepare Dataset
+
+## General Information
+
+GovReport is a dataset for long document summarization that consists of reports written by government research agencies. The dataset hosted on the MLPerf drive is already tokenized and packed so that each sequence has length 8192.
+
+The used model is the LLama2-70B with fused QKV. You will need 270GB to download and convert the model.
+
+## Download and Preprocess Data & Model
+
+To download the model from Huggingface, you'll need to sign the LLAMA 2 COMMUNITY LICENSE AGREEMENT as well as obtain a Hugginface Token `HF_TOKEN`.
+
+Start the docker container by mounting the volume you want to use for downloading the data under `/data` within the container. In this example we use `/data/mlperf_llama2/data` as the host download directory:
+
+```bash
+docker run -it -v /data/mlperf_llama2/data:/data \
+    --net=host --uts=host \
+    --ipc=host --device /dev/dri --device /dev/kfd \
+    --security-opt=seccomp=unconfined \
+    rocm/amd-mlperf:llama2_70b_training_6.0
+```
+
+Start the script for downloading and preprocessing data from within the container (HF_TOKEN is needed to download the model weights):
+
+```bash
+export HF_TOKEN=<your-huggingace-token>
+bash ./scripts/prepare_data_and_model.sh
+```
+
+## Verify Data
+
+After completion of the above step, your data directory should look like this:
 
 ```
 /data/mlperf_llama2/data/
@@ -37,233 +72,67 @@ After completing all steps, your data directory should look like this:
 │               ├── tokenizer.model
 │               ├── tokenizer_config.json
 │               └── special_tokens_map.json
-└── huggingface/                       # HF cache (can be removed after conversion)
-    └── hub/
-        └── models--meta-llama--Llama-2-70b-hf/
+
 ```
 
 ---
 
-## Step 1: Build the Docker Image
+## Exit Container
 
-Build the Primus submission image:
-
-```bash
-cd llama2_sft/primus
-docker build -t rocm/amd-mlperf:llama2_70b_sft_primus_6.0 .
-```
-
-Or build the dev image (includes profiling tools):
-
-```bash
-cd llama2_sft/primus
-bash dev/build_docker.sh
-```
-
-## Step 2: Start a Preparation Container
-
-Start an interactive container with the host data directory mounted at `/data`.
-This is where all dataset and checkpoint files will be stored.
-
-```bash
-export DATADIR=/data/mlperf_llama2/data
-sudo mkdir -p $DATADIR
-
-docker run -it --rm \
-    -v $DATADIR:/data \
-    --net=host --uts=host --ipc=host \
-    --device /dev/dri --device /dev/kfd \
-    --security-opt=seccomp=unconfined \
-    -e HF_TOKEN=${HF_TOKEN} \
-    rocm/amd-mlperf:llama2_70b_sft_primus_6.0 \
-    bash
-```
-
-All remaining steps run **inside this container**.
-
-## Step 3: Download the Dataset
-
-The dataset is the GovReport dataset, pre-tokenized and packed so that each
-sequence has length 8192.
-
-**Option A — Download pre-packed `.npy` files from the AMD HF repo (recommended):**
-
-```bash
-pip install huggingface_hub
-huggingface-cli login --token $HF_TOKEN
-
-huggingface-cli download \
-    amd/mlperf-training-llama2-70b-lorasft-nemo \
-    --repo-type=dataset \
-    --local-dir /data
-```
-
-Verify the files:
-
-```bash
-ls -lh /data/train.npy /data/validation.npy
-```
-
-**Option B — Download raw parquet and convert (using bundled scripts):**
-
-If Option A is unavailable, use the scripts bundled in the container at
-`/workspace/code/scripts/`:
-
-```bash
-cd /workspace/code/scripts
-
-# Download raw parquet files from HuggingFace
-python download_dataset.py --data_dir /data
-
-# Convert parquet to packed .npy format
-python convert_dataset.py --data_dir /data
-```
-
-This downloads from `regisss/scrolls_gov_report_preprocessed_mlperf_2`,
-converts to `train.npy` / `validation.npy`, and removes the parquet files.
-
-## Step 4: Generate Packed Metadata
-
-Megatron-Bridge requires a `packed_metadata.jsonl` file that describes the
-packed sequence properties. Create it:
-
-```bash
-cd /workspace/code/scripts
-python3 create_metadata.py 8192 /data/packed_metadata.jsonl
-```
-
-Or create it manually:
-
-```bash
-cat > /data/packed_metadata.jsonl << 'METAEOF'
-[
-  {
-    "max_samples_per_bin": 1,
-    "dataset_max_seqlen": 8192,
-    "min_packed_seqlen": 8192
-  }
-]
-METAEOF
-```
-
-Verify:
-
-```bash
-cat /data/packed_metadata.jsonl
-```
-
-## Step 5: Download HuggingFace Model Weights
-
-Download the `Llama-2-70b-hf` safetensors to the local HF cache.
-This downloads ~130 GB of model weights.
-
-```bash
-python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download(
-    'meta-llama/Llama-2-70b-hf',
-    max_workers=16,
-    allow_patterns=['*.safetensors', '*.json', 'tokenizer.model'],
-)
-print('Download complete.')
-"
-```
-
-The HF cache defaults to `$HF_HOME/hub` (typically `/data/huggingface/hub`
-inside the container when the Primus hook sets `HF_HOME`). You can override
-the cache location:
-
-```bash
-export HF_HOME=/data/huggingface
-```
-
-Verify the download:
-
-```bash
-ls $HF_HOME/hub/models--meta-llama--Llama-2-70b-hf/snapshots/*/
-# Expected: model-00001-of-00015.safetensors ... model-00015-of-00015.safetensors
-#           config.json, tokenizer.model, tokenizer_config.json, etc.
-```
-
-## Step 6: Convert to Megatron-Bridge Checkpoint Format
-
-The hook `01_convert_checkpoints.sh` normally runs this conversion
-automatically on the first training launch, but running it ahead of time
-avoids the on-the-fly overhead.
-
-The conversion script has known import incompatibilities in this container
-(`modelopt` broken on ROCm, Megatron-Bridge eagerly importing unsupported
-model bridges). The wrapper script handles all of this automatically:
-
-```bash
-bash /workspace/code/scripts/convert_megatron_checkpoint.sh \
-    "meta-llama/Llama-2-70b-hf" \
-    "/data/megatron_checkpoints/Llama-2-70b-hf"
-```
-
-This reads from the HF cache (no re-download) and writes the Megatron-format
-checkpoint to `/data/megatron_checkpoints/Llama-2-70b-hf/iter_0000000/`.
-
-Verify the conversion:
-
-```bash
-ls -lh /data/megatron_checkpoints/Llama-2-70b-hf/iter_0000000/
-# Expected:
-#   __0_0.distcp           (~64 GB)
-#   __0_1.distcp           (~64 GB)
-#   common.pt, .metadata, metadata.json
-#   run_config.yaml, modelopt_run_config.yaml
-#   train_state.pt
-#   tokenizer/  (tokenizer.model, tokenizer_config.json, special_tokens_map.json)
-```
-
-## Step 7: Final Verification
-
-Run a final check that everything is in place:
-
-```bash
-echo "=== Dataset ==="
-ls -lh /data/train.npy /data/validation.npy /data/packed_metadata.jsonl
-
-echo ""
-echo "=== Megatron Checkpoint ==="
-ls -lh /data/megatron_checkpoints/Llama-2-70b-hf/iter_0000000/__0_0.distcp
-ls -lh /data/megatron_checkpoints/Llama-2-70b-hf/iter_0000000/__0_1.distcp
-ls    /data/megatron_checkpoints/Llama-2-70b-hf/iter_0000000/tokenizer/
-
-echo ""
-echo "All data prepared. Ready for training."
-```
-
-## Step 8: Exit Preparation Container
+Exit the container by running the below command
 
 ```bash
 exit
 ```
 
----
+# 3. Run Training
 
-## (Optional) Clean Up HF Cache
+### Set Environment
 
-After conversion, the HF cache is no longer needed for training. You can
-reclaim ~130 GB:
+Set the directory for the data, model and results. Ensure that `$LOGDIR` has write access for the results to be written by running `sudo chmod -R 777 $LOGDIR`, In this example we use `/data/mlperf_llama2/results` as the results directory, so please make sure to create this directory.
 
 ```bash
-sudo rm -rf $DATADIR/huggingface
+export DATADIR=/data/mlperf_llama2
+export LOGDIR=/data/mlperf_llama2/results
+export CONT=rocm/amd-mlperf:llama2_70b_training_6.0
 ```
 
----
+### Set Configuration
 
-## Running Training
-
-With all data prepared, training will start without any downloads:
+Source the appropriate config for your GPU:
 
 ```bash
-export DATADIR=/data/mlperf_llama2/data
-export LOGDIR=/data/experiments
-export CONT=rocm/amd-mlperf:llama2_70b_sft_primus_6.0
+source config_MI355X_1x8x1.sh 
+```
 
-source config_MI355X_1x8x1.sh
+### Launch 1 Training Run
+
+If you want to perform a single run, use:
+
+```bash
 export NEXP=1
 bash run_with_docker.sh
 ```
+
+### Launch 10 Training Run [Optional]
+
+If you would like to prepare for 10 run submisision, use:
+
+```bash
+export NEXP=10
+bash run_with_docker.sh
+```
+
+After completion, the logs will be available under the directory `$LOGDIR`.
+
+Note:To optimize the machine's performance, the training script will also execute `runtime_tunables.sh` script before any training run.
+
+# 4. Check Quality
+
+### Quality Metric
+
+Cross entropy loss
+
+### Quality Target
+
+0.925

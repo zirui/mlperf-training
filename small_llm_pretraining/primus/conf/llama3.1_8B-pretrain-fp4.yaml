@@ -53,7 +53,8 @@ modules:
       overlap_param_gather: true
       gradient_accumulation_fusion: true
       masked_softmax_fusion: true
-      average_in_collective: true
+      ddp_average_in_collective: true
+      fused_single_qkv_rope: true
 
       # --- Data Config ---
       mock_data: false

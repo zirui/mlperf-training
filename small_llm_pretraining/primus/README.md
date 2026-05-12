@@ -1,156 +1,99 @@
-# LLama3.1 8B Pretraining Benchmark
+# Running AMD LLama3.1-8B Pretraining PyTorch MLPerf Benchmark (Primus)
 
-LLama3.1 8B pretraining using the Primus framework on AMD MI355X GPUs.
-
-**Key Features:**
-- 8B parameter LLama3.1 dense model
-- FP8 hybrid precision training
-- Megatron backend via Primus
+Small Language Model pretraining - Llama 3.1 8B using the Primus framework.
 
 # 1. Setup Docker Image
 
-## Option 1: Build Docker Image
+##  Build Docker Image
 
-Run the following build command from this directory:
+Run the following build command from the root of the repository. The build process will take a while to complete. Ensure that all scripts have write access by running `sudo chmod -R 777`.
 
 ```bash
-docker build -t rocm/amd-mlperf:llama3.1_8b_training_6.0 .
+docker build -t rocm/amd-mlperf:llama31_8b_training_6.0 .
 ```
+# 2. Prepare Dataset and Model
 
-## Option 2: Build Dev Image (with profiling tools)
+The current codebase is using the c4/en/3.0.1 dataset from [HuggingFace/AllenAI](https://huggingface.co/datasets/allenai/c4) for train and evaluation.
 
-```bash
-bash dev/build_docker.sh
-```
+## Download Preprocessed Data
 
-This builds the base submission image and a dev image with RPD profiler and TraceLens.
-
-# 2. Prepare Dataset
-
-The current codebase uses the c4/en/3.0.1 dataset from [HuggingFace/AllenAI](https://huggingface.co/datasets/allenai/c4) for training and evaluation.
-
-## Download Preprocessed Data and Model
+The pre-tokenized dataset and the tokenizer are available for download.You can navigate in the terminal to your desired download directory and run the following commands to download the dataset and tokenizer. In this example, we're using `/data/mlperf_llama31_8b` as the host download directory.
 
 ```bash
+# desired download directory
+mkdir -p /data/mlperf_llama31_8b
 cd /data/mlperf_llama31_8b
 
-# Download training and validation data
-bash <(curl -s https://raw.githubusercontent.com/mlcommons/r2-downloader/refs/heads/main/mlc-r2-downloader.sh) \
-    -d data https://training.mlcommons-storage.org/metadata/llama-3-1-8b-preprocessed-c4-dataset.uri
+# data
+bash <(curl -s https://raw.githubusercontent.com/mlcommons/r2-downloader/refs/heads/main/mlc-r2-downloader.sh) -d data https://training.mlcommons-storage.org/metadata/llama-3-1-8b-preprocessed-c4-dataset.uri
 
-# Download model tokenizer
-bash <(curl -s https://raw.githubusercontent.com/mlcommons/r2-downloader/refs/heads/main/mlc-r2-downloader.sh) \
-    -d model https://training.mlcommons-storage.org/metadata/llama-3-1-8b-tokenizer.uri
+# model
+bash <(curl -s https://raw.githubusercontent.com/mlcommons/r2-downloader/refs/heads/main/mlc-r2-downloader.sh) -d model https://training.mlcommons-storage.org/metadata/llama-3-1-8b-tokenizer.uri
 
 mv llama3_1_8b_tokenizer model
 ```
 
-After download, you should see files with the following naming conventions:
-- Training: `c4-train.en_6_text_document.bin` and `.idx`
-- Validation: `c4-validation-91205-samples.en_text_document.bin` and `.idx`
+After the download is complete, you should see files with the following naming conventions under the data directory, ending with both `.idx` and `.bin`: 
+- Training partitions: `c4-train.en_6_text_document`
+- Validation partitions: `c4-validation-91205-samples.en_text_document`
 
-The data directory is approximately **80 GB** and model directory is approximately **30 GB**.
+The data directory is ~80 GB and model directory is ~30 GB.
 
 # 3. Run Training
 
-## Set Environment Variables
+### Set Environment
+
+Set the directory for the data, model and results. Ensure that `$LOGDIR` has write access for the results to be written by running `sudo chmod -R 777 $LOGDIR`, In this example we use `/data/mlperf_llama31_8b/results` as the results directory, so please make sure to create this directory.
 
 ```bash
 export DATADIR=/data/mlperf_llama31_8b/data
-export MODELDIR=/data/mlperf_llama31_8b/model
+export MODELDIR=/data/mlperf_llama31_8b/model/
 export LOGDIR=/data/mlperf_llama31_8b/results
-export CONT=rocm/amd-mlperf:llama3.1_8b_training_6.0
-
-mkdir -p $LOGDIR
-sudo chmod -R 777 $LOGDIR
+export CONT=rocm/amd-mlperf:llama31_8b_training_6.0
 ```
 
-## Set Configuration
+### Set Configuration
+
+Set appropriate configuration and system-specific hyperparameters:\
+MI350x submission configurations are in `config_MI350X_*.sh`\
+MI355x submission configurations are in `config_MI355X_*.sh`
 
 ```bash
-source config_MI355X_1x8x1.sh
+source config_MI355X_1x8x1_8b.sh
 ```
 
-## Launch Training
-
-### Single Run
-
+### Launch 1 Training Run
+If you want to perform a single run, use:
 ```bash
 export NEXP=1
-export CONFIG_NAME=config_MI355X_1x8x1.sh
 bash run_with_docker.sh
 ```
 
-### Multiple Runs (for submission)
+### Launch 10 Training Run [Optional]
+If you would like to prepare for 10 run submisision, use:
 
 ```bash
 export NEXP=10
 bash run_with_docker.sh
 ```
+After completion, the logs will be available under the directory `$LOGDIR`.
 
-After completion, logs will be available under `$LOGDIR`.
+Note:To optimize the machine's performance, the training script will also execute `runtime_tunables.sh` script before any training run.
 
-# 4. Quality Metrics
 
-## Quality Metric
+# 4. Check Quality
+### Quality metric
 
-Validation loss (log perplexity)
+Validation loss
 
-## Quality Target
+### Quality target
 
-Validation log perplexity = **3.3**
+Validation log perplexity = 3.3
 
-## Evaluation Frequency
+### Evaluation frequency
 
-Evaluation every **384 iterations** (12,288 samples with GBS=32)
+We perform evaluation every **12288** sequences. 
 
-## Evaluation Thoroughness
+### Evaluation thoroughness
 
-We evaluate using **1024 sequences** from the validation dataset.
-
-# 5. Model Architecture
-
-| Parameter | Value |
-|-----------|-------|
-| Model Size | 8B parameters |
-| Architecture | LLama3.1 (dense) |
-| Sequence Length | 8192 |
-| Precision | BF16 / FP8 hybrid |
-| Hidden Size | 4096 |
-| Layers | 32 |
-| Attention Heads | 32 |
-
-# 6. Training Configuration
-
-| Hyperparameter | Value |
-|----------------|-------|
-| Micro Batch Size | 2 |
-| Global Batch Size | 32 |
-| Learning Rate | 8e-4 |
-| LR Schedule | Cosine decay with warmup |
-| Weight Decay | 0.1 |
-| Adam b1, b2 | 0.9, 0.95 |
-| Training Iterations | 1,200,000 |
-
-# 7. Directory Structure
-
-```
-small_llm_pretraining/primus/
-├── conf/                               # Configuration files
-│   └── llama3.1_8B-pretrain-fp8.yaml
-├── dev/                                # Development scripts
-│   ├── Dockerfile
-│   ├── build_docker.sh
-│   ├── run_docker.sh
-│   ├── run_and_time.sh
-│   └── run_with_docker_dev.sh
-├── src/                                # Training source code
-│   └── train.py
-├── config_MI355X_1x8x1.sh             # System configuration
-├── Dockerfile
-├── run_and_time.sh
-├── run_with_docker.sh
-├── runtime_tunables.sh
-├── requirements.txt
-└── primus_mllog-0.1.1-py3-none-any.whl
-```
+We evaluate using **1024** sequences from our customized validation dataset. 

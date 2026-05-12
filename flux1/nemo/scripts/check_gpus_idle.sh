@@ -1,5 +1,5 @@
 #!/bin/bash
-# Fail (exit 1) if any GPU on this node reports non-zero VRAM% or GPU%.
+# Fail (exit 1) if any GPU on this node reports non-zero VRAM%.
 
 set -uo pipefail
 
@@ -12,8 +12,7 @@ busy=$(printf '%s\n' "$smi_output" \
         !in_table   { next }
         /^[0-9]+[[:space:]]/ {
             vram = $(NF-1)
-            gpu  = $NF
-            if (vram != "0%" || gpu != "0%") print
+            if (vram != "0%") print
         }
     ')
 

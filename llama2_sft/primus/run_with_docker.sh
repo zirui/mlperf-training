@@ -10,7 +10,6 @@ cd "$SCRIPT_DIR"
 : "${CONT:?CONT not set}"
 : "${DATADIR:?DATADIR not set}"
 : "${LOGDIR:?LOGDIR not set}"
-: "${CONFIG_NAME:?CONFIG_NAME not set}"
 
 # Vars with defaults
 : "${NEXP:=1}"
@@ -23,7 +22,7 @@ cd "$SCRIPT_DIR"
 : "${HF_TOKEN:=""}"
 
 # Other vars
-readonly _config_file="${CONFIG_NAME}"
+readonly _config_file="config_${DGXSYSTEM}.sh"
 readonly _logfile_base="${LOGDIR}/${DATESTAMP}"
 readonly _cont_name="${CONT_NAME}"
 : "${MODEL:=${DATADIR}/model}"

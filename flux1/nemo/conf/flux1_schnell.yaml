@@ -38,9 +38,9 @@ optim:
       hold_steps: ${oc.decode:${oc.env:HOLD_STEPS,10000000000000}} # hold lr constant
 
 strategy:
-    tensor_model_parallel_size: ${oc.decode:${oc.env:TP,1}}
-    pipeline_model_parallel_size: 1
-    context_parallel_size: 1
+    tensor_model_parallel_size: ${oc.decode:${oc.env:MLLOG_TENSOR_PARALLELISM,1}}
+    pipeline_model_parallel_size: ${oc.decode:${oc.env:MLLOG_PIPELINE_PARALLELISM,1}}
+    context_parallel_size: ${oc.decode:${oc.env:MLLOG_CONTEXT_PARALLELISM,1}}
     sequence_parallel: False
     ddp:
       _target_: megatron.core.distributed.DistributedDataParallelConfig

@@ -1,5 +1,6 @@
 # Load default settings
 source $(dirname ${BASH_SOURCE[0]})/config_common.sh
+export CONFIG_FILENAME=$(basename "$(readlink -f "${BASH_SOURCE[0]}")")
 
 export MAX_STEPS=${MAX_STEPS:--1}
 export WARMUP_STEPS=${WARMUP_STEPS:-1600}

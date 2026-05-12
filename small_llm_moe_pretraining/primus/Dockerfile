@@ -5,10 +5,11 @@ FROM ${BASE_IMAGE}
 WORKDIR /workspace/deps
 
 ARG PRIMUS_REPO=https://github.com/AMD-AGI/Primus.git
-ARG PRIMUS_REF=893c18aad4769805b5f9ae1efbabdf7b505580c8
+ARG PRIMUS_REF=8195b3e30f44b935511d5752176b1524dabeeb2c
 RUN rm -rf /workspace/Primus && \
     git clone --recursive "${PRIMUS_REPO}" /workspace/Primus && \
     cd /workspace/Primus && \
+    git fetch origin "${PRIMUS_REF}" && \
     git checkout "${PRIMUS_REF}" && \
     git submodule sync --recursive && \
     git submodule update --init --recursive
@@ -46,6 +47,16 @@ RUN git clone --recursive "${TE_REPO}" TransformerEngine \
  && sed -i "s|^aiter_commit = .*|aiter_commit = \"${AITER_COMMIT}\"|" \
         transformer_engine/common/ck_fused_attn/qola_manifest.toml
 
+ARG BWD_ATTN_ASM_ENABLE=1
+RUN DEPS_DIR=/workspace/deps \
+    TE_DIR=/workspace/deps/TransformerEngine \
+    BWD_ATTN_ASM_ENABLE=${BWD_ATTN_ASM_ENABLE} \
+    bash /workspace/Primus/primus/backends/transformer_engine/fwd_attn_asm/install.sh
+
+ENV FMHA_HD64_ASM_CO=/workspace/deps/fwd-attn-asm/build/fwd_d64_opt128.co
+ENV MLPERF_ENABLE_FWD_ATTN_ASM=1
+ENV FMHA_HD64_ASM_LOG=0
+
 RUN cd TransformerEngine && \
     NVTE_FUSED_ATTN_AOTRITON=0 \
     NVTE_CK_FUSED_ATTN_PATH="" \
@@ -66,5 +77,8 @@ WORKDIR /workspace/code
 # Copy the current state of the code inside the image
 COPY . .
 
-COPY primus_mllog-0.1.17-py3-none-any.whl /tmp/primus_mllog-0.1.17-py3-none-any.whl
-RUN pip install /tmp/primus_mllog-0.1.17-py3-none-any.whl && rm /tmp/primus_mllog-0.1.17-py3-none-any.whl
+COPY requirements.txt requirements.txt
+RUN pip install -r requirements.txt
+
+COPY primus_mllog-0.1.21-py3-none-any.whl /tmp/primus_mllog-0.1.21-py3-none-any.whl
+RUN pip install /tmp/primus_mllog-0.1.21-py3-none-any.whl && rm /tmp/primus_mllog-0.1.21-py3-none-any.whl

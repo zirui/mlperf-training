@@ -1,12 +1,13 @@
 # Load default settings
 source $(dirname ${BASH_SOURCE[0]})/config_common.sh
+export CONFIG_FILENAME=$(basename "$(readlink -f "${BASH_SOURCE[0]}")")
 
 export MAX_STEPS=${MAX_STEPS:--1}
-export WARMUP_STEPS=${WARMUP_STEPS:-100}
+export WARMUP_STEPS=${WARMUP_STEPS:-0}
 
-export BATCHSIZE=4096
-export LEARNING_RATE=${LEARNING_RATE:-"0.0004"}
-export MBS=64
+export BATCHSIZE=2048
+export LEARNING_RATE=${LEARNING_RATE:-"0.00027"}
+export MBS=32
 export FP8_RECIPE="delayed"
 
 # System parameters

@@ -2,7 +2,7 @@ ARG BASE_IMAGE=docker.io/rocm/primus:v26.2
 FROM ${BASE_IMAGE}
 
 # Install library dependencies
-WORKDIR /workspace/deps
+WORKDIR /workspace
 
 ## Unset NVTE_CK_FUSED_ATTN_PATH from base image so TE's cmake uses prebuilt download
 ENV NVTE_CK_FUSED_ATTN_PATH=""
@@ -25,15 +25,17 @@ RUN cd TransformerEngine \
 
 # AITER
 ARG AITER_COMMIT=77455e3ecf4f0d28756afc452e914940c45b944b
-RUN rm -rf /workspace/deps/aiter \
+RUN rm -rf /workspace/aiter \
     && git clone --recursive https://github.com/ROCm/aiter.git \
-    && cd aiter && git checkout ${AITER_COMMIT} \
-    && git submodule update --init --recursive
-ENV PYTHONPATH="/workspace/deps/aiter:${PYTHONPATH}"
+    && cd aiter && git checkout ${AITER_COMMIT}
+ENV PYTHONPATH="/workspace/aiter:${PYTHONPATH}"
+RUN echo "/workspace/aiter" > \
+    $(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")/aiter_workspace.pth
 
-# Pre-compile AITER JIT modules at build time
+# Pre-compile AITER JIT modules
+RUN pip install psutil
 COPY precompile_aiter.py /tmp/precompile_aiter.py
-RUN pip install psutil && python3 /tmp/precompile_aiter.py
+RUN python3 /tmp/precompile_aiter.py
 
 # Primus
 ARG PRIMUS_REPO=https://github.com/AMD-AGI/Primus.git
@@ -52,11 +54,11 @@ RUN cd /workspace/Primus/third_party/Megatron-LM && \
 
 WORKDIR /workspace/code
 
+COPY . .
+
 COPY requirements.txt requirements.txt
 RUN pip install -r requirements.txt
 
-COPY . .
-
 #Install primus_mllog for MLPerf logging
-COPY primus_mllog-0.1.19-py3-none-any.whl /tmp/primus_mllog-0.1.19-py3-none-any.whl
-RUN pip install /tmp/primus_mllog-0.1.19-py3-none-any.whl && rm /tmp/primus_mllog-0.1.19-py3-none-any.whl
+COPY primus_mllog-0.1.21-py3-none-any.whl /tmp/primus_mllog-0.1.21-py3-none-any.whl
+RUN pip install /tmp/primus_mllog-0.1.21-py3-none-any.whl && rm /tmp/primus_mllog-0.1.21-py3-none-any.whl

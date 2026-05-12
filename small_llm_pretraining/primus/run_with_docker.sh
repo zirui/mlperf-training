@@ -26,7 +26,6 @@ cd "$SCRIPT_DIR"
 : "${DATADIR:?DATADIR not set}"
 : "${MODELDIR:?MODELDIR not set}"
 : "${LOGDIR:?LOGDIR not set}"
-: "${CONFIG_NAME:?CONFIG_NAME not set}"
 
 # Vars with defaults
 : "${NEXP:=1}"
@@ -42,8 +41,8 @@ cd "$SCRIPT_DIR"
 : "${HF_TOKEN:=""}"
 
 # Other vars
-readonly _config_file="${CONFIG_NAME}"
-echo "CONFIG_NAME: ${CONFIG_NAME}"
+readonly _config_file="config_${DGXSYSTEM}.sh"
+echo "CONFIG FILE: ${_config_file}"
 readonly _logfile_base="${LOGDIR}/${DATESTAMP}"
 readonly _cont_name="${CONT_NAME}"
 _cont_mounts=("--volume=${DATADIR}:/data" "--volume=${MODELDIR}:/model" "--volume=$(pwd):/workspace/code" "--volume=${LOGDIR}:/results")

@@ -1,5 +1,0 @@
-megatron-energon==7.1.0
-multi-storage-client<0.26.0
-huggingface_hub>=0.24
-numpy==1.26.4
-rich

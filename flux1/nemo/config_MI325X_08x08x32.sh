@@ -1,5 +1,6 @@
 # Load default settings
 source $(dirname ${BASH_SOURCE[0]})/config_common.sh
+export CONFIG_FILENAME=$(basename "$(readlink -f "${BASH_SOURCE[0]}")")
 
 export MAX_STEPS=${MAX_STEPS:--1}
 export WARMUP_STEPS=${WARMUP_STEPS:-0}
@@ -28,7 +29,7 @@ export USE_TE_SWIGLU=1
 
 export NVTE_CK_USES_BWD_V3=1
 export NVTE_CK_USES_FWD_V3=1
-export NVTE_CK_IS_V3_ATOMIC_FP32=0
+export NVTE_CK_IS_V3_ATOMIC_FP32=1
 
 export CK_FUSED_ATTN_LOG_CONFIG=0
 export NVTE_LOG_CK_CONFIG=0
@@ -53,3 +54,10 @@ export CPU_OFFLOADING=False
 export CPU_OFFLOADING_ACTIVATIONS=False
 export COMPILE_DIT=1
 export COMPILE_DIT_STRATEGY=stack
+
+export NCCL_SOCKET_IFNAME=eno0
+export GLOO_SOCKET_IFNAME=eno0
+export NCCL_IB_HCA=rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+export NCCL_IB_GID_INDEX=3
+export NCCL_PXN_DISABLE=0
+export NCCL_DEBUG=VERSION

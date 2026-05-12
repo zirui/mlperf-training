@@ -249,6 +249,13 @@ class MetricsLogger(MLPerfLogger):
             self.mllogger.constants.OPT_ADAMW_WEIGHT_DECAY: self.cfg.optim.config.weight_decay,
             self.mllogger.constants.OPT_BASE_LR: self.cfg.optim.config.lr,
             self.mllogger.constants.OPT_GRADIENT_CLIP_NORM: self.cfg.optim.config.clip_grad,
+            self.mllogger.constants.TENSOR_PARALLELISM: self.cfg.strategy.tensor_model_parallel_size,
+            self.mllogger.constants.PIPELINE_PARALLELISM: self.cfg.strategy.pipeline_model_parallel_size,
+            self.mllogger.constants.CONTEXT_PARALLELISM: self.cfg.strategy.context_parallel_size,
+            self.mllogger.constants.EXPERT_PARALLELISM: 1,
+            self.mllogger.constants.MICRO_BATCH_SIZE: self.mbs,
+            self.mllogger.constants.CONFIG_FILENAME: os.getenv("CONFIG_FILENAME", ""),
+            "lowest_numerical_precision_in_linear": os.getenv("MLLOG_LOWEST_NUMERICAL_PRECISION_LINEAR", ""),
         }
 
     def compute_validation_metric(self, metrics: dict[str, float]) -> float:

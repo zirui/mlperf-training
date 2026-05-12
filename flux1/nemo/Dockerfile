@@ -63,7 +63,7 @@ RUN cd TransformerEngine \
 RUN pip uninstall -y bitsandbytes mlperf-logging megatron-energon mlperf-common
 
 RUN pip install megatron-energon==7.1.0
-RUN pip install git+https://github.com/mlcommons/logging.git@6.0.0-rc1
+RUN pip install git+https://github.com/mlcommons/logging.git@6.0.0-rc5
 RUN pip install git+https://github.com/NVIDIA/mlperf-common.git@b86d175a05849d650a8ff69c1e2c37b9f4e61d51
 
 WORKDIR /workspace/code

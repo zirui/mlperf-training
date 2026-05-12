@@ -139,6 +139,9 @@ from megatron.bridge.training.train import (
     _maybe_register_fsdp_buffers,
 )
 
+# Importing this module installs a monkey-patch that swaps Megatron-Bridge's
+from primus.recipes import nemo_loss as _nemo_loss  # noqa: F401
+
 MLPERF_TARGET_LOSS = 0.925
 
 # Sticky flag: once ``evaluate_and_print_results_custom`` observes an lm-loss
@@ -183,6 +186,13 @@ def bf16_with_mxfp4_mixed() -> MixedPrecisionConfig:
     cfg.fp8 = None
     cfg.fp4 = "e2m1"
     cfg.fp4_recipe = "mxfp4"
+    cfg.fp8_recipe = "delayed"
+    cfg.fp8_amax_history_len = 4
+    cfg.fp8_amax_compute_algo = "most_recent"
+    cfg.fp8_reduce_amax = False
+    cfg.fp8_interval = 1
+    cfg.fp8_margin = 0
+    cfg.fp8_dot_product_attention = False
     cfg.fp8_param_gather = False
     cfg.grad_reduce_in_fp32 = False
     return cfg
@@ -338,6 +348,12 @@ def llama2_70b_lora_config(**user_kwargs: Unpack[Llama2CustomKwargs]) -> ConfigC
                 lora_alpha=32,
                 data_root=data_root,
                 data_parallel_size=dp_size,
+                tensor_model_parallel_size=tp,
+                pipeline_model_parallel_size=pp,
+                context_parallel_size=int(os.getenv("MLLOG_CONTEXT_PARALLELISM", "1")),
+                config_filename=os.getenv("MLLOG_CONFIG_FILENAME", ""),
+                lowest_numerical_precision_linear=os.getenv("MLLOG_LOWEST_NUMERICAL_PRECISION_LINEAR", "mxfp4"),
+
             )
             _sft_logger.log_init_params(init_cfg)
         except ImportError:
@@ -360,9 +376,9 @@ def llama2_70b_lora_mxfp4_config(**user_kwargs: Unpack[Llama2CustomKwargs]) -> C
     """
     mxfp4_defaults: Llama2CustomKwargs = {
         "precision_config": "bf16_with_mxfp4_mixed",
-        "recompute_granularity": "full",
-        "recompute_method": "block",
-        "recompute_num_layers": 8,
+        "recompute_granularity": None,
+        "recompute_method": None,
+        "recompute_num_layers": None,
         "attention_backend": "fused",
     }
     combined_kwargs: Llama2CustomKwargs = {**mxfp4_defaults, **user_kwargs}
@@ -403,7 +419,7 @@ def _llama2_lora(
     weight_decay: float = 0.0001,
     clip_grad: float = 0.3,
     # Precision recipe
-    precision_config: Optional[Union[MixedPrecisionConfig, str]] = "bf16_with_fp8_hybrid",
+    precision_config: Optional[Union[MixedPrecisionConfig, str]] = "bf16_with_mxfp4_mixed",
     comm_overlap_config: Optional[CommOverlapConfig] = None,
     seed: int = 1234,
     check_for_nan_in_loss: bool = False,
@@ -496,19 +512,27 @@ def _llama2_lora(
     model_cfg.autocast_dtype = torch.bfloat16
     model_cfg.pipeline_dtype = torch.bfloat16
     # Fusions / CE: TE parallel cross-entropy; grad-acc fusion (not used with Megatron FSDP).
-    model_cfg.cross_entropy_loss_fusion = True
-    model_cfg.cross_entropy_fusion_impl = "te"
-    model_cfg.gradient_accumulation_fusion = True
-    model_cfg.bias_dropout_fusion = False
+    model_cfg.cross_entropy_loss_fusion = False
+    model_cfg.cross_entropy_fusion_impl = "native"
+    model_cfg.gradient_accumulation_fusion = False
+    model_cfg.bias_dropout_fusion = True
     model_cfg.fused_single_qkv_rope = False
     model_cfg.apply_rope_fusion = True
     model_cfg.use_transformer_engine_op_fuser = False
     # Activation offload hint for TP paths (distinct from cpu_offloading / cpu_offloading_num_layers).
     model_cfg.cpu_offloading_activations = True
+
+    # MXFP4 configuration
+    model_cfg.fp8 = None
+    model_cfg.fp4 = "e2m1"
+    model_cfg.fp4_recipe = "mxfp4"
+    model_cfg.fp8_param_gather = False
+    model_cfg.grad_reduce_in_fp32 = False    
+
     # Used when cuda_graph_impl is not "none" (harmless when graphs are disabled).
     model_cfg.cuda_graph_retain_backward_graph = True
     model_cfg.cuda_graph_use_single_mempool = True
-    model_cfg.fp8 = 'hybrid'
+    model_cfg.fp8 = None
     model_cfg.fp8_recipe = 'delayed'
     model_cfg.fp8_amax_history_len = 4
     model_cfg.disable_parameter_transpose_cache = False
@@ -539,28 +563,35 @@ def _llama2_lora(
         model_cfg.qk_clip = False
     if hasattr(model_cfg, "log_max_attention_logit"):
         model_cfg.log_max_attention_logit = False
-    # model_cfg.recompute_granularity = "full"
-    # model_cfg.recompute_method = "block"
-    # model_cfg.recompute_num_layers = 1
-    # model_cfg.num_query_groups = None
 
-    opt_config, scheduler = distributed_fused_adam_with_cosine_annealing(
-        lr_warmup_iters=lr_warmup_iters,
-        lr_decay_iters=lr_decay_iters,
+    from megatron.bridge.training.config import OptimizerConfig, SchedulerConfig
+    opt_config = OptimizerConfig(
+        optimizer="adam",
+        lr=lr,
+        min_lr=min_lr,
+        clip_grad=clip_grad,
+        weight_decay=weight_decay,
         adam_beta1=adam_beta1,
         adam_beta2=adam_beta2,
         adam_eps=adam_eps,
-        weight_decay=weight_decay,
-        max_lr=lr,
-        min_lr=min_lr,
-        clip_grad=clip_grad
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        use_distributed_optimizer=True,
+        overlap_param_gather_with_optimizer_step=True,
+        barrier_with_L1_time=False,
+        log_num_zeros_in_grad=False,
     )
-    opt_config.use_distributed_optimizer = True
-    opt_config.overlap_param_gather_with_optimizer_step = True
-    opt_config.params_dtype = torch.bfloat16
-    # Avoid L1 timer barriers and per-step zero-grad counting unless debugging.
-    opt_config.barrier_with_L1_time = False
-    opt_config.log_num_zeros_in_grad = False
+
+    scheduler = SchedulerConfig(
+        lr_decay_style="cosine",
+        lr_decay_iters=lr_decay_iters,  # same as max_steps in nemo
+        lr_warmup_iters=lr_warmup_iters, # value 0 same as nemo
+        lr_warmup_init=0.0,
+        start_weight_decay=weight_decay,
+        end_weight_decay=weight_decay, 
+        weight_decay_incr_style="constant",
+        override_opt_param_scheduler=True,
+    )
 
     peft_config = LoRA(
         dim=16,
@@ -692,7 +723,7 @@ def _llama2_lora(
             load_optim=False,
             load_rng=False,
         ),
-        rng=RNGConfig(seed=seed),
+        rng=RNGConfig(seed=seed, te_rng_tracker=True),
         rerun_state_machine=RerunStateMachineConfig(
             check_for_nan_in_loss=check_for_nan_in_loss,
         ),
@@ -810,36 +841,24 @@ def evaluate(
             fault_tolerance.on_eval_step_end(state)
             config.timers = state.timers
             if is_pp_last_stage(pg_collection.pp):
-                # NeMo-style: mean of per-microbatch means (matches NeMo validation loss).
-                # Keep loss_sum / num_tokens on GPU; avoid per-microbatch .item() syncs.
                 for key in loss_dicts[0].keys():
                     if key not in total_loss_dict:
                         total_loss_dict[key] = torch.zeros(2, dtype=torch.float32, device="cuda")
                     val = [x[key].reshape(-1) for x in loss_dicts]
                     if val[0].numel() == 2:
-                        device = val[0].device
-                        stacked = torch.stack([v.float() for v in val], dim=0)
-                        loss_sums = stacked[:, 0]
-                        num_toks = stacked[:, 1]
-                        ok = num_toks > 0
-                        if ok.any():
-                            sum_means_this_rank = (loss_sums[ok] / num_toks[ok]).sum()
-                            count_this_rank_t = ok.sum().to(dtype=torch.float32)
-                        else:
-                            sum_means_this_rank = torch.zeros((), dtype=torch.float32, device=device)
-                            count_this_rank_t = torch.zeros((), dtype=torch.float32, device=device)
-                        torch.distributed.all_reduce(sum_means_this_rank, group=pg_collection.dp_cp)
-                        torch.distributed.all_reduce(count_this_rank_t, group=pg_collection.dp_cp)
-                        total_loss_dict[key][0] += sum_means_this_rank
-                        total_loss_dict[key][1] += count_this_rank_t
+                        # NeMo MLPerf-equivalent: accumulate raw [sum, count] across micros & eval iters.
+                        # Per-micro [sum, count] is already DP/CP-reduced inside
+                        # nemo_loss.MaskedTokenLossReduction.forward, so no extra all_reduce here.
+                        per_iter = torch.vstack([v.float() for v in val]).sum(dim=0)   # [Σ_micro sum, Σ_micro count]
+                        total_loss_dict[key] += per_iter
                     elif val[0].numel() == 1:
+                        # legacy single-scalar branch 
                         micro_sum = torch.stack([v.float() for v in val], dim=0).sum()
                         total_loss_dict[key][0] += micro_sum
                         total_loss_dict[key][1] += float(len(loss_dicts))
                     else:
-                        raise ValueError(
-                            f"Invalid value shape: {val[0].shape} for key {key}"
-                        )
+                        raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
+
             state.train_state.consumed_valid_samples += eval_batch_size
             if state.cfg.train.exit_duration_in_mins:
                 train_time = (time.time() - state.start_time) / 60.0
@@ -854,8 +873,7 @@ def evaluate(
                     rerun_state_machine.set_mode(rerun_mode)
                     log_rank_0("Exiting during evaluation, timelimit reached")
                     return None, None, True
-        if state.cfg.train.empty_unused_memory_level >= 1:
-            torch.cuda.empty_cache()
+        
         collected_non_loss_data = None
         if non_loss_data_func is not None:
             collected_non_loss_data = non_loss_data_func(model)
@@ -886,11 +904,11 @@ def evaluate(
     for model_module in model:
         model_module.train()
     for key in total_loss_dict:
-        sum_of_means, count = total_loss_dict[key]
-        if count > 0:
-            total_loss_dict[key] = sum_of_means / count
+        val_loss_sum, val_loss_count = total_loss_dict[key]
+        if val_loss_count > 0:
+            total_loss_dict[key] = val_loss_sum / val_loss_count
         else:
-            total_loss_dict[key] = sum_of_means
+            total_loss_dict[key] = val_loss_sum
     timers("evaluate").stop()
     timers.log(["evaluate"])
     rerun_state_machine.set_mode(rerun_mode)

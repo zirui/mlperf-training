@@ -1,5 +1,6 @@
 # Load default settings
 source $(dirname ${BASH_SOURCE[0]})/config_common.sh
+export CONFIG_FILENAME=$(basename "$(readlink -f "${BASH_SOURCE[0]}")")
 
 export MAX_STEPS=${MAX_STEPS:--1}
 export WARMUP_STEPS=${WARMUP_STEPS:-100}
@@ -29,7 +30,7 @@ export USE_TE_SWIGLU=1
 
 export NVTE_CK_USES_BWD_V3=1
 export NVTE_CK_USES_FWD_V3=1
-export NVTE_CK_IS_V3_ATOMIC_FP32=0
+export NVTE_CK_IS_V3_ATOMIC_FP32=1
 
 export CK_FUSED_ATTN_LOG_CONFIG=0
 export NVTE_LOG_CK_CONFIG=0

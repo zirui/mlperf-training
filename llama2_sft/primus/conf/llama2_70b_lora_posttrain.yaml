@@ -48,30 +48,13 @@ modules:
       lr_decay_iters: 550
       clip_grad: 0.3
 
-      wandb_project: null
-      wandb_entity: null
-      wandb_exp_name: null
-
-      recompute_granularity: null
-      recompute_method: null
-      recompute_num_layers: null
-
-      # MXFP4 (see megatron.bridge.training.mixed_precision.bf16_with_mxfp4_mixed)
-      precision_config: bf16_with_mxfp4_mixed
       comm_overlap_config: null
 
-      cross_entropy_fusion_impl: "te"
-      crosss_entropy_loss_fusion: true
-
-      seed: ${SEED:1234}
+      seed: ${SEED}
 
       enable_primus_turbo: false
       use_turbo_attention: false
       use_turbo_rms_norm: false
       use_turbo_parallel_linear: false
-
-      # TE attention backend: "fused" forces FusedAttention (CK / AOTriton on ROCm)
-      # instead of FlashAttention. Other options: "flash", "unfused", "local", "auto".
-      attention_backend: fused
 
       check_for_nan_in_loss: false

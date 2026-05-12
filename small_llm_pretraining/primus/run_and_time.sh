@@ -7,6 +7,15 @@ mkdir -p /results
 
 cd /workspace/code
 
+# Under multi-node SLURM (run_with_docker_slurm.sh), inherit rendezvous + node
+# sizing from SLURM env so we can scale to N nodes without editing the config
+# file. Single-node SLURM jobs (NNODES=1) fall through to the config defaults
+# so torchrun doesn't try to do c10d rdzv against MASTER_ADDR=localhost.
+if [[ -n "${SLURM_NNODES:-}" && "${SLURM_NNODES}" -gt 1 ]]; then
+    NNODES="${SLURM_NNODES}"
+    NODE_RANK="${SLURM_NODEID:-0}"
+fi
+
 echo "============================================"
 echo "MLPerf LLama3.1 8B Training"
 echo "============================================"
@@ -14,6 +23,8 @@ echo "Config: ${EXP}"
 echo "Data:   ${DATA_PATH}"
 echo "GPUs:   ${GPUS_PER_NODE}"
 echo "Nodes:  ${NNODES}"
+echo "Rank:   ${NODE_RANK}"
+echo "Master: ${MASTER_ADDR}:${MASTER_PORT}"
 echo "============================================"
 
 # Start timing
@@ -29,6 +40,8 @@ torchrun \
     --node_rank=${NODE_RANK} \
     --master_addr=${MASTER_ADDR} \
     --master_port=${MASTER_PORT} \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
     src/train.py 2>/dev/null
 
 ret_code=$?
