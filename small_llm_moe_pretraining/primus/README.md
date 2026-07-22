@@ -1,26 +1,14 @@
 # GPT-OSS-20B Pretraining Benchmark
 
-GPT-OSS 20B (Mixture of Experts)
+GPT-OSS 20B (Mixture of Experts) using Primus framework.
 
 ## Overview
 
 This benchmark trains a 20B parameter GPT model with Mixture of Experts (MoE) architecture using the Primus framework on AMD GPUs.
 
-**Key Features:**
-- 20B parameter MoE model
-- Expert Parallelism (EP=8)
-- FP8 hybrid precision training
-- Primus Turbo optimizations (DeepEP, sync-free MoE)
-
 # 1. Setup Docker Image
 
-## Option 1: Pull Docker Image
-
-```bash
-docker pull rocm/amd-mlperf:gpt_oss_20b_training_6.0
-```
-
-## Option 2: Build Docker Image
+## Build Docker Image
 
 Run the following build command from this directory. The build process will take a while to complete.
 
@@ -79,21 +67,25 @@ sudo chmod -R 777 $LOGDIR
 
 Set appropriate configuration and system-specific hyperparameters:
 
-| Config File | System | GPUs |
-|-------------|--------|------|
-| `config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh` | MI355X | 1 node × 8 GPUs |
+| Config File | System | Nodes × GPUs | Global Batch |
+|-------------|--------|--------------|--------------|
+| `config_MI350X_1x8x1_tp1pp1ep1_gbs32.sh` | MI350X | 1 × 8        | 32           |
+| `config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh` | MI355X | 1 × 8        | 32           |
+| `config_MI355X_2x8x1_tp1pp1ep1_gbs32.sh` | MI355X | 2 × 8        | 32           |
+| `config_MI355X_4x8x1_tp1pp1ep1_gbs64.sh` | MI355X | 4 × 8        | 64           |
+
+For single-node runs source the matching script before launching:
 
 ```bash
 source config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh
 ```
 
-## Launch Training
+## Launch Training (Single Node)
 
 ### Single Run
 
 ```bash
 export NEXP=1
-export CONFIG_NAME=config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh
 bash run_with_docker.sh
 ```
 
@@ -106,39 +98,14 @@ bash run_with_docker.sh
 
 After completion, logs will be available under `$LOGDIR`.
 
-## Run-log Verbosity
+## Launch training (multi-node via slurm)
 
-By default the run log contains only `:::MLLOG ...` lines and the three
-`run_and_time.sh` banners (`STARTING TIMING RUN ...`, `ENDING TIMING RUN
-...`, `RESULT,GPT_OSS_20B,...`). All other framework output is suppressed
-to keep submission logs clean. The suppression is owned by
-`src/_log_suppression.py`, which `src/train.py` imports before any
-Primus / Megatron / TransformerEngine import. It works in three layers:
-
-1. **Env vars** (`AITER_LOG_LEVEL=ERROR`, `PYTHONWARNINGS=ignore`,
-   `TRANSFORMERS_VERBOSITY=error`, `HF_HUB_DISABLE_PROGRESS_BARS=1`,
-   and `OMP_NUM_THREADS=1` pre-set by `run_and_time.sh` to silence the
-   `torchrun` advisory) honoured by each noisy library.
-2. **Python `logging` levels** raised to `ERROR` for the `aiter`,
-   `megatron.*`, `primus*`, `torch.distributed.*`, and
-   `transformer_engine` logger trees — re-applied after the Primus
-   trainer is constructed because Primus installs a loguru
-   `InterceptHandler` on the root logger.
-3. **FD-level filter** (last resort) for native `std::cout` and raw
-   `print()` sources that bypass Python logging: the aiter JIT /
-   TE-RoPE / hipify / Gloo peer-connect banners and the
-   `[MLPerf Train] ...` status prints. Stderr is redirected wholesale
-   to `/dev/null` in quiet mode since everything on FD 2 (Primus loguru
-   sink, `warnings.warn`, hipify) is informational.
-
-Set `MLPERF_VERBOSE_LOGS=1` to restore the full framework output for
-debugging. The variable defaults to `0` in
-`config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh` and can be overridden at the shell:
-
-```bash
-export MLPERF_VERBOSE_LOGS=1
-bash run_with_docker.sh
+Use the `job.sh` in this directory to launch the training run (update `job.sh` per your cluster/run configuration).
 ```
+sbatch job.sh
+```
+
+Note: For MI355X multi-node runs, we are using the AINIC bundle version 1.117.5-a-77.
 
 # 4. Quality Metrics
 
@@ -152,46 +119,8 @@ Validation log perplexity = **3.34**
 
 ## Evaluation Frequency
 
-Evaluation every **384 iterations** (12,288 samples with GBS=32)
+Evaluation every **12,288 samples** (iteration count depends on GBS, e.g. 384 iters at GBS=32, 192 iters at GBS=64). The per-iter value is computed in each `config_*.sh` as `PRIMUS_EVAL_INTERVAL = EVAL_SAMPLES_INTERVAL / PRIMUS_GLOBAL_BATCH_SIZE`.
 
 ## Evaluation Thoroughness
 
 We evaluate using **1024 sequences** from the validation dataset.
-
-# 5. Model Architecture
-
-| Parameter | Value |
-|-----------|-------|
-| Model Size | 20B parameters |
-| Architecture | GPT with Mixture of Experts |
-| Sequence Length | 8192 |
-| Precision | BF16 / FP8 hybrid |
-| Expert Parallelism | 1 |
-
-# 6. Training Configuration
-
-| Hyperparameter | Value |
-|----------------|-------|
-| Micro Batch Size | 4 |
-| Global Batch Size | 32 |
-| Learning Rate | 8e-4 |
-| LR Schedule | Cosine decay with warmup |
-| Weight Decay | 0.1 |
-| Adam β1, β2 | 0.9, 0.95 |
-| Training Iterations | 1,200,000 |
-
-# 7. Directory Structure
-
-```
-small_llm_moe_pretraining/primus/
-├── conf/                                       # Configuration files
-│   └── gpt_oss_20B-pretrain-fp8.yaml
-├── dev/                                        # Development scripts
-│   ├── build_docker.sh
-│   ├── run_docker.sh
-│   └── run_and_time.sh
-├── src/                                        # Training source code
-│   └── train.py
-├── config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh      # System configuration
-└── Dockerfile
-```

@@ -43,12 +43,17 @@ modules:
       # log_avg_skip_iterations: 2
       # log_avg_reset_interval: 50
 
-      # profile
-      profile: ${PRIMUS_PROFILE:false}
-      use_pytorch_profiler: ${PRIMUS_PROFILE:false}
-      profile_step_end: ${PRIMUS_PROFILE_STEP_END:32}
-      profile_step_start: ${PRIMUS_PROFILE_STEP_START:16}
+      # profile (PRIMUS_PROFILE: 0=off, 1=on — use integers; string "false" is truthy in Python)
+      profile: ${PRIMUS_PROFILE:0}
+      use_pytorch_profiler: ${PRIMUS_PROFILE:0}
+      profile_step_end: ${PRIMUS_PROFILE_STEP_END:0}
+      profile_step_start: ${PRIMUS_PROFILE_STEP_START:0}
       profile_ranks: [0,1,2,3,4,5,6,7]
+
+      # manual gc
+      manual_gc: ${PRIMUS_MANUAL_GC:0}
+      manual_gc_interval: ${PRIMUS_MANUAL_GC_INTERVAL:500}
+      manual_gc_eval: ${PRIMUS_MANUAL_GC_EVAL:0}
       
       # enable fp8 training
       fp8: e4m3

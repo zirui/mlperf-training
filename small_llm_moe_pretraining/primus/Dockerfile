@@ -16,7 +16,7 @@ RUN rm -rf /workspace/Primus && \
 
 
 ARG PRIMUS_TURBO_REPO=https://github.com/AMD-AGI/Primus-Turbo.git
-ARG PRIMUS_TURBO_REF=d372005bf487380b517044c8845031f4867d4389
+ARG PRIMUS_TURBO_REF=c41b6dbc74cfc1dbc35285704757fcbb37fcac65
 RUN git clone --recursive "${PRIMUS_TURBO_REPO}" /workspace/deps/Primus-Turbo && \
     cd /workspace/deps/Primus-Turbo && \
     git checkout "${PRIMUS_TURBO_REF}" && \

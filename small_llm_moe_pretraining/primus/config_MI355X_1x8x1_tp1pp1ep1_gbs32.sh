@@ -6,7 +6,7 @@
 # -----------------------------------------------------------------------------
 # System Configuration
 # -----------------------------------------------------------------------------
-export DGXSYSTEM=MI355X_1x8x1
+export DGXSYSTEM=MI355X_1x8x1_tp1pp1ep1_gbs32
 export GPUS_PER_NODE=8
 export NNODES=1
 export NODE_RANK=0
@@ -27,17 +27,16 @@ export MODEL=/model
 # -----------------------------------------------------------------------------
 export PRIMUS_MICRO_BATCH_SIZE=4
 export PRIMUS_GLOBAL_BATCH_SIZE=32
-export EVAL_ITERS=$((1024 / PRIMUS_GLOBAL_BATCH_SIZE))  # MLPerf closed: eval_iters * GBS = 1024 eval samples
+export EVAL_ITERS=$((1024 / PRIMUS_GLOBAL_BATCH_SIZE))
 export PRIMUS_LR=8.0e-4
-export PRIMUS_MIN_LR=8.0e-5 # Set to 10% of max LR
+export PRIMUS_MIN_LR=8.0e-5
 export PRIMUS_TRAIN_ITERS=1200000
 export PRIMUS_LR_WARMUP_ITERS=128
-export PRIMUS_LR_DECAY_ITERS=$((PRIMUS_TRAIN_ITERS-PRIMUS_LR_WARMUP_ITERS)) # 1200000 - 128 = 1199872
-# export SEED=30279
+export PRIMUS_LR_DECAY_ITERS=$((PRIMUS_TRAIN_ITERS-PRIMUS_LR_WARMUP_ITERS))
 
-# Evaluation frequency (sample-based, adjusts automatically with GBS)
-export EVAL_SAMPLES_INTERVAL=12288   # Evaluate every 12,288 samples
-export PRIMUS_EVAL_INTERVAL=$((EVAL_SAMPLES_INTERVAL / PRIMUS_GLOBAL_BATCH_SIZE))  # Auto-computed
+export SYNTH_WARMUP_STEPS=10
+export EVAL_SAMPLES_INTERVAL=12288
+export PRIMUS_EVAL_INTERVAL=$((EVAL_SAMPLES_INTERVAL / PRIMUS_GLOBAL_BATCH_SIZE))
 
 # -----------------------------------------------------------------------------
 # Parallelism
@@ -49,9 +48,16 @@ export PRIMUS_EP=1
 # -----------------------------------------------------------------------------
 # Primus Configuration
 # -----------------------------------------------------------------------------
-export PRIMUS_TURBO_GROUPED_GEMM_BACKEND=TRITON
+export PRIMUS_TURBO_GROUPED_GEMM_BACKEND=ASM_CO
 export PRIMUS_GRAD_REDUCE_IN_BF16=true
 export USE_TURBO_RMS_NORM=true
+export PRIMUS_FUSED_RESIDUAL_NORM=1
+export PRIMUS_MOE_SWIGLU_NOCAT=1
+export PRIMUS_ASM_SWIGLU_BWD=1
+export PRIMUS_ASM_ROUTER=1
+export PRIMUS_MANUAL_GC=1
+export PRIMUS_MANUAL_GC_INTERVAL=500
+export PRIMUS_MANUAL_GC_EVAL=1
 
 # -----------------------------------------------------------------------------
 # ROCm / System Runtime
@@ -95,25 +101,27 @@ export NVTE_USE_CAST_TRANSPOSE_TRITON=0
 export NVTE_USE_OPTIMIZED_HIPIFIED_CAST_TRANSPOSE=1
 
 # -----------------------------------------------------------------------------
+# MoE Token Dispatcher
+# -----------------------------------------------------------------------------
+export MOE_SKIP_IDENTITY_SORT=1
+
+# -----------------------------------------------------------------------------
+# DDP Parameter All-Gather (SDMA)
+# -----------------------------------------------------------------------------
+export ENABLE_SDMA_ALLGATHER=1
+
+# -----------------------------------------------------------------------------
 # NVTE — FMHA / CK Backend
 # -----------------------------------------------------------------------------
-export NVTE_FLASH_ATTN=0                  # Disable FlashAttention so FusedAttention (CK/ASM) is used
-export NVTE_CK_USES_FWD_V3=1              # Globally on; aiter selects v3 vs CK-tile internally
-export NVTE_CK_USES_BWD_V3=1              # Globally on; aiter selects v3 vs CK-tile internally
-export NVTE_USE_AITER_ROPE=1              # Route RoPE through aiter's fused kernel instead of TE's own CK kernel
-export NVTE_FMHA_USE_BSHD=0               # Native SBHD path (aiter c4b33df0 supports it; skips Megatron's SBHD↔BSHD shim transposes)
-export NVTE_CK_IS_V3_ATOMIC_FP32=0        # 0=a16 (atomic fp16), 1=a32 (atomic fp32)
-export NVTE_CK_HOW_V3_BF16_CVT=2          # 0=RTNE, 1=RTNA, 2=RTZ
-
-# fwd-attn-asm: route eligible (D=64 BF16 [SWA-]causal) fused_attn_fwd calls
-# to the hand-tuned gfx950 kernel staged into site-packages by the Dockerfile.
-# Set to 0 to disable. FMHA_HD64_ASM_LOG=1 prints one line per dispatch.
+export NVTE_FLASH_ATTN=0
+export NVTE_CK_USES_FWD_V3=1
+export NVTE_CK_USES_BWD_V3=1
+export NVTE_USE_AITER_ROPE=1
+export NVTE_FMHA_USE_BSHD=0
+export NVTE_CK_IS_V3_ATOMIC_FP32=0
+export NVTE_CK_HOW_V3_BF16_CVT=2
 export MLPERF_ENABLE_FWD_ATTN_ASM=1
 export FMHA_HD64_ASM_LOG=0
-
-# bwd-attn-asm is build-time only — TE's QoLA build embeds aiter's bwd `.co`
-# into te_libmha_bwd.so at pip-install. Toggle with Docker `--build-arg
-# BWD_ATTN_ASM_ENABLE=0` (default 1) at image build time.
 
 # -----------------------------------------------------------------------------
 # NVTE — Debug
@@ -123,7 +131,6 @@ export NVTE_DEBUG_LEVEL=0
 export NVTE_LOG_FUSED_ATTN_CONFIG=0
 export NVTE_LOG_CK_CONFIG=0
 export CK_FUSED_ATTN_LOG_CONFIG=0
-# export NVTE_FMHA_DEBUG=1                    # keep commented; debug-only knob
 
 # -----------------------------------------------------------------------------
 # MLPerf Logging
@@ -146,37 +153,5 @@ export MLLOG_MICRO_BATCH_SIZE=4
 export MLLOG_CONFIG_FILENAME=$(basename "${BASH_SOURCE[0]}")
 export MLLOG_LOWEST_NUMERICAL_PRECISION_LINEAR='fp8'
 
-# -----------------------------------------------------------------------------
-# Synthetic Warmup (kernel pre-compilation)
-# -----------------------------------------------------------------------------
-export SYNTH_WARMUP_STEPS=3
-
-# -----------------------------------------------------------------------------
-# MoE Token Dispatcher
-# -----------------------------------------------------------------------------
-# Skip sort_chunks_by_idxs when the per-local-expert index is an identity
-# permutation (fires at EP=1/TP=1). Set to 0 to run the original path; useful
-# for A/B measurements. See patches/megatron_moe_skip_identity_sort.patch.
-export MOE_SKIP_IDENTITY_SORT=1
-
-# -----------------------------------------------------------------------------
-# DDP Parameter All-Gather (SDMA)
-# -----------------------------------------------------------------------------
-export ENABLE_SDMA_ALLGATHER=1
-# Optional: cap the per-call peer-copy stream count. Default is
-# min(world_size-1, 8); lower values reduce SDMA / memory-system pressure.
-# export MEGATRON_SDMA_PEER_COPY_STREAMS=8
-
-# -----------------------------------------------------------------------------
-# Run-log verbosity
-# -----------------------------------------------------------------------------
-# MLPerf run-log verbosity. Default 0 keeps only :::MLLOG + ``run_and_time.sh``
-# banners on stdout. Set to 1 to restore the full framework output (Primus
-# loguru banners / Megatron / TE / aiter / Gloo / torchrun / hipify / ...)
-# when debugging. See src/_log_suppression.py for the full strategy.
-export MLPERF_VERBOSE_LOGS=${MLPERF_VERBOSE_LOGS:-0}
-
-# fused rms and swiglu no cat
-export PRIMUS_FUSED_RESIDUAL_NORM=1
-export PRIMUS_MOE_SWIGLU_NOCAT=1
 export MLLOG_BLOCK_TPUT_LOG=0
+export MLPERF_VERBOSE_LOGS=${MLPERF_VERBOSE_LOGS:-0}
