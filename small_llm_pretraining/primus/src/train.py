@@ -20,13 +20,11 @@ from primus_mllog import MLPerfMegatronPretrainTrainer
 
 _log_suppression.reapply_quiet_logger_levels()
 
-
 def setup_environment(data_path: Optional[str] = None) -> None:
     if data_path and "HF_HOME" not in os.environ:
         hf_home = os.path.join(data_path, "huggingface")
         os.environ["HF_HOME"] = hf_home
         print(f"[MLPerf Train] HF_HOME={hf_home}")
-
 
 def load_config(
     config_path: str, overrides: Optional[List[str]] = None

@@ -4,13 +4,15 @@ Small Language Model pretraining - Llama 3.1 8B using the Primus framework.
 
 # 1. Setup Docker Image
 
-##  Build Docker Image
-
-Run the following build command from the root of the repository. The build process will take a while to complete. Ensure that all scripts have write access by running `sudo chmod -R 777`.
+Build the submission image from `small_llm_pretraining/primus`:
 
 ```bash
-docker build -t rocm/amd-mlperf:llama31_8b_training_6.0 .
+docker build -t rocm/amd-mlperf:llama31_8b_training_6.1 -f Dockerfile .
 ```
+
+The Dockerfile specifies the pinned dependencies. Both submission configs use
+1,200,000 training iterations.
+
 # 2. Prepare Dataset and Model
 
 The current codebase is using the c4/en/3.0.1 dataset from [HuggingFace/AllenAI](https://huggingface.co/datasets/allenai/c4) for train and evaluation.
@@ -49,7 +51,7 @@ Set the directory for the data, model and results. Ensure that `$LOGDIR` has wri
 export DATADIR=/data/mlperf_llama31_8b/data
 export MODELDIR=/data/mlperf_llama31_8b/model/
 export LOGDIR=/data/mlperf_llama31_8b/results
-export CONT=rocm/amd-mlperf:llama31_8b_training_6.0
+export CONT=rocm/amd-mlperf:llama31_8b_training_6.1
 ```
 
 ### Set Configuration
@@ -59,7 +61,7 @@ MI350x submission configurations are in `config_MI350X_*.sh`\
 MI355x submission configurations are in `config_MI355X_*.sh`
 
 ```bash
-source config_MI355X_1x8x1_8b.sh
+source config_MI355X_1x8x1.sh
 ```
 
 ### Launch 1 Training Run
@@ -96,4 +98,4 @@ We perform evaluation every **12288** sequences.
 
 ### Evaluation thoroughness
 
-We evaluate using **1024** sequences from our customized validation dataset. 
+Both MI350X and MI355X evaluate **1,024** sequences per evaluation.

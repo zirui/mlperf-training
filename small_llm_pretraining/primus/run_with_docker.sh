@@ -1,19 +1,5 @@
 #!/bin/bash
 
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 set -euxo pipefail
 
 # Change directory to the primus directory
@@ -32,8 +18,7 @@ cd "$SCRIPT_DIR"
 : "${DATESTAMP:=$(date +'%y%m%d%H%M%S%N')}"
 : "${CLEAR_CACHES:=1}"
 : "${CHECK_COMPLIANCE:=1}"
-: "${MLPERF_RULESET:=6.0.0}"
-: "${UTILITIES:="$(pwd)/../../utilities"}"
+: "${MLPERF_RULESET:=6.1.0}"
 
 : "${CONT_NAME:=mlperf_small_llm_pretraining}"
 : "${NGPU:=1}"
@@ -43,6 +28,23 @@ cd "$SCRIPT_DIR"
 # Other vars
 readonly _config_file="config_${DGXSYSTEM}.sh"
 echo "CONFIG FILE: ${_config_file}"
+
+_apply_config_defaults() {
+    local kv key
+    while IFS= read -r -d '' kv; do
+        key="${kv%%=*}"
+        case "${key}" in PWD | OLDPWD | SHLVL | _) continue ;; esac
+        if [[ -z "${!key:-}" ]]; then
+            export "${key}=${kv#*=}"
+        fi
+    done < <(env -i bash -c ". ${_config_file} && env -0")
+}
+set +x
+_apply_config_defaults
+set -x
+: "${EXP:?EXP is empty after loading ${_config_file}}"
+echo "EXP: ${EXP}"
+
 readonly _logfile_base="${LOGDIR}/${DATESTAMP}"
 readonly _cont_name="${CONT_NAME}"
 _cont_mounts=("--volume=${DATADIR}:/data" "--volume=${MODELDIR}:/model" "--volume=$(pwd):/workspace/code" "--volume=${LOGDIR}:/results")
@@ -65,6 +67,33 @@ _config_env+=(GEMM_OFFLINE_TUNING)
 _config_env+=(GEMM_USE_TUNING_RESULTS)
 _config_env+=(HF_TOKEN)
 _config_env+=(SEED)
+_config_env+=(HIPBLASLT_LOG_MASK)
+_config_env+=(HIPBLASLT_LOG_FILE)
+_config_env+=(ENABLE_PRIMUS_TURBO)
+_config_env+=(PRIMUS_USE_TURBO_ATTENTION)
+_config_env+=(PRIMUS_USE_TURBO_GEMM)
+_config_env+=(PRIMUS_ATTENTION_BACKEND)
+_config_env+=(PRIMUS_TURBO_ATTN_BACKEND)
+_config_env+=(PRIMUS_TURBO_AUTO_TUNE)
+_config_env+=(PRIMUS_TURBO_GEMM_BACKEND)
+_config_env+=(PRIMUS_TURBO_FUSED_DENSE_MLP)
+_config_env+=(PRIMUS_TURBO_DENSE_MLP_FUSE_QUANT)
+_config_env+=(PRIMUS_TURBO_DENSE_MLP_FUSE_DGLU)
+_config_env+=(PRIMUS_USE_TURBO_RMS_NORM)
+_config_env+=(PRIMUS_FUSED_RESIDUAL_NORM)
+_config_env+=(PRIMUS_FUSED_RESIDUAL_NORM_V2)
+_config_env+=(PRIMUS_FUSED_RMSNORM_MXFP4)
+_config_env+=(APPLY_SKIP_Y_STE)
+_config_env+=(PRIMUS_TRAIN_ITERS)
+_config_env+=(PRIMUS_EVAL_INTERVAL)
+_config_env+=(PRIMUS_EVAL_ITERS)
+_config_env+=(PRIMUS_ATTN_SOFTMAX_FP32)
+_config_env+=(PRIMUS_ACCUM_GRADS_FP32)
+_config_env+=(PRIMUS_PROFILE)
+_config_env+=(PRIMUS_PROFILE_STEP_START)
+_config_env+=(PRIMUS_PROFILE_STEP_END)
+_config_env+=(PRIMUS_STDERR_SINK_LEVEL)
+_config_env+=(PRIMUS_LOG_INTERVAL)
 
 echo "${_config_env[@]}"
 mapfile -t _config_env < <(for v in "${_config_env[@]}"; do echo "--env=$v"; done)
@@ -82,36 +111,23 @@ cleanup_docker
 trap 'set -eux; cleanup_docker' EXIT
 
 # Setup container
-# Use DGXSYSTEM to determine hardware type (MI* = AMD/ROCm, otherwise NVIDIA)
-if [[ "${DGXSYSTEM}" == MI* ]]; then
-  echo "Using AMD/ROCm container flags"
-  docker run --rm --init --detach \
-      --net=host --uts=host --ipc=host \
-      --device /dev/dri --device /dev/kfd --device=/dev/infiniband \
-      --cap-add=SYS_PTRACE --cap-add=CAP_SYS_ADMIN \
-      --security-opt=seccomp=unconfined \
-      --group-add video \
-      --privileged \
-      --name="${_cont_name}" "${_cont_mounts[@]}" \
-      -e IMAGE_NAME="${CONT}" \
-      "${CONT}" sleep infinity
-else
-  echo "Using NVIDIA container flags"
-  docker run --rm --init --detach \
-      --net=host --uts=host \
-      --ipc=host --gpus all \
-      --ulimit memlock=-1 \
-      --ulimit stack=67108864 \
-      --device=/dev/infiniband \
-      --security-opt=seccomp=unconfined \
-      --name="${_cont_name}" "${_cont_mounts[@]}" \
-      -e IMAGE_NAME="${CONT}" \
-      "${CONT}" sleep infinity
-fi
+docker run --rm --init --detach \
+    --net=host --uts=host --ipc=host \
+    --device /dev/dri --device /dev/kfd --device=/dev/infiniband \
+    --cap-add=SYS_PTRACE --cap-add=CAP_SYS_ADMIN \
+    --security-opt=seccomp=unconfined \
+    --group-add video \
+    --privileged \
+    --ulimit memlock=-1:-1 \
+    --ulimit nofile=1048576:1048576 \
+    --name="${_cont_name}" "${_cont_mounts[@]}" \
+    -e IMAGE_NAME="${CONT}" \
+    "${CONT}" sleep infinity
 
 
 # Make sure container has time to finish initialization
 sleep 5
+bash runtime_tunables.sh
 docker exec "${_cont_name}" true
 
 # Run experiments
