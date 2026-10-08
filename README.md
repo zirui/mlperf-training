@@ -1,6 +1,6 @@
-# MLPerf Training v6.0 — AMD Submission
+# MLPerf Training — AMD Submission
 
-AMD submissions for the [MLPerf Training v6.0](https://mlcommons.org/benchmarks/training/) benchmark suite, running on AMD Instinct GPUs with ROCm.
+AMD submissions for the [MLPerf Training](https://mlcommons.org/benchmarks/training/) benchmark suite, running on AMD Instinct GPUs with ROCm.
 
 ## Benchmarks
 
