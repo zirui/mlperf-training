@@ -11,26 +11,29 @@ modules:
     # model to run
     model: llama3.1_8B.yaml
     overrides:
+      # Migrated MLPerf pretrain trainer (mllog + MLPerf hooks via mlperf-common).
+      stage: ${PRIMUS_STAGE:mlperf_pretrain}
+
       tokenizer_model: /model
       # --- Logging Config ---
       disable_wandb: true
       disable_tensorboard: true
-      stderr_sink_level: ERROR
-      log_interval: 9999999
+      stderr_sink_level: ${PRIMUS_STDERR_SINK_LEVEL:ERROR}
+      log_interval: ${PRIMUS_LOG_INTERVAL:9999999}
       log_avg_skip_iterations: 2
       log_avg_reset_interval: 50
-      eval_iters: ${PRIMUS_EVAL_ITERS:32}  # 32 * GBS = 1024 eval samples
+      eval_iters: ${PRIMUS_EVAL_ITERS:32}  # 32 * GBS 32 = 1024 eval samples
       eval_interval: ${PRIMUS_EVAL_INTERVAL:10} # 10 * GBS = 320 eval samples perform evaluation.
 
       # --- Training Config ---
-      train_iters: ${PRIMUS_TRAIN_ITERS:200}
+      train_iters: ${PRIMUS_TRAIN_ITERS:1200000}
       micro_batch_size: ${PRIMUS_MICRO_BATCH_SIZE:2}                # grad_acc = global_batch_size / (micro_batch_size * num_gpus) = 32 / (2 * 8) = 2
       global_batch_size: ${PRIMUS_GLOBAL_BATCH_SIZE:32}
       seq_length: 8192
       max_position_embeddings: 8192
       seed: ${SEED:1234}
       lr: ${PRIMUS_LR:0.0008}          # 8e-4
-      min_lr: 0.00008     # 10% of lr
+      min_lr: ${PRIMUS_MIN_LR:0.00008}     # 10% of lr
       lr_warmup_iters: ${PRIMUS_LR_WARMUP_ITERS:64}
       lr_decay_iters: 1199936
       lr_decay_style: cosine
@@ -51,6 +54,8 @@ modules:
       expert_model_parallel_size: 1
       overlap_grad_reduce: true
       overlap_param_gather: true
+
+      ddp_num_buckets: 32
       gradient_accumulation_fusion: true
       masked_softmax_fusion: true
       ddp_average_in_collective: true
@@ -65,16 +70,17 @@ modules:
       data_cache_path: /npy_indices
       mmap_bin_files: true
       data_cache_path: null
+      create_attention_mask_in_dataloader: ${PRIMUS_CREATE_ATTENTION_MASK_IN_DATALOADER:0}
 
       # --- Profiling Config ---
-      profile: false
-      use_pytorch_profiler: true
+      profile: ${PRIMUS_PROFILE:false}
+      use_pytorch_profiler: ${PRIMUS_PROFILE:false}
       profile_ranks: [0]           # Only profile rank 0 to save disk space
-      profile_step_start: 8        # Start after warmup (step 8)
-      profile_step_end: 13        # Profile 5 iterations (8-12)
-      disable_profiler_activity_cpu: false     # GPU kernels only (smaller files)
-      torch_profiler_record_shapes: false     # Disable for smaller traces
-      torch_profiler_with_stack: false        # Disable for smaller traces
+      profile_step_start: ${PRIMUS_PROFILE_STEP_START:8}
+      profile_step_end: ${PRIMUS_PROFILE_STEP_END:13}
+      disable_profiler_activity_cpu: false     # Keep CPU so with_stack can attribute kernels
+      torch_profiler_record_shapes: ${PRIMUS_PROFILE_RECORD_SHAPES:false}
+      torch_profiler_with_stack: ${PRIMUS_PROFILE_WITH_STACK:false}
       torch_profiler_use_gzip: true           # Compress output
 
       # --- Checkpointing Config ---
@@ -94,24 +100,28 @@ modules:
       use_torch_fsdp2: false
       use_distributed_optimizer: true # this is needed for fsdp2
 
-      # Cross entropy flags
+      # TE fused CE (te_parallel_cross_entropy). Base-image TE, not a TE rebuild.
       cross_entropy_fusion_impl: "te"
       cross_entropy_loss_fusion: true
 
       # --- Mixed Precision Config ---
       fp4: true
       fp4_recipe: mxfp4
-      accumulate_allreduce_grads_in_fp32: false
+      accumulate_allreduce_grads_in_fp32: ${PRIMUS_ACCUM_GRADS_FP32:false}
       grad_reduce_in_bf16: true
-      attention_softmax_in_fp32: false
+      attention_softmax_in_fp32: ${PRIMUS_ATTN_SOFTMAX_FP32:false}
 
 
       # --- Primus Turbo Config ---
-      enable_primus_turbo: false
-      use_turbo_attention: false
-      use_turbo_parallel_linear: false              # can't use together with delayed recipe
-      use_turbo_grouped_mlp: false
+      enable_primus_turbo: ${ENABLE_PRIMUS_TURBO:true}
+      use_turbo_attention: ${PRIMUS_USE_TURBO_ATTENTION:true}
+      enable_turbo_attention_float8: false
+      use_turbo_gemm: ${PRIMUS_USE_TURBO_GEMM:true}
+      turbo_gemm_backend: ${PRIMUS_TURBO_GEMM_BACKEND:flydsl}
+      use_turbo_grouped_gemm: false
+      use_turbo_fused_dense_mlp: ${PRIMUS_TURBO_FUSED_DENSE_MLP:true}
+      use_turbo_rms_norm: ${PRIMUS_USE_TURBO_RMS_NORM:true}
       moe_use_fused_router_with_aux_score: false
-      enable_turbo_attention_float8 : false
+      attention_backend: ${PRIMUS_ATTENTION_BACKEND:flash}
 
 
