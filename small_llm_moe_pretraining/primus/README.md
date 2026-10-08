@@ -14,7 +14,7 @@ Run the following build command from this directory. The build process will take
 
 ```bash
 # From gpt-oss-20b/primus directory
-docker build -t rocm/amd-mlperf:gpt_oss_20b_training_6.0 .
+docker build -t rocm/amd-mlperf:gpt_oss_20b_training_6.1 .
 ```
 
 # 2. Prepare Dataset
@@ -56,7 +56,7 @@ Set the directory for data and results. Ensure `$LOGDIR` has write access.
 export DATADIR=/data/gpt_oss_20b/data
 export MODELDIR=/data/gpt_oss_20b/model
 export LOGDIR=/data/gpt_oss_20b/results
-export CONT=rocm/amd-mlperf:gpt_oss_20b_training_6.0
+export CONT=rocm/amd-mlperf:gpt_oss_20b_training_6.1
 
 # Create results directory
 mkdir -p $LOGDIR
@@ -81,6 +81,8 @@ source config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh
 ```
 
 ## Launch Training (Single Node)
+
+Output defaults to MLPerf records and run summaries; set `MLPERF_VERBOSE_LOGS=1` for debugging.
 
 ### Single Run
 

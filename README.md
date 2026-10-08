@@ -7,7 +7,7 @@ AMD submissions for the [MLPerf Training](https://mlcommons.org/benchmarks/train
 | Benchmark | Model | Target Hardware | Quality Target |
 |---|---|---|---|
 | [**Text-to-Image**](flux1/nemo/) | FLUX.1 Schnell | MI300X, MI355X (1–4 nodes) | Validation loss ≤ 0.586 |
-| [**Small LLM MoE Pretraining**](small_llm_moe_pretraining/primus/) | GPT-OSS 20B MoE | MI355X | Validation loss ≤ 3.34 |
+| [**Small LLM MoE Pretraining**](small_llm_moe_pretraining/primus/) | GPT-OSS 20B MoE | MI350X, MI355X | Validation loss ≤ 3.34 |
 | [**Recommendation**](recommendation_v4/hstu/) | DLRMv4 HSTU | MI350X, MI355X (1–4 nodes) | Eval AUC ≥ 0.75 |
 
 Each benchmark directory contains its own `README.md` with detailed setup, dataset preparation, and launch instructions.

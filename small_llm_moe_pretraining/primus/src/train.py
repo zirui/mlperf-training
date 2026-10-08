@@ -1,15 +1,7 @@
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# ---------------------------------------------------------------------------
-# Non-MLLOG log suppression. Must be imported BEFORE any other import that
-# may log/print at import time (Primus, Megatron, TE, aiter, primus_mllog,
-# ...). See ``_log_suppression.py`` for the full strategy; the short
-# version is that non-MLLOG output is gated behind ``MLPERF_VERBOSE_LOGS=1``
-# via Python logging levels + env vars + an FD-level stdout filter for
-# native C++ writes that bypass the above.
-# ---------------------------------------------------------------------------
-import _log_suppression as _log_suppression  # noqa: F401
-# ---------------------------------------------------------------------------
+# Configure legacy entry-point logging before framework imports.
+import _log_suppression
 
 import argparse
 import os
@@ -30,13 +22,9 @@ from primus.core.launcher.config import PrimusConfig
 from primus.core.launcher.parser import load_primus_config, add_pretrain_parser
 from primus_mllog import MLPerfMegatronPretrainTrainer
 
-# Primus reconfigures stdlib ``logging`` via loguru ``InterceptHandler`` during
-# trainer init, which resets the per-logger levels installed by
-# ``_log_suppression`` at import time. Re-apply the quiet levels after the
-# Primus imports so the "Setting RerunStateMachine mode" / Megatron
-# deprecation / torch.distributed banners stay hidden. No-op in verbose mode.
-if not _log_suppression.VERBOSE_LOGS:
-    _log_suppression.reapply_quiet_logger_levels()
+# Primus may replace logger configuration during import.
+_log_suppression.reapply_quiet_logger_levels()
+
 
 def setup_environment(data_path: Optional[str] = None) -> None:
     """Setup HuggingFace home and other environment variables."""
@@ -52,7 +40,7 @@ def load_config(
     """
     Load and parse the experiment YAML configuration.
     
-    The config file (e.g., gpt_oss_20B-pretrain.yaml) defines:
+    The config file (e.g., gpt_oss_20B-MXFP4-deosc-mlperf-pretrain.yaml) defines:
     - Model architecture (hidden size, num layers, attention heads, etc.)
     - Training hyperparameters (batch size, learning rate, etc.)
     - Data paths and tokenizer settings
@@ -107,7 +95,7 @@ def create_trainer(
     return trainer
 
 def main() -> None:
-    config_path = os.environ.get("EXP", "/workspace/code/conf/gpt_oss_20B-pretrain.yaml")
+    config_path = os.environ.get("EXP", "/workspace/code/conf/gpt_oss_20B-MXFP4-deosc-mlperf-pretrain.yaml")
     
     if not Path(config_path).exists():
         raise FileNotFoundError(f"Config not found: {config_path}")

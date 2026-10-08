@@ -1,1 +1,2 @@
-git+https://github.com/mlcommons/logging.git@6.0.0-rc5
+# Upstream 6.1.0-rc2 includes training_6.1.0 rules; no final 6.1.0 tag exists yet.
+git+https://github.com/mlcommons/logging.git@8a0cc0558ab498b3b003b106d7eae0de19801876
