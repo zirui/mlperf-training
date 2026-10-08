@@ -1,0 +1,966 @@
+"""HSTU jagged-attention FORWARD written in FlyDSL for gfx950.
+
+Two gemms with a pointwise between them, per (batch, head, m-block):
+
+    qk  = alpha * q @ k.T                          (mfma, acc in f32)
+    p   = where(m >= n, qk * sigmoid(qk) / N, 0)   (silu, causal INCLUDES diag)
+    out = p @ v                                     (mfma, acc in f32)
+
+There is NO softmax, no row max, no row sum, no rescale.  `out[m]` sums over
+n <= m only, so an m-outer (q-outer) grid gives each workgroup exclusive
+ownership of its output rows -- no atomics, no zero-fill.
+
+Decomposition:
+  * grid is XCD-pinned: (NXCD*heads, m_blocks, cdiv(batch, NXCD)), so each
+    batch's K/V stays resident in one XCD's L2 instead of being re-fetched
+    across all eight.  One workgroup owns BM output rows of one (batch, head);
+    WAVES waves, wave w owns MT = BM/(16*WAVES) sixteen-row tiles starting at
+    m0 + 16*MT*w.
+  * Q for the owned rows is loaded once into registers (loop-invariant) and is
+    the A-operand of the score gemm.  K and V are streamed over n and staged in
+    LDS; K is the score gemm's B-operand, V is the out gemm's B-operand.
+  * BOTH K AND V ARE B-OPERANDS, so they are broadcast across m: each fragment
+    is read from LDS once and issued against all MT m-tiles.  That is why
+    WAVES=2/MT=2 beats WAVES=4/MT=1 -- it halves the workgroup's K/V LDS reads
+    without touching BM, and this kernel is LDS-throughput bound (measured:
+    occupancy 3 wg/CU vs 2 is worth nothing, while a K-read bank conflict is
+    worth 40%).
+  * The score accumulator is TRANSPOSED -- mfma2(kf, qf) rather than
+    mfma2(qf, kf) -- so the fragment it produces already carries n on the
+    element axis, which is the layout the out gemm's A-operand needs.  V is read
+    from a tr16 LDS layout with ds_read_b64_tr_b16 (transpose-on-read).
+  * Every LDS tile is bank-conflict padded, and that is where most of this
+    kernel's performance came from: k_lds stride D+16, p_lds stride BN+4,
+    v_lds tr16 block stride BN+1.  Each pad was worth double digits; the sweep
+    is exhausted (see ../../lineage/hstu_attention_forward.md).
+
+Reads q/k/v in place at a caller-supplied row stride (`rs`), because production
+hands attention COLUMN SLICES of one uvqk buffer rather than packed tensors.
+
+This is the structural transpose of hstu_bwd_dkdv.py: it reuses that kernel's
+mfma2 helper, _shifted_rsrc buffer descriptors and silu chain.
+"""
+
+import functools
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import fly, llvm, memref, scf
+from flydsl._mlir.dialects import rocdl as rocdl_raw
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.compiler.protocol import fly_values
+from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, vector
+from flydsl.expr.typing import T
+from flydsl.runtime.device import get_rocm_arch
+from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+
+from generative_recommenders.ops.flydsl import current_stream_launch
+
+LOG2E = 1.4426950408889634
+
+# Shipping configuration in one place so bench and gate cannot drift.
+#
+# BN=32 (not 64): halves the K/V/p LDS tiles.  BN=64 re-measured at -17.6% on the
+# production shape, so this is not merely an occupancy choice.
+#
+# waves=2 (not 4): with BM=64 this gives each wave MT=2 sixteen-row m-tiles, so a
+# K or V fragment is read from LDS once and issued against both -- halving the
+# workgroup's K/V LDS reads at identical BM, MFMA count and causal waste.  Worth
+# +2.6% measured by repeated standalone runs and +4.7% by an in-process paired
+# harness (identity control -0.05%, sign flips correctly when the arms swap);
+# +2.6% is the figure banked, following the campaign's worse-of-two rule.
+# waves=1 (MT=4) collapses (-69%): there is a register cliff between MT=2 and 4.
+SHIPPED = {"BM": 64, "BN": 32, "sched": "iglp1", "waves": 2}
+
+PTR_TY = "!llvm.ptr"
+RSRC_TY = "!llvm.ptr<8>"
+LDS_PTR_TY = "!llvm.ptr<3>"
+GEP_DYNAMIC = -2147483648  # kDynamicIndex marker in llvm.getelementptr
+CAT8 = [0, 1, 2, 3, 4, 5, 6, 7]  # concat two v4bf tr reads into a K=32 fragment
+CDNA_BUFFER_FLAGS = (7 << 12) | (4 << 15)
+
+
+def _lds_gep(mem, elem_off, elem_ty):
+    """Raw `!llvm.ptr<3>` at a dynamic element offset into an LDS memref.
+
+    rocdl.ds.read.tr16.b64 takes a raw LDS pointer, not the (memref, index) pair
+    the vector ops accept, so the view is reduced to a pointer by hand.
+    """
+    ptr_ty = ir.Type.parse(LDS_PTR_TY)
+    idx = memref.ExtractAlignedPointerAsIndexOp(mem).result
+    base = llvm.IntToPtrOp(ptr_ty, arith.index_cast(T.i32, idx)).result
+    return llvm.GEPOp(
+        ptr_ty, base, [arith.unwrap(elem_off)], [GEP_DYNAMIC], elem_ty,
+        llvm.GEPNoWrapFlags(0),
+    ).result
+
+
+def _i32(v):
+    return arith.constant(int(v), type=T.i32)
+
+
+def _f32(v):
+    return arith.constant(float(v), type=T.f32)
+
+
+def _i64(v):
+    return arith.constant(int(v), type=T.i64)
+
+
+def _to_i64(v):
+    v = arith.unwrap(v)
+    return v if v.type == T.i64 else arith.extsi(T.i64, v)
+
+
+def _idx(v):
+    return arith.index_cast(T.index, v)
+
+
+def _shifted_rsrc(tensor, elem_offset, elem_bytes, num_bytes=None):
+    """Buffer resource whose base is advanced by elem_offset (computed in i64).
+
+    `num_bytes`, when given, becomes the descriptor's num_records: a raw buffer
+    load whose voffset reaches it returns zero instead of reading.  That turns
+    "row past the end of this sequence" into an exact algebraic zero.
+
+    `elem_offset` must ALREADY be i64 when it can exceed 2^31.  seq_start * RS is
+    a whole-tensor element offset and DOES overflow i32 at production sizes: at
+    batch 1024 and a uvqk row stride of 2048 it reaches 5.66e9 against i32's
+    2.15e9, which faults on a wild address.  Only this base shift needs the wider
+    type -- every voffset used against the returned descriptor is relative to it
+    and bounded by one sequence.
+    """
+    ptr_ty = ir.Type.parse(PTR_TY)
+    base = fly.extract_aligned_pointer_as_index(ptr_ty, fly_values(tensor)[0])
+    base_i64 = llvm.PtrToIntOp(T.i64, base).result
+    off_i64 = arith.ArithValue(_to_i64(elem_offset))
+    byte_i64 = off_i64 * arith.constant(int(elem_bytes), type=T.i64)
+    new_i64 = llvm.AddOp(
+        arith.unwrap(base_i64), arith.unwrap(byte_i64), llvm.IntegerOverflowFlags(0)
+    ).result
+    new_ptr = llvm.IntToPtrOp(ptr_ty, new_i64).result
+    if num_bytes is None:
+        nrec = arith.constant(0xFFFFFFFF, type=T.i64)
+    else:
+        nrec = arith.extsi(T.i64, arith.unwrap(num_bytes))
+    return rocdl_raw.MakeBufferRsrcOp(
+        ir.Type.parse(RSRC_TY),
+        new_ptr,
+        arith.unwrap(arith.constant(0, type=T.i16)),
+        arith.unwrap(nrec),
+        arith.unwrap(_i32(CDNA_BUFFER_FLAGS)),
+    ).result
+
+
+@functools.lru_cache(maxsize=64)
+def compile_hstu_fwd(
+    heads: int,
+    dim: int,
+    alpha: float,
+    BM: int = 64,
+    BN: int = 32,
+    sched: str = "",
+    rs: int = 0,
+    kpad: int = -1,
+    lds_dummy: int = 0,
+    waves: int = 2,
+    # ---- true fp8 MFMA on the qk gemm -----------------------------------
+    # Same argument as the backward's fp8_mfma (hstu_bwd_dkdv.py): in the FP8
+    # arm q and k are ALREADY e4m3 in memory, and e4m3 -> bf16 is lossless (3
+    # mantissa bits into 7), so the incumbent widens both operands and runs a
+    # bf16 MFMA over values that are exactly fp8.  Substituting a native fp8
+    # MFMA changes only the f32 accumulation order -- it is numerically free.
+    # What it buys is NOT math rate:
+    #   * k_lds halves, 128 B/row -> 64 B/row of payload;
+    #   * "k128" (mfma_scale_f32_16x16x128_f8f6f4) collapses the score gemm's
+    #     FOUR ds_read_b128 per (n-tile) into TWO, and its four mfma into one.
+    # The K LDS read is this kernel's measured DOMINANT cost (the ablation in
+    # the KPAD note above puts it at -17.6%, vs -8.4% for the V tr-reads), so
+    # that read collapse is aimed straight at the top of the profile.
+    fp8_mfma: str = "",
+    # Feed V as e4m3 too.  Independent of fp8_mfma: it halves the v_lds tile
+    # and the V global traffic even while the out gemm stays bf16, because the
+    # tr16 staging then widens e4m3 -> bf16 on the way in.
+    fp8_v: bool = False,
+    # fp8 MFMA on the out gemm (p @ v).  Needs fp8_v, and unlike qk it is NOT
+    # free: p is computed in f32 and would have to be ROUNDED to e4m3.  p's
+    # underflow is benign (0.009-0.017% flushed on real tensors, vs 96-99.9%
+    # for the backward's ds/dO), so the cost is mantissa, not flush.
+    pv: str = "",
+    # Bank-conflict padding, in BYTES, of the fp8 k_lds row.  Same role KPAD
+    # plays for the bf16 tile; the bf16 sweep's answer does not carry over
+    # because the row is half as wide, so this is swept separately.
+    k8_pad: int = 16,
+    # Bank-conflict padding, in BYTES, of the fp8 v_lds tr8 block stride.
+    v8_pad: int = 16,
+    # ---- TRACK E2: silu-epilogue VALU reductions ------------------------
+    # The rocprofv3 census says the kernel spends 57% of its SIMD cycles in
+    # NON-MFMA VALU and only 28.6% in MFMA, at 12.0 VALU lane-ops per score
+    # element (4 MUL, 2 TRANS, 2 INT32, 1.1 CVT, 1 ADD, 1.9 cmp/cndmask/mov).
+    # Both knobs below delete lane-ops the counters name, and neither changes
+    # what the MFMAs compute.
+    #
+    # `epi_fold`: the two constant MULs.  Reparametrise the silu on
+    #   u = -log2(e) * score_scale * raw   (ONE mul, was two: score_scale then
+    #   -LOG2E), so exp2's argument IS u; then silu = u*sig carries a constant
+    #   factor -1/log2(e) which, together with inv_max, rides out on the
+    #   epilogue's existing out_scale -- 128 f32 muls per output row instead of
+    #   one per score element.  4 MUL/element -> 2.
+    epi_fold: bool = False,
+    # `mask_split`: the causal compare.  For an m-block at m0, every n-tile
+    #   with n0+BN <= m0 is strictly below the diagonal, so m >= n holds for
+    #   all of it and the mask is dead.  m0 is a multiple of BN (BM % BN == 0),
+    #   so that is exactly the first m0/BN iterations.  Splitting the n loop
+    #   there drops the n_idx add, the v_cmp and the v_cndmask -- 3 of 12
+    #   lane-ops -- on the 95.55% of n-iterations that are fully below the
+    #   diagonal at the production length distribution.
+    mask_split: bool = False,
+    # `epi_pk`: the two MULs and the ADD that survive epi_fold, at double rate.
+    #   The re-profile after epi_fold+mask_split says the kernel is STILL
+    #   VALU-bound and not MFMA-bound (VALUBusy 57.1% vs MfmaUtil 34.0%), and
+    #   names the remainder exactly: per score element 2 TRANS (v_exp_f32 +
+    #   v_rcp_f32, irreducible for silu), 2 MUL_F32 and 1 ADD_F32.  gfx950 has
+    #   double-rate packed f32 -- verified at the ISA level, `llc -mcpu=gfx950`
+    #   turns an <2 x float> fmul/fadd into v_pk_mul_f32/v_pk_add_f32 -- and the
+    #   accumulator already holds 4 consecutive n per lane, so the pairs are
+    #   free to form.  MUL 5.230e8 + ADD 2.497e8 = 7.73e8 of 2.016e9 VALU
+    #   instructions halve, i.e. -19.2% of VALU issue.  The transcendentals stay
+    #   scalar; only the surrounding arithmetic packs.  Bit-exact: same
+    #   operations, same order, same f32 rounding, just two lanes per issue.
+    epi_pk: bool = False,
+):
+    """`kpad` overrides the k_lds row pad; `lds_dummy` wastes that many LDS bytes.
+
+    Both exist to separate two effects the KPAD sweep confounded. Raising KPAD
+    from 8 to 16 both fixes a K-read bank conflict AND costs 512 B/workgroup,
+    which pushes 3x21.75 KB past the 64 KB the CU has and drops occupancy from 3
+    workgroups to 2. The sweep preferred KPAD=16, so conflict-freedom is worth
+    more than that occupancy -- but it never priced the occupancy on its own.
+    `lds_dummy` does: it forces the same occupancy drop at an UNCHANGED conflict
+    pattern, so KPAD=8+512 vs KPAD=8 isolates occupancy, and against KPAD=16 it
+    isolates the conflict fix. Measured at the production shape: 3 wg/CU 6.192 ms
+    vs 2 wg/CU 6.169 at KPAD=8, i.e. occupancy is worth NOTHING here, while
+    KPAD=0 costs 40% (8.436). This kernel is LDS-throughput bound, not latency
+    bound -- which is what makes `waves` below the interesting knob.
+
+    `waves` sets waves per workgroup, and with BM fixed it sets MT = BM/(16*waves),
+    the number of 16-row m-tiles ONE wave owns. It is the lever on LDS traffic:
+    K and V are both B-operands, broadcast across m, so a wave that owns MT
+    m-tiles reads each K/V fragment ONCE and issues MT mfmas against it. Halving
+    `waves` therefore halves the workgroup's K/V LDS reads for identical MFMA
+    work, at identical BM -- which is what distinguishes it from raising BM. BM
+    sets the causal waste (the n loop runs to m0+BM, so a coarser BM overshoots
+    the triangle), and that is why BM=128 measured neutral in the campaign: it
+    bought this same amortization and paid it back in wasted tiles.
+    """
+    assert dim == 128, "kernel is specialised for D=128"
+    assert BM % 64 == 0 and BN % 32 == 0
+    # The packed path only implements the epi_fold parametrisation.
+    assert not epi_pk or epi_fold, "epi_pk requires epi_fold"
+    assert fp8_mfma in ("", "k32", "k128"), fp8_mfma
+    assert pv in ("", "k32", "k128"), pv
+    assert not pv, "the p@v fp8 path is not implemented (see the pv note above)"
+    assert not (pv and not fp8_v), "pv needs an e4m3 V"
+    FP8_QK = fp8_mfma
+    D = dim
+    # k_lds is row-major [BN][D].  The score gemm's B read for lane l is
+    # k[n = 16*nt + l16][d = 32*ks + 8*l4 .. +7] as a b128 (v8bf).  ABLATION
+    # (collapsing the 8 K reads/iter to 1 reused read) shows these K reads are
+    # this kernel's DOMINANT LDS cost: -17.6% at b256, vs V tr-reads -8.4% and
+    # transcendentals ~0%.  So the K-read bank pattern is where the money is.  A
+    # KPAD sweep over the alignment-preserving multiples of 8 (KSTRIDE must be
+    # 8-elem == 16 B aligned or the b128 splits) at b256: pad=8 4.085 (old
+    # leader), pad=16 3.87-4.04, pad=24 4.186, pad=32 4.223.  pad=16
+    # (KSTRIDE=144, 288 B == 16 mod 32 banks) wins despite the +512 B pushing
+    # 3 wg/CU -> 2 wg (66 KB > 64 KB for three): the K-read conflict reduction
+    # beats the occupancy loss, matching the note that this kernel is no longer
+    # latency-bound.  The earlier pad=8 "2-way" model was wrong; trust the sweep.
+    KPAD = 16 if kpad < 0 else kpad
+    assert KPAD % 8 == 0, "KSTRIDE must stay 16 B aligned or the b128 read splits"
+    KSTRIDE = D + KPAD
+    # fp8 k_lds: the SAME row-major [BN][row] tile, but the row is D BYTES wide
+    # instead of D halfwords.  Padding is in bytes and has to keep the row 16 B
+    # aligned, because "k128" reads it as two ds_read_b128.
+    K8STRIDE = D + k8_pad
+    assert K8STRIDE % 16 == 0, "fp8 k_lds row must stay 16 B aligned"
+    K8_DW = K8STRIDE // 4
+    # p_lds is per-wave [16 m_local][BN n].  With row stride exactly BN=32 elems
+    # (64 B) two m_local rows 2 apart (=128 B, the 32-bank period) alias onto the
+    # SAME banks: the out-gemm A read (row = l16, all 16 rows at once) is an 8-way
+    # conflict on its 2 b64 reads/iter, and the p-store (rows l4*4+e, 4 apart =
+    # 256 B = 2 periods) is a 4-way conflict on its 8 scalar writes/iter -- the
+    # exact flaw the k_lds pad fixed.  Padding to 36 elems (72 B) puts rows k=1..4
+    # apart at {72,16,88,32} B mod 128 (none 0), killing both.  PSTRIDE%4==0 keeps
+    # the b64 A read 8 B aligned.  +512 B LDS -> 21.0 KB, still 3 wgs/CU (3 waves).
+    PPAD = 4
+    PSTRIDE = BN + PPAD
+    # v_lds is tr16 [D/16 blocks][BN rows][16 cols]; the tr16 block stride
+    # (ROWS in the (c/16)*ROWS+r formula) is BN, so the cooperative vec8 staging
+    # store v_off = (v_blk*BN + n)*16 + v_in has byte bank =
+    # 8*((v_blk*BN+n) mod 8)+{0,4} on gfx950's 64 banks.  BN=32 == 0 mod 8 drops
+    # v_blk out entirely: all 8 d-blocks collide on the same banks for each
+    # (n,half) -> 8-way store conflict, only 32 of 64 banks used.  Same flaw KPAD
+    # fixed for k_lds, on the ONE tile never padded.  VROWS = BN+1 (== 1 mod 8)
+    # makes 8*((v_blk+n) mod 8) spread all 8 blocks over distinct bank groups ->
+    # conflict-free store.  Reads (ds_read_tr16, all lanes share dd) are
+    # unaffected by block stride.  +256 B LDS; already 2 wg/CU so no cliff.
+    VPAD = 1
+    VROWS = BN + VPAD
+    VLDS_HW = (D // 16) * VROWS * 16
+    H = heads
+    HD = H * D
+    # Elements between consecutive tokens of q/k/v.  A packed [N, H, D] tensor
+    # has H*D, but production never builds one: the UVQK gemm emits a single
+    # [N, 2*H*hidden + 2*H*attn] buffer and hands attention COLUMN SLICES of it,
+    # so one token's q sits `rs` elements from the next.  Passing that stride is
+    # what lets the kernel read the slice in place; with rs unset the caller is
+    # promising a packed tensor and gets the old math.
+    #
+    # This matters more here than it looks.  Packing q/k/v to contiguous costs
+    # three full copies of the attention input per layer per step, and the
+    # backward measured that class of wrapper tax at ~15 ms/step/rank for six
+    # copies -- enough to eat this kernel's entire win.  The column offset needs
+    # no parameter: a torch slice view carries it in its data_ptr, which is what
+    # _shifted_rsrc starts from.
+    #
+    # OUT is NOT a slice of that buffer -- it is attention's own freshly
+    # allocated output -- so it keeps the packed H*D stride and is addressed
+    # separately below.
+    RS = rs or HD
+    # An 8-wide bf16 load is 16 B and must stay 16 B-aligned at every token, so
+    # the row stride has to be a multiple of 8 elements.  Production's 2048 is.
+    assert RS % 8 == 0, f"row stride {RS} must be a multiple of 8 bf16 elements"
+    # Element size of each input, in bytes.  q/k follow fp8_mfma, v follows
+    # fp8_v, and they are addressed independently because the two gemms consume
+    # them independently: the qk operands are raw bytes fed to an fp8 MFMA while
+    # V is still widened on the way into a bf16 tr16 tile.
+    QK_BYTES = 1 if FP8_QK else 2
+    V_BYTES = 1 if fp8_v else 2
+    assert RS >= HD, f"row stride {RS} cannot be narrower than one H*D row"
+    NXCD = 8                          # gfx950: 8 XCDs, each an independent L2
+    WAVES = waves
+    THREADS = WAVES * 64
+    MT = BM // (16 * WAVES)          # 16-row m-tiles owned by one wave
+    assert BM == 16 * WAVES * MT, f"BM {BM} != 16*{WAVES}*MT"
+    assert MT >= 1
+    # Rows of the K/V tile staged per cooperative pass. Each pass has one thread
+    # per (row, 16-wide d block), so THREADS/16 rows move at a time; the count of
+    # passes below is what keeps the whole BN-row tile covered as WAVES varies.
+    ROWS_PER_PASS = THREADS // 16
+    assert BN % ROWS_PER_PASS == 0, f"BN {BN} not divisible by {ROWS_PER_PASS}"
+    KSTEP = D // 32                  # d-tiles of the score gemm (double-rate K=32)
+    NTILE = BN // 16                 # 16-n tiles in one BN block (score B reads)
+    NDSTEP = D // 16                 # 16-d tiles of the out accumulator
+    NKSTEP = BN // 32                # 32-n contraction steps of the out gemm
+
+    def emit_sched():
+        if not sched:
+            return
+        if sched.startswith("iglp"):
+            rocdl.iglp_opt(int(sched[4:]))
+            return
+        raise ValueError(f"unknown sched {sched!r}")
+
+    arch = get_rocm_arch()
+    allocator = SmemAllocator(
+        None, arch=arch,
+        global_sym_name=(f"hstu_fwd_smem_{BM}_{BN}_{KPAD}_{lds_dummy}_w{WAVES}"
+                         f"_{FP8_QK or 'bf16'}_{k8_pad}_{int(fp8_v)}"
+                         f"_{int(epi_fold)}{int(mask_split)}{int(epi_pk)}"),
+    )
+    # k_lds[BN][D], v_lds[BN][D] (row-major), p_lds[WAVES][BN][16] (per-wave).
+    off_k = allocator._align(allocator.ptr, 16)
+    allocator.ptr = off_k + (BN * K8STRIDE if FP8_QK else BN * KSTRIDE * 2)
+    off_v = allocator._align(allocator.ptr, 16)
+    allocator.ptr = off_v + VLDS_HW * 2
+    off_p = allocator._align(allocator.ptr, 16)
+    # One region per (wave, m-tile) == BM/16 regions, so this is independent of
+    # how the m-tiles are distributed over waves.
+    allocator.ptr = off_p + (BM // 16) * 16 * PSTRIDE * 2
+    # Never read or written; it exists only to consume the occupancy headroom.
+    allocator.ptr = allocator._align(allocator.ptr + lds_dummy, 16)
+
+    def emit_body(Q, K, V, OUT, inv_max, qkv_scale, tid, m0, head, seq_start,
+                  seq_len):
+        v1bf = T.vec(1, T.bf16)
+        v4bf = T.vec(4, T.bf16)
+        v8bf = T.vec(8, T.bf16)
+        v2i32 = T.vec(2, T.i32)
+        v4i32 = T.vec(4, T.i32)
+
+        def mfma2(a, b, acc):
+            return rocdl_raw.mfma_f32_16x16x32_bf16(
+                T.f32x4, arith.unwrap(a), arith.unwrap(b), arith.unwrap(acc),
+                0, 0, 0,
+            ).result
+
+        # ---- fp8 MFMA for the qk gemm ------------------------------------
+        # Both take the SAME (lane, element) -> k mapping the bf16 16x16x32 op
+        # uses, so the operands are the raw e4m3 bytes in exactly the order the
+        # widened bf16 fragments carried them, and the operand SWAP the score
+        # gemm relies on (A=k, B=q, transposed accumulator) is preserved.
+        # No scale is folded into the instruction: qkv_scale**2 is applied once
+        # per score in the silu epilogue, which keeps the dequant out of the
+        # E8M0-only scale field.
+        def mfma_qk_k32(a, b, acc):
+            return rocdl_raw.mfma_f32_16x16x32_fp8_fp8(
+                T.f32x4,
+                llvm.BitcastOp(T.i64, arith.unwrap(a)).result,
+                llvm.BitcastOp(T.i64, arith.unwrap(b)).result,
+                arith.unwrap(acc), 0, 0, 0,
+            ).result
+
+        z_i32 = arith.unwrap(arith.constant(0, type=T.i32))
+
+        def mfma_qk_k128(a, b, acc):
+            # cbsz=0 / blgp=0 select e4m3 for both operands; scale=0 is E8M0
+            # bias 127, multiplier 1.0, so the scale field is a no-op.
+            return rocdl_raw.mfma_scale_f32_16x16x128_f8f6f4(
+                T.f32x4, arith.unwrap(a), arith.unwrap(b), arith.unwrap(acc),
+                0, 0, 0, z_i32, 0, z_i32,
+            ).result
+
+        def widen8(packed):
+            """8 packed e4m3 bytes (vec<2xi32>) -> vec<8xbf16>, exactly."""
+            conv = []
+            for dw in range_constexpr(2):
+                src = vector.extract(packed, static_position=[dw],
+                                     dynamic_position=[])
+                for hi in (False, True):
+                    conv.append(rocdl_raw.cvt_scalef32_pk_bf16_fp8(
+                        T.vec(2, T.bf16), src, arith.unwrap(_f32(1.0)), hi))
+            lo = vector.shuffle(conv[0], conv[1], [0, 1, 2, 3])
+            hi = vector.shuffle(conv[2], conv[3], [0, 1, 2, 3])
+            return vector.shuffle(lo, hi, CAT8)
+
+        zero_acc = arith.constant_vector(0.0, T.f32x4)
+
+        # q/k/v walk at RS (they may be column slices of uvqk); OUT is packed.
+        # i64: seq_start * RS is a whole-tensor element offset and overflows i32
+        # at production sizes -- see _shifted_rsrc.  Only these base shifts need
+        # it; the per-row offsets below stay i32, bounded by one sequence.
+        head_off = arith.ArithValue(_to_i64(head)) * _i64(D)
+        tok_off = arith.ArithValue(_to_i64(seq_start)) * _i64(RS) + head_off
+        out_off = (tok_off if RS == HD else
+                   arith.ArithValue(_to_i64(seq_start)) * _i64(HD) + head_off)
+        # Extent must stop at the LAST ADDRESSABLE ELEMENT, not at the start of
+        # the row after the sequence.  The largest offset any load here forms is
+        # (seq_len-1)*RS + D-1, so seq_len*RS over-reaches by RS-D elements --
+        # invisible while RS == H*D (the slack lands inside the same tensor) but
+        # a fault once RS is a uvqk row stride, because for the final sequence it
+        # runs past the end of the whole buffer.  Cost a memory access fault at
+        # batch 1024 while batch 64 passed on allocator slack.
+        # seq_len >= 1 here: emit_body runs only under the m0 < seq_len guard.
+        def _seq_bytes(eb):
+            return (arith.ArithValue(seq_len) - _i32(1)) * _i32(RS * eb) \
+                + _i32(D * eb)
+
+        # Rows past the end of this sequence read back as zero: a zero k/q row
+        # makes qk=0 -> silu(0)=0 -> p=0, contributing exactly nothing.
+        rQ = _shifted_rsrc(Q, tok_off, QK_BYTES,
+                           num_bytes=_seq_bytes(QK_BYTES))
+        rK = _shifted_rsrc(K, tok_off, QK_BYTES,
+                           num_bytes=_seq_bytes(QK_BYTES))
+        rV = _shifted_rsrc(V, tok_off, V_BYTES, num_bytes=_seq_bytes(V_BYTES))
+        rOUT = _shifted_rsrc(OUT, out_off, 2)
+
+        base = allocator.get_base()
+        if FP8_QK:
+            # Typed i32 so every offset is a dword index: the byte tile is only
+            # ever touched 8 or 16 bytes at a time, never element-wise.
+            k_lds = SmemPtr(base, off_k, T.i32, shape=(BN * K8_DW,)).get()
+        else:
+            k_lds = SmemPtr(base, off_k, T.bf16, shape=(BN * KSTRIDE,)).get()
+        v_lds = SmemPtr(base, off_v, T.bf16, shape=(VLDS_HW,)).get()
+        p_lds = SmemPtr(base, off_p, T.bf16, shape=((BM // 16) * 16 * PSTRIDE,)).get()
+
+        lane = tid % _i32(64)
+        wave = tid // _i32(64)
+        l16 = lane % _i32(16)
+        l4 = lane // _i32(16)
+        l16q = l16 // _i32(4)                   # tr16: sub-group row selector
+        l16r = (l16 % _i32(4)) * _i32(4)        # tr16: halfword offset s*4
+        # Dequantization.  q and k are e4m3 with ONE per-tensor scale, so every
+        # score carries qkv_scale**2 and it is applied once, in f32, on the way
+        # into the silu -- not folded into the MFMA's E8M0-only scale field and
+        # not applied per operand.  bf16 inputs pass qkv_scale = 1.0.
+        score_scale = (arith.ArithValue(qkv_scale) * qkv_scale * _f32(alpha)
+                       if FP8_QK else _f32(alpha))
+        # V's scale rides on the accumulator instead, in the epilogue.
+        out_scale = arith.ArithValue(qkv_scale) if fp8_v else None
+        if epi_fold:
+            # exp2's argument becomes the ONLY scaled form of the score, and
+            # the leftover -1/log2(e) joins inv_max on the epilogue.
+            score_scale = score_scale * _f32(-LOG2E)
+            fold = arith.ArithValue(inv_max) * _f32(-1.0 / LOG2E)
+            out_scale = fold if out_scale is None else out_scale * fold
+        V2F = T.vec(2, T.f32)
+        # Packed-f32 constants, built once per kernel: a <2xf32> splat of the
+        # (uniform) score scale and of 1.0.  LLVM keeps the splat in an SGPR
+        # pair, so v_pk_mul_f32 reads it as a scalar operand.
+        ss2 = (vector.from_elements(
+            V2F, [arith.unwrap(score_scale), arith.unwrap(score_scale)])
+            if epi_pk else None)
+        one2 = arith.constant_vector(1.0, V2F) if epi_pk else None
+        # This wave owns MT consecutive 16-row m-tiles: m_base + 16*mt.
+        m_base = m0 + wave * _i32(16 * MT)
+        p_wave = wave * _i32(MT * 16 * PSTRIDE)   # this wave's p_lds region base
+
+        def tr_read(lds, row_base, inner):
+            """One ds_read_b64_tr_b16 out of a tile in the tr16 layout
+            halfword(r, c) = ((c/16)*ROWS + r)*16 + c%16, with ROWS = BN.
+            `row_base` = (c/16)*BN selects the 16-wide c block.  Returns v4bf:
+            lane l = 16*l4 + l16 gets r = 4*l4 + 16*inner + e (e=0..3) at
+            c = 16*(row_base/BN) + l16 -- a transposed 4-wide slice.
+            """
+            if isinstance(row_base, int):
+                row_base = _i32(row_base)
+            off = (arith.ArithValue(row_base) + l4 * _i32(4) + _i32(16 * inner)
+                   + l16q) * _i32(16) + l16r
+            return rocdl_raw.ds_read_tr16_b64_(v4bf, _lds_gep(lds, off, T.bf16))
+
+        def tr_pair(lds, row_base, inner2):
+            """K=32 B fragment: two tr reads whose r values differ by 16.
+            The mfma only needs A and B to agree on which logical k each
+            (lane, elem) slot carries, not that k be contiguous -- so the two
+            v4bf halves are concatenated as they come out."""
+            return vector.shuffle(tr_read(lds, row_base, 2 * inner2),
+                                  tr_read(lds, row_base, 2 * inner2 + 1), CAT8)
+
+        def lds_scalar(lds, addr):
+            v = vector.load_op(v1bf, lds, [_idx(addr)])
+            return vector.extract(v, static_position=[0], dynamic_position=[])
+
+        def lds_store_scalar(lds, addr, val_bf):
+            v = vector.from_elements(v1bf, [val_bf])
+            vector.store(v, lds, [_idx(addr)], alignment=2)
+
+        # ---- Q fragments, A-operand of the score gemm, loop-invariant -------
+        # lane l -> q[m = m_base + 16*mt + l16][d = 32*ks + l4*8 + 0..7]
+        # MT sets of these are held live for the whole n loop; they are what the
+        # shared K fragment is issued against MT times per read.
+        qf = []
+        for mt in range_constexpr(MT):
+            row = arith.ArithValue(m_base + _i32(16 * mt) + l16)
+            if FP8_QK == "k32":
+                # Same slicing the bf16 op used, in bytes: 8 B at d = 8*l4+32*ks.
+                # Halves Q's live register footprint (2 VGPR/fragment, not 4).
+                qf.append([
+                    buffer_ops.buffer_load(
+                        rQ, (row * _i32(RS) + l4 * _i32(8)
+                             + _i32(32 * ks)) // _i32(4),
+                        vec_width=2, dtype=T.i32)
+                    for ks in range_constexpr(KSTEP)
+                ])
+            elif FP8_QK == "k128":
+                # K=128 wants lane l4 to hold d in [32*l4, 32*l4+32): one 32 B
+                # run, which is two dwordx4 (a 256-bit buffer load is not
+                # selectable on gfx950).  FOUR fragments collapse to one, and
+                # the whole d axis is covered by a single mfma.
+                b = (row * _i32(RS) + l4 * _i32(32)) // _i32(4)
+                qf.append([vector.shuffle(
+                    buffer_ops.buffer_load(rQ, b, vec_width=4, dtype=T.i32),
+                    buffer_ops.buffer_load(rQ, b + _i32(4), vec_width=4,
+                                           dtype=T.i32),
+                    [0, 1, 2, 3, 4, 5, 6, 7])])
+            else:
+                qf.append([
+                    buffer_ops.buffer_load(
+                        rQ, row * _i32(RS) + l4 * _i32(8) + _i32(32 * ks),
+                        vec_width=8, dtype=T.bf16)
+                    for ks in range_constexpr(KSTEP)
+                ])
+
+        # ---- cooperative K/V staging into LDS -------------------------------
+        # THREADS threads load BN*D bf16 as vec8: (BN*D/8)/THREADS vecs each.
+        # One pass covers ROWS_PER_PASS = THREADS/16 rows, so the row stride
+        # between passes is ROWS_PER_PASS, not a hardcoded 16 -- that only
+        # coincided while THREADS was 256.
+        KV_VECS = (BN * D) // (THREADS * 8)
+        st_col16 = tid % _i32(16)               # 0..15
+        st_row0 = tid // _i32(16)               # 0..ROWS_PER_PASS-1
+        st_dcol = st_col16 * _i32(8)            # 0,8,..,120
+        # V goes to LDS in the tr16 layout so the out-gemm reads it transposed
+        # with ds_read_tr16_b64.  A vec8 over 8 consecutive d stays inside one
+        # 16-wide d block, so it maps to 8 consecutive tr16 halfwords -> the
+        # staging store is still ONE vec8 (no store-side transpose).
+        v_blk = st_col16 // _i32(2)              # d/16 block for this vec8
+        v_in = (st_col16 % _i32(2)) * _i32(8)    # d%16 offset (0 or 8)
+
+        def stage_kv(n0):
+            for r in range_constexpr(KV_VECS):
+                n = st_row0 + _i32(ROWS_PER_PASS * r)   # local n in [0, BN)
+                g_off = (arith.ArithValue(n0) + n) * _i32(RS) + st_dcol
+                v_off = (v_blk * _i32(VROWS) + n) * _i32(16) + v_in
+                if FP8_QK:
+                    # Same 16-threads-per-row cooperative shape, 8 BYTES each
+                    # instead of 8 halfwords: identical instruction count, half
+                    # the global traffic and half the LDS written.
+                    kv = buffer_ops.buffer_load(rK, g_off // _i32(4),
+                                                vec_width=2, dtype=T.i32)
+                    l_off = arith.ArithValue(n) * _i32(K8_DW) + st_dcol // _i32(4)
+                    vector.store(kv, k_lds, [_idx(l_off)], alignment=8)
+                else:
+                    kv = buffer_ops.buffer_load(rK, g_off, vec_width=8,
+                                                dtype=T.bf16)
+                    l_off = n * _i32(KSTRIDE) + st_dcol
+                    vector.store(kv, k_lds, [_idx(l_off)], alignment=16)
+                if fp8_v:
+                    # V's LDS tile stays bf16 (the out gemm is still bf16), so
+                    # the e4m3 bytes are widened here, on the WRITE side, which
+                    # is touched once per element -- the read side is touched
+                    # BN/16 times more often.
+                    vv = widen8(buffer_ops.buffer_load(
+                        rV, g_off // _i32(4), vec_width=2, dtype=T.i32))
+                else:
+                    vv = buffer_ops.buffer_load(rV, g_off, vec_width=8,
+                                                dtype=T.bf16)
+                vector.store(vv, v_lds, [_idx(v_off)], alignment=16)
+
+        def one_iter(n0, acc, masked=True):
+            # Raise wave issue-priority for the whole MFMA-heavy compute region.
+            # Workgroups co-reside with INDEPENDENT barriers,
+            # so at any instant one wave is usually in this compute while its
+            # neighbour is in the memory-heavy K/V staging below.  s_setprio(1)
+            # here (paired with s_setprio(0) before the yield) lets the compute
+            # wave win the shared issue slot and keep the single MFMA pipe fed,
+            # instead of being interleaved with the neighbour's LDS/global
+            # traffic.  Purely an arbitration hint -- semantically a no-op, and
+            # a lever neither LLVM's SSA scheduler nor iglp_opt expresses.
+            rocdl.s_setprio(1)
+            # ---- score: qk.T[n][m] = (q @ k.T).T  (per wave, its 16 m x BN n) --
+            # OPERANDS SWAPPED vs the natural mfma2(qf, kf): kf and qf have
+            # IDENTICAL fragment structure (lane l -> 16-index=l16, k=l4*8+32ks),
+            # so putting kf in the A slot and qf in the B slot computes the same
+            # scores but with the accumulator TRANSPOSED: output row = n-space,
+            # col = m-space.  This is NOT the eliminate-the-round-trip transpose
+            # (gen 12, -20.51%, VGPR 78->88 from keeping p live): p is still
+            # round-tripped through LDS and freed, so the accumulator is still 4
+            # f32/lane and VGPR is unchanged.  The payoff is purely the p-STORE:
+            # a lane now holds 4 CONSECUTIVE n (l4*4+0..3) for one m=l16, so the
+            # 8 scalar ds_write_u16/iter collapse to 2 ds_write_b64/iter, while
+            # the a_p read below is byte-identical (p_lds is the same [m][n]
+            # row-major layout, just written transposed).
+            # K IS READ ONCE AND ISSUED MT TIMES. The K fragment depends only on
+            # (nt, ks), not on m, so hoisting the read above the mt loop is what
+            # makes MT>1 cheaper than the equivalent BM increase: the workgroup's
+            # K LDS reads scale with WAVES, while its MFMA work scales with BM.
+            qk = [[None] * NTILE for _ in range_constexpr(MT)]
+            for nt in range_constexpr(NTILE):
+                accs = [zero_acc for _ in range_constexpr(MT)]
+                if FP8_QK == "k128":
+                    # ONE contiguous 32 B run per lane, read as TWO b128 --
+                    # against FOUR b128 for the bf16 tile.  This is the k128
+                    # lesson: the read INSTRUCTION count halves and the bytes
+                    # quarter, on the read the ablation named dominant.
+                    kb = (_i32(16 * nt) + l16) * _i32(K8_DW) + l4 * _i32(8)
+                    kf = vector.shuffle(
+                        vector.load_op(v4i32, k_lds, [_idx(kb)]),
+                        vector.load_op(v4i32, k_lds,
+                                       [_idx(arith.ArithValue(kb) + _i32(4))]),
+                        [0, 1, 2, 3, 4, 5, 6, 7])
+                    for mt in range_constexpr(MT):
+                        accs[mt] = mfma_qk_k128(kf, qf[mt][0], accs[mt])
+                else:
+                    for ks in range_constexpr(KSTEP):
+                        if FP8_QK == "k32":
+                            koff = ((_i32(16 * nt) + l16) * _i32(K8_DW)
+                                    + l4 * _i32(2) + _i32(8 * ks))
+                            kf = vector.load_op(v2i32, k_lds, [_idx(koff)])
+                        else:
+                            koff = ((_i32(16 * nt) + l16) * _i32(KSTRIDE)
+                                    + l4 * _i32(8) + _i32(32 * ks))
+                            kf = vector.load_op(v8bf, k_lds, [_idx(koff)])
+                        for mt in range_constexpr(MT):
+                            accs[mt] = (mfma_qk_k32 if FP8_QK else mfma2)(
+                                kf, qf[mt][ks], accs[mt])
+                for mt in range_constexpr(MT):
+                    qk[mt][nt] = accs[mt]
+
+            # ---- silu + causal mask -> p, stored [m][n] into p_lds ----------
+            # transposed accumulator: lane l elem e -> n = 16*nt + l4*4 + e (4
+            # consecutive n), m = l16 (fixed).  Storing p[m=l16][n] into the
+            # [m][n] row-major p_lds puts the 4 e's at contiguous LDS offsets ->
+            # ONE ds_write_b64 per nt (2/iter).  The out-gemm a_p read (below)
+            # reads p_lds[m=l16][n = 32*t + l4*4 ..] unchanged.
+            for mt in range_constexpr(MT):
+                m_idx = m_base + _i32(16 * mt) + l16
+                p_tile = p_wave + _i32(mt * 16 * PSTRIDE)
+                for nt in range_constexpr(NTILE):
+                    silus = [None] * 4
+                    if epi_pk:
+                        # The accumulator already holds 4 CONSECUTIVE n per
+                        # lane, so pairs form for free: one v_pk_mul_f32 for
+                        # x = raw*score_scale, one v_pk_add_f32 for ex+1, one
+                        # v_pk_mul_f32 for x*sig, over two elements each.  Only
+                        # exp2/rcp stay scalar -- there is no packed
+                        # transcendental on gfx950.
+                        for e0 in range_constexpr(2):
+                            acc4 = qk[mt][nt]
+                            x2 = arith.mulf(
+                                vector.shuffle(acc4, acc4,
+                                               [2 * e0, 2 * e0 + 1]),
+                                ss2)
+                            exs = [
+                                rocdl.exp2(T.f32, arith.unwrap(vector.extract(
+                                    x2, static_position=[j],
+                                    dynamic_position=[])))
+                                for j in range_constexpr(2)
+                            ]
+                            d2 = arith.addf(
+                                vector.from_elements(V2F, exs), one2)
+                            sigs = [
+                                rocdl.rcp(T.f32, arith.unwrap(vector.extract(
+                                    d2, static_position=[j],
+                                    dynamic_position=[])))
+                                for j in range_constexpr(2)
+                            ]
+                            s2 = arith.mulf(
+                                x2, vector.from_elements(V2F, sigs))
+                            for j in range_constexpr(2):
+                                silus[2 * e0 + j] = arith.ArithValue(
+                                    vector.extract(s2, static_position=[j],
+                                                   dynamic_position=[]))
+                    for e in range_constexpr(4):
+                        if epi_pk:
+                            silu = silus[e]
+                        else:
+                            raw = arith.ArithValue(
+                                vector.extract(qk[mt][nt], static_position=[e],
+                                               dynamic_position=[]))
+                            x = raw * score_scale
+                            if epi_fold:
+                                # score_scale already carries -log2(e): x IS the
+                                # exp2 argument, and x*sig differs from the silu
+                                # only by the constant now living in out_scale.
+                                ex = rocdl.exp2(T.f32, arith.unwrap(x))
+                                sig = arith.ArithValue(rocdl.rcp(
+                                    T.f32,
+                                    arith.unwrap(arith.ArithValue(ex) + _f32(1.0))))
+                                silu = x * sig
+                            else:
+                                ex = rocdl.exp2(
+                                    T.f32, arith.unwrap(x * _f32(-LOG2E)))
+                                sig = arith.ArithValue(rocdl.rcp(
+                                    T.f32,
+                                    arith.unwrap(arith.ArithValue(ex) + _f32(1.0))))
+                                silu = arith.ArithValue(x * sig) * inv_max
+                        if masked:
+                            n_idx = (arith.ArithValue(n0) + _i32(16 * nt)
+                                     + l4 * _i32(4) + _i32(e))
+                            ok = arith.cmpi(arith.CmpIPredicate.sge, arith.unwrap(m_idx),
+                                            arith.unwrap(n_idx))
+                            silu = arith.ArithValue(arith.select(
+                                arith.unwrap(ok), arith.unwrap(silu),
+                                arith.unwrap(_f32(0.0))))
+                        poff = (p_tile + l16 * _i32(PSTRIDE) + _i32(16 * nt)
+                                + l4 * _i32(4) + _i32(e))
+                        lds_store_scalar(p_lds, poff, arith.trunc_f(T.bf16, silu))
+
+            # p_lds is per-(wave, m-tile) (p_wave + mt separates the regions),
+            # so the store->read exchange below is entirely INTRA-wave.  A
+            # cross-wave gpu.barrier() is not needed for it; the same-buffer LDS
+            # RAW is ordered by a compiler lgkmcnt wait.  v_lds (shared, read in
+            # the out gemm) was staged behind the barriers at the loop top and is
+            # not touched here, so dropping this barrier is safe.
+
+            # ---- out: out[m][d] += p @ v -----------------------------------
+            # V's B-fragment is read transposed straight out of the tr16 tile
+            # with ds_read_tr16_b64 (2 b64 tr reads per K=32 step), replacing the
+            # old 64 strided scalar loads/iter.  The tr layout hands each lane
+            # group g the n set {4g..4g+3, 4g+16..4g+19}, so p's A-fragment is
+            # read in that SAME k-labelling: two contiguous v4bf (n=4l4+e and
+            # n=4l4+16+e) concatenated, invariant across the D-tiles.
+            a_p = [[None] * NKSTEP for _ in range_constexpr(MT)]
+            for mt in range_constexpr(MT):
+                p_tile = p_wave + _i32(mt * 16 * PSTRIDE)
+                for t in range_constexpr(NKSTEP):
+                    base = p_tile + l16 * _i32(PSTRIDE) + _i32(32 * t) + l4 * _i32(4)
+                    lo = vector.load_op(v4bf, p_lds, [_idx(base)])
+                    hi = vector.load_op(v4bf, p_lds, [_idx(base + _i32(16))])
+                    a_p[mt][t] = vector.shuffle(lo, hi, CAT8)
+            # V IS READ ONCE AND ISSUED MT TIMES, for the same reason as K: the V
+            # fragment depends on (dd, t) only. With the two loops ordered
+            # (dd, t) outer and mt inner, the workgroup's V tr-reads scale with
+            # WAVES while the MFMA work scales with BM.
+            new_acc = [[acc[mt][dd] for dd in range_constexpr(NDSTEP)]
+                       for mt in range_constexpr(MT)]
+            for dd in range_constexpr(NDSTEP):
+                for t in range_constexpr(NKSTEP):
+                    b_v = tr_pair(v_lds, dd * VROWS, t)
+                    for mt in range_constexpr(MT):
+                        new_acc[mt][dd] = mfma2(a_p[mt][t], b_v, new_acc[mt][dd])
+            emit_sched()
+            # Drop priority so the next iteration's barrier + K/V staging (memory
+            # phase) runs at low priority, yielding issue to a neighbour wave
+            # that is in its own compute region.
+            rocdl.s_setprio(0)
+            return new_acc
+
+        # ---- n loop ---------------------------------------------------------
+        # out[m] sums n <= m, m up to m0+BM-1, so n in [0, min(m0+BM, seq_len)).
+        n_end = arith.ArithValue(
+            arith.select(
+                arith.cmpi(arith.CmpIPredicate.slt, arith.unwrap(m0 + _i32(BM)),
+                           arith.unwrap(seq_len)),
+                arith.unwrap(m0 + _i32(BM)), arith.unwrap(seq_len)))
+        n_iters = (n_end + _i32(BN - 1)) // _i32(BN)
+
+        step = arith.constant(1, index=True)
+        # The loop carries MT accumulator sets, flattened as mt-major.
+        NACC = MT * NDSTEP
+
+        def n_loop(lo, hi, init, masked):
+            lp = scf.ForOp(arith.unwrap(arith.index_cast(T.index, arith.unwrap(lo))),
+                           arith.unwrap(arith.index_cast(T.index, arith.unwrap(hi))),
+                           arith.unwrap(step), init)
+            with ir.InsertionPoint(lp.body):
+                it = arith.ArithValue(arith.index_cast(T.i32, lp.induction_variable))
+                n0 = it * _i32(BN)
+                flat = list(lp.inner_iter_args[:NACC])
+                acc = [flat[mt * NDSTEP:(mt + 1) * NDSTEP] for mt in range(MT)]
+                gpu.barrier()
+                stage_kv(n0)
+                gpu.barrier()
+                acc = one_iter(n0, acc, masked=masked)
+                scf.YieldOp([arith.unwrap(x) for row in acc for x in row])
+            return lp
+
+        init = [arith.unwrap(zero_acc) for _ in range(NACC)]
+        if mask_split:
+            # n0 + BN <= m0  <=>  it < m0/BN, and m0 is a multiple of BN, so the
+            # first m0/BN iterations are strictly below the diagonal: every
+            # (m, n) they touch has n <= m0-1 < m0 <= m.  The mask is dead there.
+            safe = arith.ArithValue(m0) // _i32(BN)
+            head = n_loop(_i32(0), safe, init, masked=False)
+            init = list(head.results[:NACC])
+            loop = n_loop(safe, n_iters, init, masked=True)
+        else:
+            loop = n_loop(_i32(0), n_iters, init, masked=True)
+
+        flat_res = list(loop.results[:NACC])
+        res = [flat_res[mt * NDSTEP:(mt + 1) * NDSTEP] for mt in range(MT)]
+
+        # ---- epilogue: store out[MT*16 m][128 d] for this wave --------------
+        # lane l elem e -> m = m_base + 16*mt + l4*4 + e, d = 16*dd + l16
+        for mt in range_constexpr(MT):
+            for dd in range_constexpr(NDSTEP):
+                d_idx = _i32(16 * dd) + l16
+                for e in range_constexpr(4):
+                    m_idx = m_base + _i32(16 * mt) + l4 * _i32(4) + _i32(e)
+                    ok = arith.cmpi(arith.CmpIPredicate.slt, arith.unwrap(m_idx),
+                                    arith.unwrap(seq_len))
+                    st_if = scf.IfOp(ok, results_=[], has_else=False)
+                    with ir.InsertionPoint(st_if.then_block):
+                        off = arith.ArithValue(m_idx) * _i32(HD) + d_idx
+                        val = vector.extract(res[mt][dd], static_position=[e],
+                                            dynamic_position=[])
+                        if out_scale is not None:
+                            val = arith.unwrap(
+                                arith.ArithValue(val) * out_scale)
+                        buffer_ops.buffer_store(arith.trunc_f(T.bf16, val), rOUT, off)
+                        scf.YieldOp([])
+
+    @flyc.kernel
+    def fwd_kernel(
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        OUT: fx.Tensor,
+        SEQ_OFF: fx.Tensor,
+        INV_MAX_ARG: fx.Float32,
+        QKV_SCALE_ARG: fx.Float32,
+        NBATCH: fx.Int32,
+    ):
+        def as_i32(v):
+            raw = arith.unwrap(v)
+            if not isinstance(raw.type, ir.IndexType):
+                return arith.ArithValue(raw)
+            return arith.ArithValue(arith.index_cast(T.i32, raw))
+
+        tid = as_i32(fx.thread_idx.x)
+        # XCD-pinned dispatch: grid.x = NXCD*heads carries (slot, head) with slot
+        # fastest, so the linear id's XCD selector (id % NXCD, since NXCD*heads is
+        # a multiple of NXCD) is exactly `slot`.  batch = slot + NXCD*blk_z, so
+        # every workgroup of one batch (all heads, all m-blocks) shares slot and
+        # thus one XCD's L2.  One sequence's K+V (~5.5MB for 4 heads) is fetched
+        # once and reused across its m-blocks, instead of being pulled into all 8
+        # L2s when the default order scatters m-blocks by m_blk % NXCD.
+        blk0 = as_i32(fx.block_idx.x)      # in [0, NXCD*heads)
+        m_blk = as_i32(fx.block_idx.y)     # m-tile, sizes the grid
+        blk_z = as_i32(fx.block_idx.z)     # in [0, cdiv(batch, NXCD))
+        slot = blk0 % _i32(NXCD)
+        head = blk0 // _i32(NXCD)
+        batch = slot + _i32(NXCD) * blk_z
+
+        r_off = buffer_ops.create_buffer_resource(SEQ_OFF, max_size=True)
+        seq_start = arith.ArithValue(
+            buffer_ops.buffer_load(r_off, batch, vec_width=1, dtype=T.i32))
+        seq_end = arith.ArithValue(
+            buffer_ops.buffer_load(r_off, batch + _i32(1), vec_width=1, dtype=T.i32))
+        seq_len = seq_end - seq_start
+        m0 = m_blk * _i32(BM)
+
+        guard = scf.IfOp(
+            arith.cmpi(arith.CmpIPredicate.slt, arith.unwrap(m0), arith.unwrap(seq_len)),
+            results_=[], has_else=False,
+        )
+        with ir.InsertionPoint(guard.then_block):
+            emit_body(Q, K, V, OUT,
+                      arith.ArithValue(arith.unwrap(INV_MAX_ARG)),
+                      arith.ArithValue(arith.unwrap(QKV_SCALE_ARG)),
+                      tid, m0, head, seq_start, seq_len)
+            scf.YieldOp([])
+
+    @flyc.jit
+    def launch(
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        OUT: fx.Tensor,
+        SEQ_OFF: fx.Tensor,
+        batch: fx.Int32,
+        m_blocks: fx.Int32,
+        inv_max: fx.Float32,
+        qkv_scale: fx.Float32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+        # XCD-pinned dispatch (see emit_body): grid.x = NXCD*heads packs
+        # (slot, head), grid.z rounds batch up to a multiple of NXCD.  Padded
+        # slots (batch >= NBATCH) read seq_off as 0 via the max_size resource,
+        # yield seq_len 0, and are dropped by the m0<seq_len guard.
+        fwd_kernel(Q, K, V, OUT, SEQ_OFF, inv_max, qkv_scale, batch).launch(
+            grid=(NXCD * heads, m_blocks, (batch + NXCD - 1) // NXCD),
+            block=(THREADS, 1, 1), stream=stream,
+        )
+
+    def call(*args, **kw):
+        # qkv_scale is optional at the call site: bf16 callers (production's
+        # hstu_flydsl_mha) pass 8 positional args and mean 1.0.
+        if len(args) == 8 and "qkv_scale" not in kw:
+            args = args + (1.0,)
+        if "stream" not in kw and len(args) < 10 and current_stream_launch():
+            # Launch on the caller's current PyTorch stream, not launch()'s
+            # default null stream, which does not order against non-blocking
+            # side streams.  Same handle on the default stream; an explicit
+            # stream, keyword or 10th positional, still wins.  With
+            # $DLRM_HSTU_FP8_FLYDSL_CURRENT_STREAM=0 no stream is passed: the
+            # exact pre-5ae3127 launch arguments.
+            import torch
+
+            q = args[0] if args else kw["Q"]
+            kw["stream"] = fx.Stream(torch.cuda.current_stream(q.device))
+        args = tuple(fx.Float32(a) if isinstance(a, float) else a for a in args)
+        if isinstance(kw.get("inv_max"), float):
+            kw["inv_max"] = fx.Float32(kw["inv_max"])
+        return launch(*args, **kw)
+
+    call.BM = BM
+    call.BN = BN
+    call.launch = launch
+    return call

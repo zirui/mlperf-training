@@ -1,0 +1,21 @@
+# Upstream 6.1.0-rc2 includes training_6.1.0 rules; no final 6.1.0 tag exists yet.
+git+https://github.com/mlcommons/logging.git@8a0cc0558ab498b3b003b106d7eae0de19801876
+absl-py==2.4.0
+datasets==3.6.0
+gin-config==0.5.0
+huggingface_hub==0.36.2
+iopath==0.1.10
+lightning-utilities==0.15.3
+numba==0.68.0
+pandas==2.3.3
+polars-u64-idx==1.33.1
+psutil==7.2.2
+pyarrow==21.0.0
+pyre-extensions==0.0.32
+PyYAML==6.0.3
+tensorboard==2.20.0
+tensordict==0.12.3
+torchmetrics==1.0.3
+tqdm==4.67.3
+typing-inspect==0.9.0
+xxhash==3.7.0
