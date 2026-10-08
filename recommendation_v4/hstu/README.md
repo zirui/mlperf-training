@@ -4,7 +4,7 @@ Recommendation - DLRMv4 (HSTU ranking model on the Yambda-5b dataset).
 
 # 1. Setup Docker Image
 
-Build the submission image from `dlrmv4/hstu`:
+Build the submission image from `recommendation_v4/hstu`:
 
 ```bash
 docker build --network=host -t rocm/amd-mlperf:dlrmv4_training_6.1 -f Dockerfile .
@@ -34,7 +34,7 @@ After the download is complete, you should see the following under the data dire
 - Item popularity: `processed_5b/item_popularity.npy`
 - Item mappings: `shared_metadata/album_item_mapping.parquet` and `shared_metadata/artist_item_mapping.parquet`
 
-The data directory is ~227 GB. To verify every file against the published checksums, run from `dlrmv4/hstu`:
+The data directory is ~227 GB. To verify every file against the published checksums, run from `recommendation_v4/hstu`:
 
 ```bash
 DLRM_DATA_PATH=/data/mlperf_dlrmv4/data bash scripts/verify_dataset.sh
