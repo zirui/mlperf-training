@@ -1,0 +1,36 @@
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+index 51c8b51..02b88d5 100644
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -1290,12 +1290,25 @@ class RouterGatingLinearFunction(torch.autograd.Function):
+         grad_output = grad_output.view(-1, grad_shape[-1])
+ 
+         if te_general_gemm is not None and ctx.router_dtype != torch.float64:
+-            grad_input = te_general_gemm(
+-                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
+-            )
+-            grad_weight = te_general_gemm(
+-                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
+-            )
++            if (
++                ctx.router_dtype == torch.float32
++                and ctx.input_dtype == torch.bfloat16
++                and ctx.weight_dtype == torch.bfloat16
++            ):
++                grad_output_bf16 = grad_output.to(torch.bfloat16)
++                grad_input = te_general_gemm(
++                    weight, grad_output_bf16, ctx.input_dtype, layout="NN", grad=True
++                )
++                grad_weight = te_general_gemm(
++                    inp, grad_output_bf16, ctx.router_dtype, layout="NT", grad=True
++                )
++            else:
++                grad_input = te_general_gemm(
++                    weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
++                )
++                grad_weight = te_general_gemm(
++                    inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
++                )
+             grad_input = grad_input[0].to(ctx.input_dtype)
+             grad_weight = grad_weight[0].to(ctx.weight_dtype)
+         else:

@@ -14,7 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -euxo pipefail
+set -euo pipefail
+if [[ "${MLPERF_VERBOSE_LOGS:-0}" == 1 ]]; then
+    set -x
+fi
 
 # Change directory to the primus directory
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
@@ -32,8 +35,7 @@ cd "$SCRIPT_DIR"
 : "${DATESTAMP:=$(date +'%y%m%d%H%M%S%N')}"
 : "${CLEAR_CACHES:=1}"
 : "${CHECK_COMPLIANCE:=1}"
-: "${MLPERF_RULESET:=6.0.0}"
-: "${UTILITIES:="$(pwd)/../../utilities"}"
+: "${MLPERF_RULESET:=6.1.0}"
 
 : "${CONT_NAME:=mlperf_small_llm_moe_pretraining}"
 : "${NGPU:=1}"
@@ -65,8 +67,16 @@ _config_env+=(GEMM_OFFLINE_TUNING)
 _config_env+=(GEMM_USE_TUNING_RESULTS)
 _config_env+=(HF_TOKEN)
 _config_env+=(SEED)
+_config_env+=(HIPBLASLT_LOG_MASK)
+_config_env+=(HIPBLASLT_LOG_FILE)
+_config_env+=(NVTE_FP4_LOG_GEMM_SHAPES)
+_config_env+=(HIPBLASLT_TUNING_OVERRIDE_FILE)
+_config_env+=(TE_HIPBLASLT_ALGO_LOAD)
+_config_env+=(TE_HIPBLASLT_ALGO_SAVE)
 
-echo "${_config_env[@]}"
+if [[ "${MLPERF_VERBOSE_LOGS:-0}" == 1 ]]; then
+    echo "${_config_env[@]}"
+fi
 mapfile -t _config_env < <(for v in "${_config_env[@]}"; do echo "--env=$v"; done)
 _base_config_env=("${_config_env[@]}")
 
@@ -79,16 +89,25 @@ cleanup_docker() {
     fi
 }
 cleanup_docker
-trap 'set -eux; cleanup_docker' EXIT
+trap cleanup_docker EXIT
+
+# GPU devices expose ROCm; IPC_LOCK supports pinned RDMA buffers.
+# seccomp=unconfined preserves ROCm HPC memory/NUMA mapping.
+_debug_caps=()
+if [[ "${MLPERF_DOCKER_DEBUG:-0}" == 1 ]]; then
+    _debug_caps+=(--cap-add=SYS_PTRACE)
+fi
 
 # Setup container (AMD/ROCm)
 docker run --rm --init --detach \
+    --privileged \
     --net=host --uts=host --ipc=host \
     --device /dev/dri --device /dev/kfd --device=/dev/infiniband \
-    --cap-add=SYS_PTRACE --cap-add=CAP_SYS_ADMIN \
+    --cap-add=IPC_LOCK "${_debug_caps[@]}" \
     --security-opt=seccomp=unconfined \
     --group-add video \
-    --privileged \
+    --ulimit memlock=-1:-1 \
+    --ulimit nofile=1048576:1048576 \
     --name="${_cont_name}" "${_cont_mounts[@]}" \
     -e IMAGE_NAME="${CONT}" \
     "${CONT}" sleep infinity
@@ -109,7 +128,6 @@ for _experiment_index in $(seq 1 "${NEXP}"); do
     fi
     # Use existing SEED if set; otherwise use a new RANDOM value
     _run_config_env=("${_base_config_env[@]}" --env=SEED="${SEED:-$RANDOM}")
-    echo "launching experiment using: ${_run_config_env[*]} ${_cont_name} /workspace/code/run_and_time.sh"
     docker exec "${_run_config_env[@]}" "${_cont_name}" bash /workspace/code/run_and_time.sh
   ) | grep --line-buffered -v "connected peer ranks" | tee "${_logfile_base}_${_experiment_index}.log"
 
