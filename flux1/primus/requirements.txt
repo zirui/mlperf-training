@@ -1,0 +1,6 @@
+# Direct deps of the submission glue. Versions are left to the base image, which
+# already satisfies all of them -- notably megatron-energon 7.3.2, the pin Primus
+# itself carries at PRIMUS_REF.
+huggingface_hub>=0.24
+multi-storage-client
+rich
