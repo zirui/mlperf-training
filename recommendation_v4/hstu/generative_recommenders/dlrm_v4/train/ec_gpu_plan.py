@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """GPU planning for EC segmented reduction.
 
 Hot-piece counts and their prefix sums stay on the caller's current stream.

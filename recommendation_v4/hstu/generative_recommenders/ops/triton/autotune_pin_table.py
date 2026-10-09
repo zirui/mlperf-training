@@ -1,29 +1,17 @@
-"""Robust per-key Triton autotune pins (``DLRM_HSTU_FP8_AUTOTUNE_PINS``).
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Per-key Triton autotune pins (``DLRM_HSTU_FP8_AUTOTUNE_PINS``).
 
-Default ON through the gin binding ``apply_env_bootstrap.DLRM_HSTU_FP8_AUTOTUNE_PINS =
-True`` (yambda_5b.gin, ship-4 item (10)); absent from the environment = off. Opt out per
-run with ``DLRM_HSTU_FP8_AUTOTUNE_PINS=0``. Ported from the Arbor testbed (commit
-14006f6, iteration 20) onto b97d9d9; the kernel modules and their autotune config
-lists are identical between the two trees.
+Default on through ``apply_env_bootstrap.DLRM_HSTU_FP8_AUTOTUNE_PINS``.
+Unset in the environment means off. ``DLRM_HSTU_FP8_AUTOTUNE_PINS=0`` opts out.
 
-Why: every cold start benchmarks ~21 multi-config autotune keys inside the MLPerf timed
-region (~31 s/run, iter-18 ``startup-attribution``), ranks pick different winners on
-near-ties (coin flips, ~0.10 ms/rank-step), and the winner chosen on the early-window
-shape is kept for the whole run although the keys do not contain the token count M
-(early winners at late shapes cost ~0.51 ms/rank-step, iter-19 ``autotune-pin-table``).
+Seeds each Autotuner cache entry from ``PIN_TABLE``. A seeded key skips
+benchmarking. A key that is not in the table is autotuned as usual. Every
+pinned config is already in that kernel's own autotune list.
+``TRITON_FULL_AUTOTUNE=1`` disables the pins.
 
-What: seed each Autotuner's in-memory ``cache[key]`` with the config that minimises the
-WORST normalised autotune time across four shape regimes (START_TS 0 twice, 150, 280;
-8 ranks x 2 hosts). Source: eval/eval_autotune_regret.py over probes/iter19/attime_{a,b};
-table proposals/autotune_pin_table_iter19.md. A seeded key skips benchmarking; any key not
-in the table (new shape/dtype) is autotuned exactly as before. Only configs that are
-already in the kernel's own autotune list are used, so every pinned launch is one the
-autotuner could have chosen itself. ``TRITON_FULL_AUTOTUNE=1`` disables the pins.
-
-Numerics: BLOCK_N / num_warps change rows per program. Per-row LayerNorm statistics are
-unchanged, but the dw/db partial-sum reduction order of ``*_bwd*`` kernels can differ
-from whatever winner a rank would have picked (which already varies run to run).
-Declared as a reduction-order change.
+``BLOCK_N`` and ``num_warps`` change how many rows a program owns. Per-row
+LayerNorm statistics are unchanged. The dw/db partial-sum order of the
+backward kernels can differ across configs.
 """
 
 import ast
@@ -41,27 +29,27 @@ _PKG = "generative_recommenders.ops.triton."
 
 # (module, kernel, str(autotune key), robust config)
 PIN_TABLE: List[Tuple[str, str, str, Dict[str, int]]] = [
-    ('triton_hstu_linear', '_ln_mul_dropout_bwd_dwdb', "(512, 'torch.float32', 'torch.float32', 'torch.bfloat16', 'torch.bfloat16')", {'BLOCK_N': 128, 'num_warps': 8, 'num_stages': 3}),  # worst regret 0.00%
-    ('triton_hstu_linear', '_ln_mul_dropout_fwd_rng', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.int8')", {'BLOCK_N': 1, 'num_warps': 1, 'num_stages': 3}),  # worst regret 0.00%
-    ('triton_hstu_linear', '_ln_mul_dropout_fwd_rng', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.float8_e4m3fn', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.int8')", {'BLOCK_N': 4, 'num_warps': 1, 'num_stages': 3}),  # worst regret 0.54%
-    ('triton_jagged_tensors', 'concat_2D_jagged_multirow', "(1, 'torch.int64', 'torch.int64', 'torch.int64', 'torch.int64')", {'BLOCK_N': 8, 'num_warps': 1, 'num_stages': 3}),  # worst regret 0.00%
-    ('triton_jagged_tensors', 'concat_2D_jagged_multirow', "(1, 'torch.int64', 'torch.int64', 'torch.int64', 'torch.int64', 'torch.int64')", {'BLOCK_N': 8, 'num_warps': 1, 'num_stages': 3}),  # worst regret 0.00%
-    ('triton_jagged_tensors', 'concat_2D_jagged_multirow', "(32, 'torch.float32', 'torch.float32', 'torch.int64', 'torch.int64', 'torch.float32')", {'BLOCK_N': 8, 'num_warps': 1, 'num_stages': 3}),  # worst regret 0.00%
-    ('triton_jagged_tensors', 'concat_2D_jagged_multirow', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.int64', 'torch.bfloat16')", {'BLOCK_N': 2, 'num_warps': 1, 'num_stages': 3}),  # worst regret 1.42%
-    ('triton_jagged_tensors', 'split_2D_jagged_multirow', "(32, 'torch.float32', 'torch.int64', 'torch.int64', 'torch.float32', 'torch.float32')", {'BLOCK_N': 8, 'num_warps': 1, 'num_stages': 3}),  # worst regret 0.00%
-    ('triton_jagged_tensors', 'split_2D_jagged_multirow', "(512, 'torch.bfloat16', 'torch.int64', 'torch.bfloat16', 'torch.bfloat16')", {'BLOCK_N': 4, 'num_warps': 4, 'num_stages': 3}),  # worst regret 3.25%
-    ('triton_layer_norm', '_weighted_layer_norm_bwd_dx', "(256, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32')", {'BLOCK_N': 1, 'num_warps': 1, 'num_stages': 3}),  # worst regret 0.00%
-    ('triton_layer_norm', '_weighted_layer_norm_bwd_dx', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32')", {'BLOCK_N': 1, 'num_warps': 1, 'num_stages': 3}),  # worst regret 1.15%
-    ('triton_layer_norm', '_weighted_layer_norm_bwd_dx', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32')", {'BLOCK_N': 1, 'num_warps': 1, 'num_stages': 3}),  # worst regret 2.84%
-    ('triton_layer_norm', '_weighted_layer_norm_bwd_dx', "(512, 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32')", {'BLOCK_N': 1, 'num_warps': 1, 'num_stages': 3}),  # worst regret 0.00%
-    ('triton_layer_norm', '_weighted_layer_norm_fwd', "(256, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32')", {'BLOCK_N': 8, 'num_warps': 4, 'num_stages': 3}),  # worst regret 1.45%
-    ('triton_layer_norm', '_weighted_layer_norm_fwd', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32')", {'BLOCK_N': 4, 'num_warps': 1, 'num_stages': 3}),  # worst regret 1.72%
-    ('triton_layer_norm', '_weighted_layer_norm_fwd', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32')", {'BLOCK_N': 8, 'num_warps': 1, 'num_stages': 3}),  # worst regret 1.86%
-    ('triton_layer_norm', '_weighted_layer_norm_fwd', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.bfloat16')", {'BLOCK_N': 4, 'num_warps': 1, 'num_stages': 3}),  # worst regret 1.14%
-    ('triton_layer_norm', '_weighted_layer_norm_fwd', "(512, 'torch.bfloat16', 'torch.float8_e4m3fn', 'torch.float8_e4m3fn', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32')", {'BLOCK_N': 8, 'num_warps': 1, 'num_stages': 3}),  # worst regret 0.00%
-    ('triton_layer_norm', '_weighted_layer_norm_fwd', "(512, 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32')", {'BLOCK_N': 1, 'num_warps': 1, 'num_stages': 3}),  # worst regret 0.00%
-    ('triton_position', '_add_embeddings_bwd_kernel', "(4096, 1024, 512, 'torch.bfloat16', 'torch.int32', 'torch.int64', 'torch.float32')", {'BLOCK': 64, 'num_warps': 2, 'num_stages': 3}),  # worst regret 0.00%
-    ('triton_position', '_add_timestamp_position_embeddings_kernel', "(4096, 'torch.bfloat16', 'torch.int64', 'torch.int64', 'torch.float32', 'torch.float32', 'torch.bfloat16', 'torch.int64', 'torch.int32', 'torch.int32', 'torch.int64')", {'BLOCK_N': 64, 'num_warps': 8, 'num_stages': 2}),  # worst regret 2.25%
+    ('triton_hstu_linear', '_ln_mul_dropout_bwd_dwdb', "(512, 'torch.float32', 'torch.float32', 'torch.bfloat16', 'torch.bfloat16')", {'BLOCK_N': 128, 'num_warps': 8, 'num_stages': 3}),
+    ('triton_hstu_linear', '_ln_mul_dropout_fwd_rng', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.int8')", {'BLOCK_N': 1, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_hstu_linear', '_ln_mul_dropout_fwd_rng', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.float8_e4m3fn', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.int8')", {'BLOCK_N': 4, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_jagged_tensors', 'concat_2D_jagged_multirow', "(1, 'torch.int64', 'torch.int64', 'torch.int64', 'torch.int64')", {'BLOCK_N': 8, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_jagged_tensors', 'concat_2D_jagged_multirow', "(1, 'torch.int64', 'torch.int64', 'torch.int64', 'torch.int64', 'torch.int64')", {'BLOCK_N': 8, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_jagged_tensors', 'concat_2D_jagged_multirow', "(32, 'torch.float32', 'torch.float32', 'torch.int64', 'torch.int64', 'torch.float32')", {'BLOCK_N': 8, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_jagged_tensors', 'concat_2D_jagged_multirow', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.int64', 'torch.bfloat16')", {'BLOCK_N': 2, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_jagged_tensors', 'split_2D_jagged_multirow', "(32, 'torch.float32', 'torch.int64', 'torch.int64', 'torch.float32', 'torch.float32')", {'BLOCK_N': 8, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_jagged_tensors', 'split_2D_jagged_multirow', "(512, 'torch.bfloat16', 'torch.int64', 'torch.bfloat16', 'torch.bfloat16')", {'BLOCK_N': 4, 'num_warps': 4, 'num_stages': 3}),
+    ('triton_layer_norm', '_weighted_layer_norm_bwd_dx', "(256, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32')", {'BLOCK_N': 1, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_layer_norm', '_weighted_layer_norm_bwd_dx', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32')", {'BLOCK_N': 1, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_layer_norm', '_weighted_layer_norm_bwd_dx', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32')", {'BLOCK_N': 1, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_layer_norm', '_weighted_layer_norm_bwd_dx', "(512, 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32')", {'BLOCK_N': 1, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_layer_norm', '_weighted_layer_norm_fwd', "(256, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32')", {'BLOCK_N': 8, 'num_warps': 4, 'num_stages': 3}),
+    ('triton_layer_norm', '_weighted_layer_norm_fwd', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32')", {'BLOCK_N': 4, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_layer_norm', '_weighted_layer_norm_fwd', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32')", {'BLOCK_N': 8, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_layer_norm', '_weighted_layer_norm_fwd', "(512, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.bfloat16')", {'BLOCK_N': 4, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_layer_norm', '_weighted_layer_norm_fwd', "(512, 'torch.bfloat16', 'torch.float8_e4m3fn', 'torch.float8_e4m3fn', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.float32')", {'BLOCK_N': 8, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_layer_norm', '_weighted_layer_norm_fwd', "(512, 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.float32')", {'BLOCK_N': 1, 'num_warps': 1, 'num_stages': 3}),
+    ('triton_position', '_add_embeddings_bwd_kernel', "(4096, 1024, 512, 'torch.bfloat16', 'torch.int32', 'torch.int64', 'torch.float32')", {'BLOCK': 64, 'num_warps': 2, 'num_stages': 3}),
+    ('triton_position', '_add_timestamp_position_embeddings_kernel', "(4096, 'torch.bfloat16', 'torch.int64', 'torch.int64', 'torch.float32', 'torch.float32', 'torch.bfloat16', 'torch.int64', 'torch.int32', 'torch.int32', 'torch.int64')", {'BLOCK_N': 64, 'num_warps': 8, 'num_stages': 2}),
 ]
 
 

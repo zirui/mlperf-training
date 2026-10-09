@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """GPU offsets for the existing EC caller's already-valid integer row IDs.
 
 The caller must establish 0 <= ID < num_rows (the EC forward gather does).

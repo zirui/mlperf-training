@@ -8,113 +8,8 @@
 
 """Weight-gradient GEMM ``dW = X^T @ dY`` for a token-sized reduction.
 
-WHY IT WAS WRITTEN, AND WHY IT IS NOT WIRED IN
-----------------------------------------------
-Every linear in the HSTU stack computes its weight gradient as ``X^T @ dY``, where X is
-``[tokens, in_features]`` and dY is ``[tokens, out_features]``. Because the sequences are
-jagged and flattened, ``tokens`` is ~2 million per rank per step while the output is only
-weight-sized (256x512 up to 512x2048). That is a reduction, not a square GEMM: it streams
-two huge operands into a tiny accumulator, so what matters is HBM traffic and how the
-reduction over K is split. Vendor GEMM libraries tune for square-ish problems and treat
-this corner as an afterthought.
-
-The pinned torch 2.12 stack prices it badly. Profiling the yambda_5b run (step 52, 8
-ranks) against the off-reference torch 2.10 stack, at identical shapes and identical
-launch counts:
-
-    role                   2.10    2.12   delta
-    mm dW (K reduction)   24.35   35.37  +11.00 ms/rank/step
-    addmm forward         56.25   52.12   -4.13   (2.12 is faster here)
-
-dW is the only kernel family where 2.12 loses, and it loses more than the 4.23 ms the
-whole step is behind by -- so fixing part of it is enough to put the pinned stack ahead of
-the off-reference one. The dW GEMMs are 99% exclusive on the critical path (measured with
-KernelForge's step-time-attribution trace analyzers), so the win transfers to step time
-almost 1:1.
-
-Both stacks select the *same* Tensile macro-tile (MT256x256x64_MI16x16x1) and differ only
-in the generated kernel behind that name, so this is one library version emitting worse
-code for the shape class. There is no configuration-level escape:
-``TORCH_BLAS_PREFER_HIPBLASLT=1`` is a no-op because hipBLASLt is already the default on
-both builds, and ``PYTORCH_TUNABLEOP_ENABLED`` cannot amortise because K is the token count
-and changes every step. Pointing 2.12 at the 2.10 wheel's Tensile library was considered
-and rejected: it risks a silent format/ABI mismatch between hipBLASLt versions, which is
-the class of environment drift the provisioning marker exists to prevent.
-
-WHAT ACTUALLY WON
------------------
-Two replacements were written and measured against each other on MI350X at K=1,982,017,
-bf16, interleaved A/B over 5 rounds (interleaving matters: measured back-to-back, ATen's
-own time for one shape moved by up to 40% run to run):
-
-    dW shape            2.12 aten   chunked bmm   split-K triton   2.10 aten
-    [512,K]x[K,2048]         5.50          4.30             9.25        3.99
-    [1536,K]x[K,512]         5.06          3.38             7.21        3.14
-    [512,K]x[K,1024]         3.58          1.80             5.45        2.05
-    [256,K]x[K,1024]         1.81          1.32             2.92        1.27
-    [256,K]x[K,512]          0.95          0.82             1.72        0.59
-    [512,K]x[K,256]          0.78          0.80             1.75        0.60
-
-The hand-written split-K Triton kernel below is correct and numerically indistinguishable
-from ATen, but it is 1.7-2.2x *slower*, and the autotuner lands on essentially the tiling
-rocBLAS already uses (BLOCK 128x256, BLOCK_K 64, SPLIT_K 16-32 against
-MT256x256x64 + GSU16). Losing at the same tiling is a codegen and pipelining gap that
-Triton is not going to close here, so it is kept only as a measured dead end.
-
-What wins is a reformulation, ``chunked_bmm``: keep using the vendor GEMM but stop handing
-it the shape it mishandles. Reshaping the reduction into a batch of medium-K GEMMs and
-reducing the partials in fp32 is 1.17-1.99x faster than 2.12's single big-K call on every
-shape with N >= 512.
-
-Numerically all three paths are equivalent: against an fp64 reference they land at the
-same relative error (3.2e-3), which is the bf16 quantum of the output rather than anything
-to do with accumulation order. The two-level sum is better conditioned in principle -- it
-measured slightly lower error on an fp64 comparison -- but the difference is below the
-output's representable precision, so it should not be claimed as an improvement.
-
-It does not beat 2.10 on every shape -- 2.10's own big-K kernel is good, and chunking is a
-pessimisation there (0.75-0.93x), which is itself confirmation that the regression is
-specific to 2.12's big-K path.
-
-AND YET IT LOSES END TO END
----------------------------
-Measured, 200 steps, one node, 8 ranks, steady state from step 60 on:
-
-    fwd4      2.10 stack                        355.00 ms/step
-    refstack  2.12, before the scatter fix      391.43
-    gathersel 2.12 + gather-select              359.23
-    dwbmm     2.12 + gather-select + bmm dW     370.71   <-- 3.2% WORSE
-
-So ``bmm`` is refuted as an end-to-end win despite being 1.28-1.99x faster on the GEMM in
-isolation. Both replacements here are dead ends, so the call sites in ``triton_addmm.py``
-and ``triton_hstu_linear.py`` went back to plain ``torch.mm``: nothing in training reaches
-this module, and ``HSTU_DW_GEMM`` no longer has anything to switch. It is kept for the
-measurement and the two lessons below, reachable by calling ``dw_gemm`` directly (the
-original ``dw_gemm_bench.py`` harness is in git history at ``33610d2``).
-
-The trace says where it went (ms/rank/step, gathersel -> dwbmm). The dispatch worked as
-intended: dW through ``aten::mm`` fell 177.7 -> 30.9 on rank 0 as the three big shapes
-moved to ``aten::bmm``, and total Cijk GEMM time landed at 524.2 against the 2.10 stack's
-524.0 -- GEMM parity, exactly the goal. But:
-
-    GEMM (Cijk)     115.16 -> 109.64    -5.52
-    collectives      34.79 ->  45.70   +10.91
-    GPU idle          4.56 ->   7.56    +3.00  (1.3% -> 2.2% of the step)
-    busy union      339.18 -> 338.73    -0.45
-
-Two lessons worth carrying. The GEMM saving realised in situ (-5.52) was well under the
-~9.4 projected from isolated timings, because the microbenchmark measured a tight loop over
-pre-allocated tensors and not the extra workspace, the extra launches (view, transpose,
-bmm, sum, tail mm in place of one mm) or their host-side cost -- which is what the +3.00 ms
-of new GPU idle is.
-
-More importantly, the critical-path argument that justified this work was too strong. The
-counterfactual "if these kernels vanished the busy union shrinks by 34.96 ms, ratio 0.99"
-is a true statement about the union and still a bad predictor of step time, because the
-collectives on this path are *wait*-bound: their kernels sit spinning for the slowest rank,
-so time freed elsewhere is absorbed by them rather than returned to the step. Union
-exclusivity is necessary for a win but not sufficient, and nothing short of an end-to-end
-run distinguishes the two.
+Training does not call this module. ``HSTU_DW_GEMM`` selects ``aten`` (the
+default), ``bmm``, or ``triton`` for a direct call.
 """
 
 import os
@@ -134,14 +29,11 @@ from generative_recommenders.common import backend_allow_tf32, triton_autotune
 # tiles alone already fill the machine and the vendor kernel is fine.
 MIN_REDUCTION: int = 65536
 
-# chunked_bmm loses to ATen on narrow outputs ([512,K]x[K,256] and the 24-wide action MLP)
-# because the batched GEMM's per-chunk output becomes too small to amortise its own
-# launch. Every measured shape with N >= 512 wins.
+# chunked_bmm is not used for narrow outputs: the batched GEMM's per-chunk
+# output is too small to amortise its launch.
 MIN_BMM_N: int = 512
 
-# Enough chunks to expose parallelism without shrinking each GEMM's own K too far. Swept
-# over {4, 8, 16, 32, 64}: 16 is at or near the best on every shape, and accuracy improves
-# monotonically with chunk count so there is no accuracy reason to go lower.
+# Enough chunks to expose parallelism without shrinking each GEMM's own K too far.
 BMM_CHUNKS: int = 16
 
 

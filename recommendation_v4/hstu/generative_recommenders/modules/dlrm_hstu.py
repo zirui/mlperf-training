@@ -257,8 +257,7 @@ class DlrmHSTU(HammerModule):
             # At this model's shape (69k unique rows, 512 dim, 7.1M tokens) the
             # backward is 45.8 ms vs 12.9 ms on torch 2.12. Both accumulate with
             # atomics in nondeterministic order and score identically against a
-            # float64 reference, so this is a pure kernel-selection change. See
-            # torch_212_index_scatter_regression.md (git history at 33610d2).
+            # float64 reference, so this is a pure kernel-selection change.
             ec_kwargs = {}
             if use_gather_select:
                 if "use_gather_select" not in inspect.signature(
@@ -392,24 +391,11 @@ class DlrmHSTU(HammerModule):
             return_full_embeddings=False,
             listwise=False,
         )
-        # HammerModule._training_dtype defaults to fp32 and nothing ever set it,
-        # so the transducer's entry cast upcast the bf16 embedding _user_forward
-        # hands it straight back to fp32 -- and the autocast right below then
-        # cast it to bf16 again. That round trip is four full-size
-        # [tokens, 512] copies per step (two forward, two in the backward),
-        # 4.90 ms/step/rank by trace attribution, and it is the identity:
-        # bf16 -> fp32 is exact and fp32 -> bf16 of an already-bf16 value is
-        # exact, so dropping it is bit-for-bit equal.
-        #
-        # Scoped to the transducer on purpose. _multitask_module also gates an
-        # autocast on _training_dtype, but it runs OUTSIDE the _user_forward
-        # autocast, so flipping it there would be a real behaviour change; it
-        # is not under this subtree and stays fp32.
-        #
-        # Gated separately from bf16_training so it can be rolled back on its
-        # own: `make_model.transducer_bf16_dtype = False` in the gin restores
-        # the fp32 round trip without giving up bf16 training. Default False
-        # here and True in the gin, the same way use_gather_select is carried.
+        # Keep the transducer in bf16 when training is bf16. Its default dtype
+        # is fp32, which casts the bf16 embedding up and the surrounding
+        # autocast casts it back. Scoped to the transducer: the multitask
+        # module runs outside that autocast. `transducer_bf16_dtype` is
+        # separate from `bf16_training`.
         if (not self._is_inference) and bf16_training and transducer_bf16_dtype:
             self._hstu_transducer.set_training_dtype(torch.bfloat16)
 

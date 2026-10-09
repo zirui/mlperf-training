@@ -627,7 +627,7 @@ class DLRMv4YambdaDataset(DLRMv4RandomDataset):
                     raise ValueError("Invalid offline TS indices or offsets")
                 self._ts_offsets = offsets
                 self._ts_indices = indices
-                # Arming marker for A/B drivers: logged once per process.
+                # Logged once per process.
                 if not getattr(DLRMv4YambdaDataset, "_ts_backend_logged", False):
                     DLRMv4YambdaDataset._ts_backend_logged = True
                     logger.info(

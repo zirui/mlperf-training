@@ -71,11 +71,11 @@ _SAVE_FP8_UVQK = os.environ.get("DLRM_HSTU_FP8_SAVE_UVQK", "0") == "1"
 _EARLY_RELEASE_FP8_UVQK = (
     os.environ.get("DLRM_HSTU_FP8_EARLY_RELEASE_UVQK", "0") == "1"
 )
-# Store-instead-of-recompute (instance F, user-approved class 2026-10-05): the
+# Store-instead-of-recompute: the
 # FP8 forward LayerNorm also writes the BF16 normalized input, which is saved
 # for the projection wgrad so backward no longer re-runs the LayerNorm. The
 # stored tensor is bit-identical to the recompute from the stored fp32
-# mean/rstd (L0, iter 2). The mean/rstd themselves come from a separately
+# mean/rstd. The mean/rstd themselves come from a separately
 # compiled/autotuned kernel variant, so their last fp32 bit can differ from
 # the flag-off kernel, exactly as it already differs between autotune configs
 # of the flag-off kernel: a declared reduction-order change, same formula.
@@ -225,8 +225,8 @@ def _flydsl_fwd() -> Callable[..., Optional[torch.Tensor]]:
 
     Separate from _flydsl_bwd because the two halves are independently
     selectable: HSTU has no softmax, so the forward hands the backward nothing,
-    and running one on FlyDSL with the other on Triton is both valid and the only
-    way to A/B a single half. Returns None per call when not selected or when the
+    and running one on FlyDSL with the other on Triton is valid. Returns None
+    per call when not selected or when the
     shape is not specialized, and the caller falls back to Triton.
     """
     from generative_recommenders.ops.flydsl.hstu_flydsl_mha import (

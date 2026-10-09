@@ -410,18 +410,10 @@ def _weighted_layer_norm_bwd_dx(
 ):
     # SUM_DX additionally emits sum(dx, axis=0) into DXSUM, using the same
     # [tile_num, D] partial-buffer scheme the kernel already runs for dw/db.
-    # It exists so the preceding nn.Linear's bias gradient -- which ATen
-    # computes as a separate aten::sum over this very dx, 3.9608 ms/rank/step
-    # across the two preprocessor widths -- can be read off here instead, while
-    # dx is still in registers. Zero extra global traffic on the dx side.
-    #
-    # It is a tl.constexpr, not a runtime flag, so with SUM_DX=False Triton
-    # eliminates the accumulator entirely and the control path is the byte-
-    # identical kernel it was before. That is what makes the A/B honest.
-    #
-    # NUMERICS: this sums the fp32 dx, whereas aten::sum reduces the bf16 dx
-    # that was stored. Slightly more accurate, not bit-identical -- which is
-    # why this needs the convergence arm, not just a timing arm.
+    # SUM_DX also writes the column sum of dx, which is the preceding Linear's
+    # bias gradient. The sum uses the fp32 dx still in registers. aten::sum
+    # reduces the stored bf16 dx, so the two are not bit-identical.
+    # SUM_DX is a tl.constexpr. With it false, Triton drops the accumulator.
     pid = tl.program_id(0)
     tile_num = tl.num_programs(0)
     num_blocks = tl.cdiv(N, BLOCK_N)
@@ -798,13 +790,8 @@ def _layer_norm_bwd_dwdbdx(
 ):
     """F1 finalize: _layer_norm_bwd_dwdb plus the dx column-sum.
 
-    This is a SEPARATE kernel rather than a flag on _layer_norm_bwd_dwdb, for
-    two reasons. The control path stays byte-identical -- the shipped kernel is
-    not recompiled, not re-autotuned, and not touched -- so an A/B against it is
-    honest. And the distinct name is self-proving in a trace: seeing
-    _layer_norm_bwd_dwdbdx in the kernel list IS the arming proof, with no env
-    echo to trust. The rule here is that an arm must be shown armed at kernel
-    level before any delta is quoted, and a renamed kernel satisfies it directly.
+    A separate kernel from _layer_norm_bwd_dwdb, so the path without the column
+    sum is unchanged.
 
     The reduction is the same [tile_num, D] -> [D] shape the dw/db partials
     already use, so DXSUM costs one more strided read of an array the bwd_dx
@@ -1086,27 +1073,10 @@ _LN_BWD_SWISH_SMALL_D_TILE_MULT = 32
 def _ln_bwd_tile_num(N: int, D: int, sms: int, is_swish: bool) -> int:
     """Persistent-grid size for _weighted_layer_norm_bwd_dx.
 
-    The kernel runs num_warps=1 programs that each walk rows serially, so the
-    number of in-flight programs per CU is what hides HBM latency. At
-    BLOCK_D<=256 a row is only 512 B of bf16 per tensor, so sms*8 single-warp
-    programs leave the CU starved: on MI350X at the production shape
-    (N=2.28M, D=256, SUM_DX, IS_SWISH) the dx kernel ran at 2.17 TB/s
-    (1.61 ms), versus 1.26 / 1.04 / 1.01 ms at sms*16 / 32 / 64
-    (iter_22/lnbwd/sweep_d256.log). 32 is used: end-to-end with the
-    dw/db/dxsum finalize (which reads [tile_num, D] partials) 32 and 64 tie at
-    1.24 ms vs 1.32-1.45 ms at 8, and 32 needs half the partial buffers.
-    It is gated on IS_SWISH: the swish epilogue (sigmoid recompute) makes each row latency-heavier, whereas plain
-    LN at D=256 already reaches ~4 TB/s at sms*8 and gets slower with more
-    tiles (0.88 -> 1.06 ms end-to-end). At D=512 both are ~4.1-4.3 TB/s and the
-    multiplier is neutral, so it stays at 8. Production (hidden_dim=256,
-    output_dim=512) only hits the swish/D=256 case.
-
-    For a fixed BLOCK_N, dx does not depend on the grid (rows are independent)
-    and is bit-identical. The autotuner (key BLOCK_D) re-picks BLOCK_N on the
-    new grid, however: BLOCK_N=1 wins by a wide margin at sms*32 (1.04 vs
-    1.37 ms), and BLOCK_N=1 vs 8 changes the intra-row reduction order of dx
-    at the bf16-ulp level. dw/db/dxsum are fp32 sums over [tile_num, D] partials, so
-    their reduction order changes (measured rel diff ~4e-7).
+    Swish with D<=256 uses a larger persistent grid. Other cases use sms*8.
+    Rows are independent, so dx for a fixed BLOCK_N does not depend on the
+    grid. dw/db/dxsum sum fp32 partials, so their reduction order follows
+    tile_num.
     """
     small_swish = is_swish and triton.next_power_of_2(D) <= 256
     mult = _LN_BWD_SWISH_SMALL_D_TILE_MULT if small_swish else 8
@@ -1149,14 +1119,11 @@ def _wln_bwd_v2_config(
     """(tile multiplier, BLOCK_N, NUM_STAGES, CONTIG, num_warps, FAST_SIGMOID)
     for v2; the grid is min(sms * multiplier, cdiv(N, 4 * BLOCK_N)).
 
-    Picked from interleaved MI350X sweeps at the three production shapes
-    (N~2.36M; probes/iter9/wln/sweep*_{A,B,C}.json):
       D=512 residual (no swish):  sms*8,  BLOCK_N=1, 2 stages
       D=512 SUM_DX (no swish):    sms*4,  BLOCK_N=4, 2 stages
       D=256 swish SUM_DX:         sms*32, BLOCK_N=1, 1 stage
     The non-swish non-SUM_DX config is shared by the residual and plain
-    calls so a fused residual never changes dw/db. CONTIG=True and
-    num_warps>1 lost everywhere at these shapes. Rows wider than 512 keep
+    calls so a fused residual does not change dw/db. Rows wider than 512 keep
     BLOCK_N=1 (register pressure) and add warps only past 2048 columns.
     """
     if BLOCK_D > 512:
@@ -1442,22 +1409,9 @@ def triton_weighted_layer_norm_bwd_dxsum(
     nothing for the five that do not want the extra value, so the fused path
     gets its own 4-tuple and the shipped path is left exactly as it was.
 
-    WHY THIS EXISTS. The Linear feeding this norm has its bias gradient
-    computed by ATen as a standalone aten::sum over dx -- 2.3425 ms/rank/step at
-    D=512 plus 1.6183 at D=256, 3.9608 total, measured over 8 ranks x 5 steps.
-    That sum re-reads the whole [N, D] dx from HBM immediately after the norm
-    backward wrote it. The column sum is available for free while dx is still
-    in registers, so the fused path computes it there and deletes the reread.
-    Both are HBM-bound, which is why the removal is worth more than the add:
-    the standalone sums run at 3.07 TB/s (D=512) and 2.22 TB/s (D=256), well
-    under the 5.84 TB/s the part can do, and a reduction that never touches
-    HBM beats one that does at any bandwidth.
-
-    NUMERICS: dxsum reduces the fp32 dx still in registers, whereas aten::sum
-    reduces the bf16 dx after it was stored. This is the MORE accurate of the
-    two, but it is not bit-identical -- measured relative difference 1.6-2.1e-3,
-    the bf16 rounding scale. That is why this arm owes a convergence gate and
-    not merely a timing gate.
+    The Linear's bias gradient is the column sum of dx. This computes that sum
+    from the fp32 dx still in registers. aten::sum reduces the stored bf16 dx,
+    so the two are not bit-identical.
     """
     N, D = x.shape
     dx = torch.empty_like(x)

@@ -1,4 +1,5 @@
 #!/bin/bash
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Submit from this directory: sbatch job.sh
 # Set --partition, CONT, DATADIR, and LOGDIR. CONT must be an image every node can pull.
 # --nodes and DGXSYSTEM are a pair:

@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # pyre-strict
 """
 Streaming synthetic data generator for DLRMv4.

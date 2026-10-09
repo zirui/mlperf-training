@@ -270,10 +270,7 @@ def _add_embeddings_bwd_tiled_kernel(
 ):
     """Tiled segmented reduction of sorted (key, value) rows (DLRM_HSTU_FP8_POSENC_FAST).
 
-    The incumbent kernel walks its BLOCK rows one at a time; every row load
-    depends on the index load before it, so it streams ~1 KB per dependent
-    HBM round trip and runs at ~1.3 TB/s.  Here a program gathers its BLOCK
-    rows as one [BLOCK, D] tile (BLOCK independent loads in flight), then
+    A program gathers its BLOCK rows as one [BLOCK, D] tile, then
     folds each distinct key in the tile (keys are sorted, so usually 1-2) with
     tl.sum in fp32 and issues one fp32 atomic per key, like the incumbent.
 

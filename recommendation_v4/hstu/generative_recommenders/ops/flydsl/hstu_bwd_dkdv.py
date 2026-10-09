@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """HSTU jagged-attention BACKWARD dk/dv pass written in FlyDSL for gfx950.
 
 Structure (mirrors the Triton production split: a dk/dv pass + a separate dq pass):
@@ -260,9 +261,8 @@ def compile_hstu_bwd_dkdv(
     SQ: int = 136,
     ST: int = 68,
     rm_align: int = 8,
-    # iglp1 measured 0.8 ms better on the fused body but trips an assertion in
-    # LLVM's AMDGPUIGroupLP on some parameter combinations, so it is not the
-    # default.  iglp0 is stable and best for the dk/dv-only body.
+    # iglp1 trips an assertion in LLVM's AMDGPUIGroupLP on some parameter
+    # combinations, so it is not the default. iglp0 is the default.
     sched: str = "iglp0",
     tr16: bool = True,
     DQC: int = 1,
@@ -295,12 +295,12 @@ def compile_hstu_bwd_dkdv(
     # either way and only the f32 accumulation order changes.  That makes this
     # one gemm the only numerically FREE place to put an fp8 MFMA: every other
     # gemm has a genuinely-bf16 operand (dO) or an f32-computed one (ds), and
-    # rounding those to e4m3 costs 13-21 dB (bench/sim_fp8_numerics.py).
+    # rounding those to e4m3 costs 13-21 dB.
     #
     #   ""     incumbent: bf16 16x16x32 everywhere.
     #   "k32"  mfma_f32_16x16x32_fp8_fp8 for qk.  Same (lane, element) -> k
     #          mapping as the bf16 op, so it is a drop-in once both operands
-    #          are raw bytes.  The MFMA rate is only 1.06x (bench/mfma_peak.py)
+    #          are raw bytes.  The MFMA rate is only 1.06x
     #          -- the win this mode is really testing is the LDS one: the Q
     #          A-operand read halves from b128 to b64 and the staged Q bytes
     #          halve.
@@ -328,14 +328,9 @@ def compile_hstu_bwd_dkdv(
     # profitable fp8 shape on gfx950 is mfma_scale_f32_16x16x128_f8f6f4, and
     # that needs contraction depth 128.  Running TWO m tiles per loop body
     # forms K=128.
-    #   ""      incumbent.
-    #   "bf16"  m-unroll only, out-gemms still bf16 K=32.  CONTROL: isolates
-    #           the register/schedule cost of the unroll from the fp8 gemm.
-    #   "k128"  m-unroll + mfma_scale_f32_16x16x128_f8f6f4 on dv and dk.
-    # The out-gemm mfma count falls 4x (128 -> 32 per two m tiles); the A
-    # operands (silu, ds) are f32 in registers, so unlike dO/V they can be
-    # RESCALED by a power of two before the cast, which is the one degree of
-    # freedom the closed dp-k128 experiment did not have.
+    #   ""      off.
+    #   "bf16"  unroll only; out-gemms stay bf16 K=32.
+    #   "k128"  unroll plus mfma_scale_f32_16x16x128_f8f6f4 on dv and dk.
     mu2: str = "",
     mu2_fmt: str = "e4m3",
     mu2_ssc: float = 1.0,   # silu pre-scale (dv A operand)
@@ -365,10 +360,10 @@ def compile_hstu_bwd_dkdv(
     # e4m3 ds tile sees a range that no longer depends on the loss scale.
     # All three epilogues (dv, dk, dq) multiply by 1/s_do -- exact, pow2.
     # No host sync: the scale never leaves the device.
-    # RESEARCH-ONLY since the C8 fold (2026-10-03): the production wrapper
+    # RESEARCH-ONLY: the production wrapper
     # always passes do_dyn=False/do_blk=True, and no in-tree producer of the
-    # [s_do, 1/s_do] scale remains (quantize_do_e4m3 was removed).  Kept for
-    # kernel A/B probes that supply their own scale.
+    # [s_do, 1/s_do] scale remains (quantize_do_e4m3 was removed). Training
+    # passes do_dyn=False.
     do_dyn: bool = False,
     # ---- C8 option B: per-(sequence, head, token-group) dO scale -----------
     # (default OFF, f8b only, exclusive with do_dyn).  The launcher passes a
@@ -387,15 +382,15 @@ def compile_hstu_bwd_dkdv(
     do_blk: bool = False,
     # ---- R1 stage 2b: saturating e4m3 cast of silu/ds (f8b only) ----------
     # cvt_scalef32_pk_fp8_f32 does NOT saturate: |v*scale| > 448 becomes NaN
-    # (iter-17 in-model probe 51366: silu*ssc reached 1e4 and dv went NaN on
+    # (silu*ssc reached 1e4 and dv went NaN on
     # the first armed call).  The cvt's own VOP3 clamp bit is NOT available:
     # gfx950's assembler rejects 'clamp' on v_cvt_scalef32_pk_fp8_f32
-    # ("invalid operand for instruction", iter-17 probe 51407).
+    # ("invalid operand for instruction").
     # f8_sat clamps each element to +-448/scale first
     # (one v_min + one v_max, or a v_med3, per element) so an out-of-range
     # tile degrades to saturation instead of poisoning the weights.
     f8_sat: bool = False,
-    # ---- silu / grad-coefficient epilogue form (roadmap R3) ---------------
+    # ---- silu / grad-coefficient epilogue form ---------------------------
     #   "legacy"  silu = (x*sig)*inv_max;
     #             gc   = sig*(1 + x*(1-sig))*inv_max;  ds = dp*vis*gc
     #   "reuse"   hoist the uniform alpha*score_input_scale product out of
@@ -411,10 +406,10 @@ def compile_hstu_bwd_dkdv(
     #             accumulator elements; exp2/rcp stay scalar.  Same ops, same
     #             order, IEEE per lane -> bitwise equal to "reuse".  Same
     #             technique as hstu_fwd's epi_pk.
-    # Sept-22 prototype (job42237): bwd_dkdv 54.47 -> 53.02 ms/rank/step
-    # in-model, VGPR 420 -> 416, max paired train-loss diff 3.13e-7.
+    # Packed f32 over two consecutive accumulator elements. exp2 and rcp stay
+    # scalar. Same operations and the same order as "reuse".
     epilogue: str = "reuse",
-    # R15 iter11 intra-pair lookahead (dqsplit + mu2 only; 0 = off, the
+    # Intra-pair lookahead (dqsplit + mu2 only; 0 = off, the
     # unchanged kernel).  Both m tiles of an mu2 pair are staged in LDS up
     # front (a second q8/o8 buffer), and the qk/dp MFMAs of tile B are issued
     # in the same scheduling region as tile A's silu/ds VALU chain, which they
@@ -434,8 +429,8 @@ def compile_hstu_bwd_dkdv(
     #   6: as 5 with all NSTEP d tiles' B-operand reads.
     pipe: int = 0,
 ):
-    # `abl` is a comma-separated set of ablation switches.  Ablated kernels are
-    # numerically WRONG on purpose; they exist only to attribute time to a term.
+    # `abl` is a comma-separated set of debug switches. Those builds are
+    # numerically wrong. They are not used by training.
     abl_set = {s for s in abl.split(",") if s}
     ABL_ACT = "act" in abl_set  # drop silu / grad-coeff math
     ABL_MASK = "mask" in abl_set  # drop causal + bounds selects
@@ -491,7 +486,7 @@ def compile_hstu_bwd_dkdv(
     # else changes -- same LDS reads, same operands, same register pressure, no
     # dead code for the compiler to remove.  The time delta is the EXPOSED cost
     # of that MFMA issue, which is what a faster MFMA could actually buy back;
-    # the analytic issue-time model in bench/mfma_fraction.py only bounds it
+    # the analytic issue-time model only bounds it
     # from above, because MFMA that hides under LDS latency is free to remove
     # and free to add.  Numerically wrong on purpose.
     ABL_MFMA2X = "mfma2x" in abl_set
@@ -675,25 +670,10 @@ def compile_hstu_bwd_dkdv(
     # values in one dword.  Reaching them needs the accumulator TRANSPOSED so
     # that a lane's four elements are four consecutive d rather than four m;
     # that is one mfma operand swap, see the flush below.
-    # "bf16"/"f16" transpose the accumulator so a lane's own elements pair up.
-    # That is simple but it moves m onto the lane axis, and m has stride HD in
-    # memory, so one atomic then touches 16 cache lines instead of 4 -- measured
-    # 99.4 ms against 59.0.  "bf16c" keeps the coalesced C[m][d] orientation and
-    # gets the pair from the NEIGHBOURING LANE with a DPP quad swap instead;
-    # the odd lanes then have nothing to contribute and are dropped by pointing
-    # them past num_records.
-    #
-    # Both of those miss the point, because the atomic unit is limited per 64 B
-    # LINE TOUCHED, not per byte or per element (atomic_roof.hip: f32,
-    # pk_add_f16, pk_add_bf16 and add_f64 all land on 2.0e10 line-requests/s).
-    # bf16c keeps 16 lanes' worth of addresses but only 8 live lanes, so each
-    # request covers half a line and the request count is unchanged -- measured
-    # 49.8 ms against 49.6, exactly as that model predicts.
-    #
-    # "bf16p" is the one that pays: it interleaves d in the staged K tile so
-    # that a lane's TWO accumulators hold d and d+1, which lets all 16 lanes
-    # pack a pair and span a whole 64 B line in one request.  Same bytes as
-    # bf16c, half the line-requests.
+    # "bf16" and "f16" transpose the accumulator so a lane's own elements pair.
+    # "bf16c" keeps C[m][d] and pairs with the neighbouring lane.
+    # "bf16p" interleaves d in the staged K tile so a lane's two accumulators
+    # hold d and d+1, and all 16 lanes pack a pair. Training uses "bf16p".
     assert dq16 in ("", "bf16", "f16", "bf16c", "bf16p")
     # bf16p needs exactly two d tiles per wave to pair up.
     assert dq16 != "bf16p" or not fused or DQD == 2
@@ -858,35 +838,8 @@ def compile_hstu_bwd_dkdv(
             widening whenever conversion_scale is 1.0.
             """
             if ABL_WCVT0:
-                # Ceiling probe for the e4m3->bf16 WIDENING, same trick as
-                # ABL_BCVT0 does for the out-gemm B operands: keep the load, the
-                # data dependence and the fragment width, and delete ONLY the
-                # four cvt_scalef32_pk_bf16_fp8 ops by reinterpreting the two
-                # dwords as bf16 halfwords and widening the fragment by shuffle.
-                # Zero VALU, numerically garbage on purpose.  The resulting
-                # time is the FLOOR any faster convert could reach here, because
-                # it prices a convert that is infinitely fast.
-                #
-                # MEASURED (2026-09-13, gfx950, ISA-verified that the 128
-                # v_cvt_scalef32_pk_bf16_fp8 ops are gone and ds_read/mfma counts
-                # are unchanged): that floor is ZERO.  The shipped k128 schedule
-                # gets SLOWER with the converts deleted -- 15.500 -> 15.812 ms at
-                # batch 512, 31.019 -> 31.489 at 1024 -- because it has >=3 ms of
-                # VALU slack and hides them completely.  Read that as "no gain
-                # available", not as "converts are beneficial"; the negative
-                # point estimate is the substitute perturbing the schedule.
-                #
-                # This is what closed FP6 and FP4: a 17.86x faster convert is
-                # worth nothing when the incumbent convert already costs nothing.
-                # Do NOT reach for this expecting the old `cvt_scalef32_pk8_*`
-                # framing -- that family is gfx1250 and does not exist on gfx950,
-                # so its "Cannot select" is correct behaviour, not a toolchain
-                # gap awaiting a fix.
-                #
-                # Run this probe in the SHIPPED config before proposing any
-                # narrower storage format for q/k/v.  An exposed cost measured in
-                # a non-shipped arm is not a prize: the same converts price at
-                # 3.0 ms in the bf16-MFMA arm and 0 ms here.
+                # Debug build: reinterpret the loaded dwords as bf16 and skip the
+                # convert. Numerically wrong. Not used by training.
                 as_bf = vector.bitcast(T.vec(4, T.bf16), packed)
                 return vector.shuffle(as_bf, as_bf, CAT8)
             converted = []
@@ -1153,7 +1106,7 @@ def compile_hstu_bwd_dkdv(
             ).result
 
         # ---- R1 f8b: ds_read_b64_tr_b8 --------------------------------------
-        # MEASURED on gfx950 (probes/iter16/probe_tr8.hip): within a 16-lane
+        # MEASURED on gfx950: within a 16-lane
         # group, lane j receives byte (j % 8) of the 8-byte runs addressed by
         # source lanes 2*e + j//8, e = 0..7, as its byte e.  So source lane j
         # names row e = j//2 for the receiver half k = j%2, and the receiver
@@ -1478,7 +1431,7 @@ def compile_hstu_bwd_dkdv(
 
         l4h = l4 // _i32(2)  # d block within a 32-wide k slice
         l4l = (l4 % _i32(2)) * _i32(8)  # offset inside that 16-wide d block
-        # ds_read_b64_tr_b16, measured on gfx950 (isa_diff/probe_tr2.hip):
+        # ds_read_b64_tr_b16, measured on gfx950:
         # for lane 16*g + j, write k = j/4 and s = j%4.  Element e of that lane
         # is the halfword at (address given by lane 16*g + 4*e + k) + s.  So each
         # 16-lane group runs four independent 4x4 transposes, and lane j supplies
@@ -2809,7 +2762,7 @@ def compile_hstu_bwd_dkdv(
             # Launch on the caller's current stream (see _current_stream); an
             # explicit stream, keyword or 14th positional, still wins.  With
             # $DLRM_HSTU_FP8_FLYDSL_CURRENT_STREAM=0 no stream is passed: the
-            # exact pre-5ae3127 launch arguments.
+            # previous null-stream launch arguments.
             kw["stream"] = _current_stream(args[0] if args else kw["Q"])
         args = tuple(fx.Float32(a) if isinstance(a, float) else a for a in args)
         if isinstance(kw.get("inv_max"), float):

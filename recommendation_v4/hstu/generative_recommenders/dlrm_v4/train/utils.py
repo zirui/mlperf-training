@@ -279,7 +279,7 @@ def _collect_and_freeze_gc() -> None:
     DLRM_HSTU_FP8_GC_FREEZE; default "1" when absent). Not an FP8 knob: the
     prefix is only what launch_slurm.sh forwards into the container. With "0"
     nothing is collected or frozen and CPython's own GC schedule applies (the
-    pre-fix behaviour), so the stall fix can be A/B'd per run.
+    pre-fix behaviour). Set DLRM_HSTU_FP8_GC_FREEZE=0 to leave it off.
     """
     _knob = os.environ.get("DLRM_HSTU_FP8_GC_FREEZE", "1")
     if _knob.strip().lower() in ("0", "false", "off", "no"):
@@ -540,9 +540,7 @@ def make_model(
         enable_bf16_ec_output()
 
     # Replace that hoisted backward's scatter_add_ with the sort-then-segment
-    # reduce kernel. Gated separately from the hoist because it is the third
-    # rung of the measured ladder and was measured as its own increment
-    # (+4.37% e2e on top of ec_bf16_output). See dlrm_v4/train/ec_segment_reduce.py.
+    # reduce kernel. Gated separately from the hoist.
     if ec_segment_reduce:
         if not ec_bf16_output:
             raise ValueError(
@@ -1224,8 +1222,7 @@ def make_optimizer_and_shard(
     # DlrmHSTU.__init__, so it has to survive DMP wrapping and torchrec's
     # meta-device to_empty() path to do anything. It should -- plain attributes
     # survive both -- but if it ever stops, the only symptom is that the
-    # ~4.9 ms/step/rank of fp32<->bf16 round-trip casts quietly come back, with
-    # no error anywhere. Log it once so a silent no-op is greppable.
+    # the fp32 entry cast comes back, with no error anywhere. Log it once.
     if (not dist.is_initialized()) or dist.get_rank() == 0:
         _inner = getattr(model, "module", model)
         _td = getattr(
@@ -1445,12 +1442,8 @@ def make_persistent_streaming_dataloader(
     ``pin_memory`` ($DL_PIN_MEMORY, on by default) routes each batch through
     ``Samples.pin_memory()`` on the loader's pin thread, so the per-step
     host-to-device copy is one real DMA instead of a blocking stage through a
-    driver bounce buffer. Saves ~77 ms/step on 8x MI350X at bs 1024/rank
-    (666 -> 589); see docs/perf_opt.md.
-
-    The copy itself stays blocking -- once the source is pinned it costs ~2 ms,
-    and non_blocking=True measured no better while requiring event-based lifetime
-    management for buffers the loader recycles.
+    driver bounce buffer. The copy itself stays blocking: non_blocking=True
+    needs event-based lifetime management for buffers the loader recycles.
     """
     use_workers = bool(num_workers and num_workers > 0)
     return DataLoader(
@@ -1554,9 +1547,8 @@ class _WarmWindowStream:
     iterator per window makes it *drain* at every seam -- the window's last two
     batches train with nothing queued behind them -- and then refill from cold
     on the next window, paying the H2D copy and the embedding input_dist with an
-    idle compute stream. On interior windows that is ~0.33 ms/step amortized; at
-    START_TS=0, where a window can be shorter than a single step, it happens
-    almost every step and eats most of the pipeline's benefit.
+    idle compute stream. At START_TS=0 a window can be shorter than a step,
+    so the seam happens on nearly every step.
 
     Chaining removes the seam entirely: when the current window's iterator runs
     out, this object rolls onto the next one, which ``_PrefetchingWindowLoader``
@@ -2155,7 +2147,7 @@ def build_train_pipeline(
             self._alloc_reporter = _alloc_pregrow.make_reporter(self)
             prio = _hsf.pipe_stream_priority()
             if prio is not None and self._memcpy_stream is not None:
-                # A/B override only; rebuilt before any batch is issued on them.
+                # Rebuilt before any batch is issued on them.
                 self._memcpy_stream = torch.cuda.Stream(priority=prio)
                 self._data_dist_stream = torch.cuda.Stream(priority=prio)
                 logger.info(
@@ -2682,7 +2674,7 @@ def streaming_train_eval_loop(
     mlperf_train_loss_log_frequency: int = 0,
     # num_workers of the persistent EVAL DataLoader pool only (double-buffer
     # path); the train pools keep the gin num_workers ($NUM_WORKERS). < 0 =
-    # inherit NUM_WORKERS (pre-2026-10-05 behaviour). Wired to $EVAL_NUM_WORKERS
+    # inherit NUM_WORKERS (the previous behaviour). Wired to $EVAL_NUM_WORKERS
     # via gin (default 8). Input pipeline only: same eval set, order and metric.
     eval_num_workers: int = -1,
     checkpoint_frequency: int = 100,
@@ -3916,10 +3908,10 @@ def streaming_train_eval_loop(
         ) > 0:
             eval_sampler = StreamingWindowSampler(rank, world_size)
             # $EVAL_NUM_WORKERS (gin default 8; < 0 inherits NUM_WORKERS, the
-            # pre-2026-10-05 pool). The holdout eval pass is input-pipeline
+            # previous pool). The holdout eval pass is input-pipeline
             # bound at 4 workers/rank (~255-285 ms per 1024-sample batch, as
-            # long as a training step); 8 workers halve it (Arbor iter-13/15:
-            # 64-70 s -> 33-40 s per 1n eval, identical eval_accuracy). Only
+            # long as a training step); 8 workers halve it
+            # (64-70 s -> 33-40 s per 1-node eval, identical eval_accuracy). Only
             # this persistent eval pool changes; train pools keep NUM_WORKERS.
             _eval_dl_kwargs = resolve_eval_dataloader_kwargs(eval_num_workers)
             if rank == 0:

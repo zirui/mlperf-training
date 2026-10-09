@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Caching-allocator pre-grow before RUN_START, and a growth report.
 
 Why: with ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` (launch_slurm.sh)

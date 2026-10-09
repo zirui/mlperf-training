@@ -373,7 +373,7 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
     # above. It used to live inside the CUDA `else:` block which meant HIP
     # configs reached `_hstu_attn_fwd[grid](...)` without these defaults and
     # crashed at dispatch. Keep this hoisted (outside the if/else) when
-    # editing — see commit message for the symptom.
+    # editing — the HIP configs crash at dispatch without these defaults.
     for config in configs:
         if not config.kwargs.get("USE_TLX", False):
             config.kwargs["USE_TLX"] = False

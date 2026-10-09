@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """HSTU jagged-attention FORWARD written in FlyDSL for gfx950.
 
 Two gemms with a pointwise between them, per (batch, head, m-block):
@@ -19,20 +20,15 @@ Decomposition:
   * Q for the owned rows is loaded once into registers (loop-invariant) and is
     the A-operand of the score gemm.  K and V are streamed over n and staged in
     LDS; K is the score gemm's B-operand, V is the out gemm's B-operand.
-  * BOTH K AND V ARE B-OPERANDS, so they are broadcast across m: each fragment
-    is read from LDS once and issued against all MT m-tiles.  That is why
-    WAVES=2/MT=2 beats WAVES=4/MT=1 -- it halves the workgroup's K/V LDS reads
-    without touching BM, and this kernel is LDS-throughput bound (measured:
-    occupancy 3 wg/CU vs 2 is worth nothing, while a K-read bank conflict is
-    worth 40%).
+    * BOTH K AND V ARE B-OPERANDS, so they are broadcast across m: each fragment
+    is read from LDS once and issued against all MT m-tiles. WAVES=2 keeps
+    MT=2, so one read covers two m-tiles.
   * The score accumulator is TRANSPOSED -- mfma2(kf, qf) rather than
     mfma2(qf, kf) -- so the fragment it produces already carries n on the
     element axis, which is the layout the out gemm's A-operand needs.  V is read
     from a tr16 LDS layout with ds_read_b64_tr_b16 (transpose-on-read).
-  * Every LDS tile is bank-conflict padded, and that is where most of this
-    kernel's performance came from: k_lds stride D+16, p_lds stride BN+4,
-    v_lds tr16 block stride BN+1.  Each pad was worth double digits; the sweep
-    is exhausted (see ../../lineage/hstu_attention_forward.md).
+  * Every LDS tile is bank-conflict padded: k_lds stride D+16, p_lds stride
+    BN+4, v_lds tr16 block stride BN+1.
 
 Reads q/k/v in place at a caller-supplied row stride (`rs`), because production
 hands attention COLUMN SLICES of one uvqk buffer rather than packed tensors.
@@ -61,16 +57,12 @@ LOG2E = 1.4426950408889634
 
 # Shipping configuration in one place so bench and gate cannot drift.
 #
-# BN=32 (not 64): halves the K/V/p LDS tiles.  BN=64 re-measured at -17.6% on the
-# production shape, so this is not merely an occupancy choice.
+# BN=32 (not 64): halves the K/V/p LDS tiles.
 #
 # waves=2 (not 4): with BM=64 this gives each wave MT=2 sixteen-row m-tiles, so a
 # K or V fragment is read from LDS once and issued against both -- halving the
-# workgroup's K/V LDS reads at identical BM, MFMA count and causal waste.  Worth
-# +2.6% measured by repeated standalone runs and +4.7% by an in-process paired
-# harness (identity control -0.05%, sign flips correctly when the arms swap);
-# +2.6% is the figure banked, following the campaign's worse-of-two rule.
-# waves=1 (MT=4) collapses (-69%): there is a register cliff between MT=2 and 4.
+# workgroup's K/V LDS reads at identical BM, MFMA count and causal waste.
+# waves=1 (MT=4) hits a register cliff between MT=2 and 4.
 SHIPPED = {"BM": 64, "BN": 32, "sched": "iglp1", "waves": 2}
 
 PTR_TY = "!llvm.ptr"
@@ -165,94 +157,41 @@ def compile_hstu_fwd(
     kpad: int = -1,
     lds_dummy: int = 0,
     waves: int = 2,
-    # ---- true fp8 MFMA on the qk gemm -----------------------------------
-    # Same argument as the backward's fp8_mfma (hstu_bwd_dkdv.py): in the FP8
-    # arm q and k are ALREADY e4m3 in memory, and e4m3 -> bf16 is lossless (3
-    # mantissa bits into 7), so the incumbent widens both operands and runs a
-    # bf16 MFMA over values that are exactly fp8.  Substituting a native fp8
-    # MFMA changes only the f32 accumulation order -- it is numerically free.
-    # What it buys is NOT math rate:
-    #   * k_lds halves, 128 B/row -> 64 B/row of payload;
-    #   * "k128" (mfma_scale_f32_16x16x128_f8f6f4) collapses the score gemm's
-    #     FOUR ds_read_b128 per (n-tile) into TWO, and its four mfma into one.
-    # The K LDS read is this kernel's measured DOMINANT cost (the ablation in
-    # the KPAD note above puts it at -17.6%, vs -8.4% for the V tr-reads), so
-    # that read collapse is aimed straight at the top of the profile.
+    # fp8 MFMA on the qk gemm. q and k are already e4m3. k128 uses
+    # mfma_scale_f32_16x16x128_f8f6f4: the k_lds row is 64 B and the score
+    # gemm issues two ds_read_b128 and one mfma per n-tile. Accumulation stays
+    # f32; only the add order changes.
     fp8_mfma: str = "",
-    # Feed V as e4m3 too.  Independent of fp8_mfma: it halves the v_lds tile
-    # and the V global traffic even while the out gemm stays bf16, because the
-    # tr16 staging then widens e4m3 -> bf16 on the way in.
+    # Feed V as e4m3. Independent of fp8_mfma. The out gemm can stay bf16;
+    # tr16 staging widens e4m3 to bf16 on the way in. The v_lds tile is half
+    # as wide.
     fp8_v: bool = False,
-    # fp8 MFMA on the out gemm (p @ v).  Needs fp8_v, and unlike qk it is NOT
-    # free: p is computed in f32 and would have to be ROUNDED to e4m3.  p's
-    # underflow is benign (0.009-0.017% flushed on real tensors, vs 96-99.9%
-    # for the backward's ds/dO), so the cost is mantissa, not flush.
+    # fp8 MFMA on the out gemm (p @ v). Needs fp8_v. p is computed in f32 and
+    # would be rounded to e4m3. Not implemented.
     pv: str = "",
-    # Bank-conflict padding, in BYTES, of the fp8 k_lds row.  Same role KPAD
-    # plays for the bf16 tile; the bf16 sweep's answer does not carry over
-    # because the row is half as wide, so this is swept separately.
+    # Bank-conflict padding, in bytes, of the fp8 k_lds row.
     k8_pad: int = 16,
     # Bank-conflict padding, in BYTES, of the fp8 v_lds tr8 block stride.
     v8_pad: int = 16,
-    # ---- TRACK E2: silu-epilogue VALU reductions ------------------------
-    # The rocprofv3 census says the kernel spends 57% of its SIMD cycles in
-    # NON-MFMA VALU and only 28.6% in MFMA, at 12.0 VALU lane-ops per score
-    # element (4 MUL, 2 TRANS, 2 INT32, 1.1 CVT, 1 ADD, 1.9 cmp/cndmask/mov).
-    # Both knobs below delete lane-ops the counters name, and neither changes
-    # what the MFMAs compute.
-    #
-    # `epi_fold`: the two constant MULs.  Reparametrise the silu on
-    #   u = -log2(e) * score_scale * raw   (ONE mul, was two: score_scale then
-    #   -LOG2E), so exp2's argument IS u; then silu = u*sig carries a constant
-    #   factor -1/log2(e) which, together with inv_max, rides out on the
-    #   epilogue's existing out_scale -- 128 f32 muls per output row instead of
-    #   one per score element.  4 MUL/element -> 2.
+    # `epi_fold`: fold the constant silu scales into out_scale.
+    # u = -log2(e) * score_scale * raw, so exp2's argument is u. The remaining
+    # constant factor leaves with out_scale.
     epi_fold: bool = False,
-    # `mask_split`: the causal compare.  For an m-block at m0, every n-tile
-    #   with n0+BN <= m0 is strictly below the diagonal, so m >= n holds for
-    #   all of it and the mask is dead.  m0 is a multiple of BN (BM % BN == 0),
-    #   so that is exactly the first m0/BN iterations.  Splitting the n loop
-    #   there drops the n_idx add, the v_cmp and the v_cndmask -- 3 of 12
-    #   lane-ops -- on the 95.55% of n-iterations that are fully below the
-    #   diagonal at the production length distribution.
+    # `mask_split`: skip the causal compare on n-tiles that lie entirely
+    # below the diagonal. m0 is a multiple of BN, so that is the first
+    # m0/BN iterations.
     mask_split: bool = False,
-    # `epi_pk`: the two MULs and the ADD that survive epi_fold, at double rate.
-    #   The re-profile after epi_fold+mask_split says the kernel is STILL
-    #   VALU-bound and not MFMA-bound (VALUBusy 57.1% vs MfmaUtil 34.0%), and
-    #   names the remainder exactly: per score element 2 TRANS (v_exp_f32 +
-    #   v_rcp_f32, irreducible for silu), 2 MUL_F32 and 1 ADD_F32.  gfx950 has
-    #   double-rate packed f32 -- verified at the ISA level, `llc -mcpu=gfx950`
-    #   turns an <2 x float> fmul/fadd into v_pk_mul_f32/v_pk_add_f32 -- and the
-    #   accumulator already holds 4 consecutive n per lane, so the pairs are
-    #   free to form.  MUL 5.230e8 + ADD 2.497e8 = 7.73e8 of 2.016e9 VALU
-    #   instructions halve, i.e. -19.2% of VALU issue.  The transcendentals stay
-    #   scalar; only the surrounding arithmetic packs.  Bit-exact: same
-    #   operations, same order, same f32 rounding, just two lanes per issue.
+    # `epi_pk`: issue the remaining silu mul/add as packed f32. exp2 and rcp
+    # stay scalar. Same operations and the same f32 rounding, two lanes per
+    # issue. Requires epi_fold.
     epi_pk: bool = False,
 ):
-    """`kpad` overrides the k_lds row pad; `lds_dummy` wastes that many LDS bytes.
+    """`kpad` overrides the k_lds row pad. `lds_dummy` reserves extra LDS bytes.
 
-    Both exist to separate two effects the KPAD sweep confounded. Raising KPAD
-    from 8 to 16 both fixes a K-read bank conflict AND costs 512 B/workgroup,
-    which pushes 3x21.75 KB past the 64 KB the CU has and drops occupancy from 3
-    workgroups to 2. The sweep preferred KPAD=16, so conflict-freedom is worth
-    more than that occupancy -- but it never priced the occupancy on its own.
-    `lds_dummy` does: it forces the same occupancy drop at an UNCHANGED conflict
-    pattern, so KPAD=8+512 vs KPAD=8 isolates occupancy, and against KPAD=16 it
-    isolates the conflict fix. Measured at the production shape: 3 wg/CU 6.192 ms
-    vs 2 wg/CU 6.169 at KPAD=8, i.e. occupancy is worth NOTHING here, while
-    KPAD=0 costs 40% (8.436). This kernel is LDS-throughput bound, not latency
-    bound -- which is what makes `waves` below the interesting knob.
-
-    `waves` sets waves per workgroup, and with BM fixed it sets MT = BM/(16*waves),
-    the number of 16-row m-tiles ONE wave owns. It is the lever on LDS traffic:
-    K and V are both B-operands, broadcast across m, so a wave that owns MT
-    m-tiles reads each K/V fragment ONCE and issues MT mfmas against it. Halving
-    `waves` therefore halves the workgroup's K/V LDS reads for identical MFMA
-    work, at identical BM -- which is what distinguishes it from raising BM. BM
-    sets the causal waste (the n loop runs to m0+BM, so a coarser BM overshoots
-    the triangle), and that is why BM=128 measured neutral in the campaign: it
-    bought this same amortization and paid it back in wasted tiles.
+    `waves` sets waves per workgroup. With BM fixed, MT = BM/(16*waves) is the
+    number of 16-row m-tiles one wave owns. K and V are B-operands, so a wave
+    reads each fragment once and issues MT mfmas against it. The n loop runs
+    to m0+BM, so a larger BM includes extra tiles past the causal triangle.
     """
     assert dim == 128, "kernel is specialised for D=128"
     assert BM % 64 == 0 and BN % 32 == 0
@@ -264,18 +203,9 @@ def compile_hstu_fwd(
     assert not (pv and not fp8_v), "pv needs an e4m3 V"
     FP8_QK = fp8_mfma
     D = dim
-    # k_lds is row-major [BN][D].  The score gemm's B read for lane l is
-    # k[n = 16*nt + l16][d = 32*ks + 8*l4 .. +7] as a b128 (v8bf).  ABLATION
-    # (collapsing the 8 K reads/iter to 1 reused read) shows these K reads are
-    # this kernel's DOMINANT LDS cost: -17.6% at b256, vs V tr-reads -8.4% and
-    # transcendentals ~0%.  So the K-read bank pattern is where the money is.  A
-    # KPAD sweep over the alignment-preserving multiples of 8 (KSTRIDE must be
-    # 8-elem == 16 B aligned or the b128 splits) at b256: pad=8 4.085 (old
-    # leader), pad=16 3.87-4.04, pad=24 4.186, pad=32 4.223.  pad=16
-    # (KSTRIDE=144, 288 B == 16 mod 32 banks) wins despite the +512 B pushing
-    # 3 wg/CU -> 2 wg (66 KB > 64 KB for three): the K-read conflict reduction
-    # beats the occupancy loss, matching the note that this kernel is no longer
-    # latency-bound.  The earlier pad=8 "2-way" model was wrong; trust the sweep.
+    # k_lds is row-major [BN][D]. The score gemm's B read for lane l is
+    # k[n = 16*nt + l16][d = 32*ks + 8*l4 .. +7] as a b128. KPAD=16 keeps
+    # KSTRIDE 16-byte aligned and moves consecutive rows off the same banks.
     KPAD = 16 if kpad < 0 else kpad
     assert KPAD % 8 == 0, "KSTRIDE must stay 16 B aligned or the b128 read splits"
     KSTRIDE = D + KPAD
@@ -317,12 +247,8 @@ def compile_hstu_fwd(
     # what lets the kernel read the slice in place; with rs unset the caller is
     # promising a packed tensor and gets the old math.
     #
-    # This matters more here than it looks.  Packing q/k/v to contiguous costs
-    # three full copies of the attention input per layer per step, and the
-    # backward measured that class of wrapper tax at ~15 ms/step/rank for six
-    # copies -- enough to eat this kernel's entire win.  The column offset needs
-    # no parameter: a torch slice view carries it in its data_ptr, which is what
-    # _shifted_rsrc starts from.
+    # A torch slice view carries the column offset in its data_ptr, which is
+    # what _shifted_rsrc starts from. Packing q/k/v would copy them first.
     #
     # OUT is NOT a slice of that buffer -- it is attention's own freshly
     # allocated output -- so it keeps the packed H*D stride and is addressed
@@ -626,22 +552,17 @@ def compile_hstu_fwd(
             # here (paired with s_setprio(0) before the yield) lets the compute
             # wave win the shared issue slot and keep the single MFMA pipe fed,
             # instead of being interleaved with the neighbour's LDS/global
-            # traffic.  Purely an arbitration hint -- semantically a no-op, and
-            # a lever neither LLVM's SSA scheduler nor iglp_opt expresses.
+            # traffic. An arbitration hint. Semantically a no-op.
             rocdl.s_setprio(1)
             # ---- score: qk.T[n][m] = (q @ k.T).T  (per wave, its 16 m x BN n) --
             # OPERANDS SWAPPED vs the natural mfma2(qf, kf): kf and qf have
             # IDENTICAL fragment structure (lane l -> 16-index=l16, k=l4*8+32ks),
             # so putting kf in the A slot and qf in the B slot computes the same
             # scores but with the accumulator TRANSPOSED: output row = n-space,
-            # col = m-space.  This is NOT the eliminate-the-round-trip transpose
-            # (gen 12, -20.51%, VGPR 78->88 from keeping p live): p is still
-            # round-tripped through LDS and freed, so the accumulator is still 4
-            # f32/lane and VGPR is unchanged.  The payoff is purely the p-STORE:
-            # a lane now holds 4 CONSECUTIVE n (l4*4+0..3) for one m=l16, so the
-            # 8 scalar ds_write_u16/iter collapse to 2 ds_write_b64/iter, while
-            # the a_p read below is byte-identical (p_lds is the same [m][n]
-            # row-major layout, just written transposed).
+            # col = m-space. p is still written through LDS and freed, so the
+            # accumulator stays 4 f32 per lane. A lane holds 4 consecutive n
+            # for one m, so the p store is two ds_write_b64 per iteration.
+            # p_lds stays row-major [m][n].
             # K IS READ ONCE AND ISSUED MT TIMES. The K fragment depends only on
             # (nt, ks), not on m, so hoisting the read above the mt loop is what
             # makes MT>1 cheaper than the equivalent BM increase: the workgroup's
@@ -650,10 +571,8 @@ def compile_hstu_fwd(
             for nt in range_constexpr(NTILE):
                 accs = [zero_acc for _ in range_constexpr(MT)]
                 if FP8_QK == "k128":
-                    # ONE contiguous 32 B run per lane, read as TWO b128 --
-                    # against FOUR b128 for the bf16 tile.  This is the k128
-                    # lesson: the read INSTRUCTION count halves and the bytes
-                    # quarter, on the read the ablation named dominant.
+                    # One contiguous 32 B run per lane, read as two b128.
+                    # The bf16 tile uses four b128.
                     kb = (_i32(16 * nt) + l16) * _i32(K8_DW) + l4 * _i32(8)
                     kf = vector.shuffle(
                         vector.load_op(v4i32, k_lds, [_idx(kb)]),
@@ -950,7 +869,7 @@ def compile_hstu_fwd(
             # side streams.  Same handle on the default stream; an explicit
             # stream, keyword or 10th positional, still wins.  With
             # $DLRM_HSTU_FP8_FLYDSL_CURRENT_STREAM=0 no stream is passed: the
-            # exact pre-5ae3127 launch arguments.
+            # previous null-stream launch arguments.
             import torch
 
             q = args[0] if args else kw["Q"]

@@ -37,9 +37,7 @@ torch.fx.wrap("len")
 _HSTU_LAST_LAYER_TARGETS_ONLY: bool = (
     os.environ.get("TRITON_HSTU_LAST_LAYER_TARGETS_ONLY", "0") == "1"
 )
-# Whether eval takes the targets-only path too. Separately switchable because
-# eval numerics feed the convergence metric the RCP sweep is compared against,
-# so an A/B has to be able to move eval without moving training.
+# Whether eval takes the targets-only path too. Independent of training.
 _HSTU_TARGETS_ONLY_EVAL: bool = (
     os.environ.get("TRITON_HSTU_TARGETS_ONLY_EVAL", "1") == "1"
 )
