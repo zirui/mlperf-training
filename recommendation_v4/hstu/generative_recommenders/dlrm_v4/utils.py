@@ -661,21 +661,11 @@ class Profiler:
 
         Why. Arming Kineto is per-process and unsynchronized, so the first
         RECORDED step otherwise absorbs the cost of turning the profiler on,
-        which real training never pays: job 36093 measured ranks entering step
-        52 up to 24.4 ms apart and the step running +66 ms (+21%), ~24 ms of it
-        drawn as exposed collective that does not exist untraced.
+        which real training never pays.
 
-        What it costs. The barrier does not delete the skew, it relocates it
-        into the WARMUP step, which is never exported -- so the first RECORDED
-        step comes out slightly optimistic. Comparing the same absolute step
-        barriered vs not (jobs 36446/36454, ``tr_ctl``, same node): wall
-        -2.94 ms (-0.9%) and NCCL -9.39 ms, against an unbarriered same-step
-        control of -0.20 and -2.02 ms. Both settings are wrong; off is +21%
-        pessimistic and on is ~-1% optimistic, so on is ~20x closer.
-
-        Consequence. The first recorded step is a boundary step, not a training
-        step. Steps 2..N are untouched. Arm-to-arm deltas are unaffected (every
-        arm is barriered identically); only the absolute level carries the ~1%.
+        The barrier relocates that skew into the WARMUP step, which is never
+        exported. The first recorded step is a boundary step, not a training
+        step. Steps 2..N are untouched.
 
         This is deliberately NOT done per step. A barrier on every step would
         serialize the pipeline's run-ahead and change the thing being measured;

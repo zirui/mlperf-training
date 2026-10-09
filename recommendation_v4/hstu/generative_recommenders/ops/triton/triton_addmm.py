@@ -1681,28 +1681,16 @@ _COLSUM_MIN_ROWS = 65536
 def triton_colsum(x: torch.Tensor) -> torch.Tensor:
     """sum(x, dim=0) for a tall row-major [M, N] matrix: the Linear bias grad.
 
-    WHY. aten::sum(dim=0) over the uvqk/vk projection gradients ([M,2048] x2
-    and [M,1024] x1 per step, M~2.28M bf16) splits into ~7 32-bit-indexable
-    sub-reductions plus a fill, and runs at 5.4 / 5.1 TB/s standalone on
-    MI350X (4.3 / 3.7 TB/s in the 1n trace). This two-stage split-M column
-    sum (fp32 partials [S, N], then an fp32 reduction over S, then one
-    rounding to x.dtype) streams 4 KiB rows at 6.5 / 6.2 TB/s: 1.726 -> 1.431
-    ms and 0.915 -> 0.751 ms (arbor dlrmv4_20260930 iter_8/colsum/mb.json).
+    aten::sum(dim=0) over a tall [M, N] matrix splits into several
+    32-bit-indexable sub-reductions. This two-stage split-M column sum uses
+    fp32 partials [S, N], then an fp32 reduction over S, then one rounding to
+    x.dtype.
 
-    NUMERICS. Same math as aten (fp32 accumulate, one final rounding to the
-    input dtype); only the fp32 summation order differs. At the production
-    shapes the bf16 result was bit-identical to aten::sum (0 differing
-    elements) for this config; other swept configs differed by at most 1 bf16
-    ulp in 1-2 of 2048 columns.
+    Same math as aten (fp32 accumulate, one final rounding to the input
+    dtype); only the fp32 summation order differs.
 
-    GATE. Gin default ON (yambda_5b.gin item (16)); absent or DLRM_HSTU_FP8_COLSUM=0 restores
-    the aten torch.sum path (the DLRM_HSTU_FP8_ prefix is forwarded by
-    launch_slurm.sh). Numerics: fp32 split accumulation, one bf16 rounding;
-    reduction order differs from aten, measured 0 differing bf16 elements at
-    the two production shapes (M=2277744, N=2048/1024), <=1 ulp elsewhere.
-    It was judged with the allocator pre-grow armed in BOTH bench arms, which
-    removes the hipMemMap growth stalls that made the CPU-ProfilerStep trace
-    gate unreadable for a ~1 ms/rank-step effect.
+    Gin default ON (yambda_5b.gin item (16)); absent or
+    DLRM_HSTU_FP8_COLSUM=0 restores the aten torch.sum path.
     """
     M, N = x.shape
     BLOCK_M, BLOCK_N, SPLITS_PER_CU = 32, 256, 2

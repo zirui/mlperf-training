@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """FlyDSL HSTU attention backward for gfx950 (MI350X).
 
 Deliberately empty of imports: `hstu_bwd_dkdv` pulls in the `flydsl` package at
@@ -35,14 +36,14 @@ def current_stream_launch() -> bool:
     apply_env_bootstrap.DLRM_HSTU_FP8_FLYDSL_CURRENT_STREAM).
 
     True: the FlyDSL attention fwd/bwd call() wrappers launch on
-    torch.cuda.current_stream(q.device) (Arbor iter 6, 5ae3127). False: they
+    torch.cuda.current_stream(q.device). False: they
     pass no stream, so launch() uses its default fx.Stream(None) -- HIP's null
-    stream, the exact pre-5ae3127 launch arguments. Not an FP8 knob; the
+    stream, the previous launch arguments. Not an FP8 knob; the
     prefix is only what launch_slurm.sh forwards into the container.
 
     The host-sync-free step ($DLRM_HSTU_FP8_SYNCFREE=1) requires True: it runs
     FlyDSL while torchrec side streams are current, where the null-stream
-    launch raced its producers (20/20 wrong outputs, Arbor iter 6 job 53750).
+    launch raced its producers and produced wrong outputs.
     Read per call (cheap) because the gin env bootstrap may run after import.
     """
     raw = _os.environ.get("DLRM_HSTU_FP8_FLYDSL_CURRENT_STREAM", "1")

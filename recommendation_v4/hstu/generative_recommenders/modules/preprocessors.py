@@ -251,25 +251,10 @@ class ContextualPreprocessor(InputPreprocessor):
         x: torch.Tensor,
         residual: torch.Tensor,
     ) -> torch.Tensor:
-        """`residual + mlp(x)`, folded into the MLP's last norm when F2 is on.
+        """`residual + mlp(x)`, folded into the MLP's last norm when enabled.
 
-        The shipped expression is a full [M, 512] read-modify-write against
-        HBM issued immediately after the MLP's final LayerNorm has just
-        finished writing that same tensor -- 2.369 ms/rank/step across the two
-        call sites, measured post-hoist so it is not double-counting item #3.
-        Handing the residual to the norm makes it an epilogue on a tile the
-        kernel already holds.
-
-        The fused epilogue rounds to the output dtype before adding, which is
-        what the shipped `+` does too (it adds a bf16 residual to an
-        already-stored bf16 norm output), so the FUSION's arithmetic is exact.
-        The container is not quite bit-identical: the residual makes a distinct
-        Triton autotune key, so the kernel is benchmarked again as a second
-        variant and picks a different num_warps, which moves rstd by an fp32
-        ulp. Pinned to one config the two agree exactly; as autotuned they
-        differ by ~2 bf16 ulp on ~2.7e-7 of elements, far below the
-        nondeterminism this model's 7.1M-atomic scatter_add_ backward already
-        has. No convergence gate of its own -- see _f2_module.py.
+        The fused path adds the residual inside the last norm. Otherwise this
+        is `residual + mlp(x)`.
         """
         if self._fuse_ln_residual:
             return mlp(x, residual=residual)

@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """R15 design B: dq for the full-FP8 (C8) attention backward without atomics.
 
 Default OFF ($DLRM_HSTU_FP8_BWD_DQ_SPLIT=1 arms it; see hstu_flydsl_mha).
@@ -42,7 +43,7 @@ def ws_header_bytes(batch: int) -> int:
 # token count.  A fresh torch.empty each call made the expandable-segments
 # allocator map new pages (hipMemMap) about once per rank-step inside the
 # attention backward, and under the host-sync-free step every map is a GPU
-# bubble (iter-14 traces: hipMemMap host time 0.56 -> 2.1 s per pairing).
+# bubble (hipMemMap host time 0.56 -> 2.1 s per pairing).
 # Keeping one buffer per device, rounded up to 1 GiB with geometric headroom
 # and regrown only when a call needs more, removes the per-call maps.  Contents are
 # never read before the fused kernel writes them (same as torch.empty), and
@@ -67,7 +68,7 @@ def _workspace(nbytes: int, device) -> torch.Tensor:
         # Geometric growth: need + 1/4, and at least 1.5x the previous size.
         # Streaming sequence lengths grow over the run; 1/8 headroom with
         # 1 GiB rounding regrew 11-14 times per device in a 200-step bench
-        # (iter 15), and every regrow is an allocator map stall.
+        # and every regrow is an allocator map stall.
         want = max(nbytes + nbytes // 4, old + old // 2)
         want = (want + _WS_ROUND - 1) // _WS_ROUND * _WS_ROUND
         buf = torch.empty(want, dtype=torch.uint8, device=device)
@@ -174,14 +175,14 @@ def dq_from_ds(ws: torch.Tensor, k: torch.Tensor, e8: torch.Tensor,
     """dq (bf16, row stride rs_dq elements, head stride D) from the workspace.
 
     k: e4m3 [T, H, D] view with row stride rs_k elements; e8: [T, H] uint8.
-    order: "bh" = (b, h)-major grid (iter-4 default); "xcd" = same grid with
-    the XCD-grouped pid remap (R15 iter 5: dense lens 6.6 -> 4.4 ms).
+    order: "bh" = (b, h)-major grid; "xcd" = same grid with
+    the XCD-grouped pid remap (dense lens 6.6 -> 4.4 ms).
     """
     assert order in ("bh", "xcd"), order
     B = seq_offsets.numel() - 1
     H, D = k.shape[1], k.shape[2]
     # 256 is excluded: its tile range t0..t0+3 is not bounded by 2*nb-1, so the
-    # last (b, h) can read past the workspace end (iter-6 review).
+    # last (b, h) can read past the workspace end.
     assert bmq in (64, 128), bmq
     U = triton.cdiv(int(N), bmq)
     if B <= 0 or U <= 0:

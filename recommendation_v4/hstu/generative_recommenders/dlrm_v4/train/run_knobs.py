@@ -18,7 +18,7 @@
 Kept out of train/utils.py so the decisions, and the exact "armed OK" strings a
 run log is checked for, are unit-testable on a CPU host without torch.
 
-  * metric cadence (ship-4 item 1): METRIC_LOG_FREQ is the console/TB metric
+  * metric cadence: METRIC_LOG_FREQ is the console/TB metric
     cadence; MLPERF_TRAIN_LOSS_LOG_FREQ the MLLOG train_loss cadence. They are
     independent.
   * training metrics off: METRIC_LOG_FREQ <= 0 (0 is the documented value and
@@ -29,9 +29,9 @@ run log is checked for, are unit-testable on a CPU host without torch.
   * MLPerf train_loss off: MLPERF_TRAIN_LOSS_LOG_FREQ <= 0 (gin default 0)
     emits no train_loss event and runs no loss all_reduce. MLPerf 6.1 does not
     require train_loss; every required MLLOG event is unaffected.
-  * eval pool workers (ship-4 item 2): EVAL_NUM_WORKERS sets num_workers of the
+  * eval pool workers: EVAL_NUM_WORKERS sets num_workers of the
     persistent eval DataLoader pool only; < 0 inherits the train pools'
-    NUM_WORKERS (the pre-ship-4 behaviour).
+    NUM_WORKERS.
 """
 
 from typing import Dict, Optional

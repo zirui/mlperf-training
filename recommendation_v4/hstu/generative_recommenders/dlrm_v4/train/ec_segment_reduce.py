@@ -1,81 +1,13 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Segmented row reduction for the EC dedup-expand backward.
 
-Replaces the global-atomic ``scatter_add_`` in
-:class:`~generative_recommenders.dlrm_v4.train.ec_bf16_output._CastExpandFp32Bwd`
-with a sort-then-reduce kernel.  Scoping and the closed alternatives are in
-``_scatter_add_design.md``; the short version:
+Replaces ``scatter_add_`` in ``_CastExpandFp32Bwd``. Each program owns one
+unique row and one column block, gathers that row's segment in tiles, and
+stores once. Segments longer than ``split_above`` finish with an atomic add.
 
-``scatter_add_`` on this call is the 4th largest kernel in the step at
-**17.4 ms/rank/step**, reducing 7,108,550 token rows into 69,256 unique rows --
-**102.6x duplication**, so ~103 atomic adds contend for every output row.  It
-runs **7.0x** off its own HBM floor, and the gap is atomic serialization, not
-bandwidth: the output is 142 MB against a 14.55 GB read.
-
-This kernel removes the contention instead of trying to stream it faster.  Each
-program owns one unique row and one column block, walks that row's segment
-accumulating in registers, and performs **one** non-atomic store.  No atomics,
-no read-modify-write.
-
-There is a second saving that the design note did not count.  Today's backward
-materializes ``grad_out.to(torch.float32)`` -- a full 14.55 GB fp32 temporary
-that is written and then read straight back by the scatter.  This kernel loads
-the bf16 gradient and upcasts **in registers**, so the tensor never exists:
-
-    today   write 14.55 GB (upcast) + read 14.55 GB (scatter) + 142 MB out
-    here    read   7.28 GB (bf16, upcast in-register)          + 142 MB out
-
-so the floor moves from 2.49 ms to ~1.25 ms and the upcast's own ~3.7 ms is
-deleted outright.
-
-**Why the segment is walked in CHUNKS, not row by row.**  The obvious inner
-loop -- ``src = tl.load(order_ptr + i)`` then ``tl.load(grad_ptr + src * W)``
--- is a *dependent* load chain: the gradient load's address does not exist
-until the index load returns, so a 103-row segment serializes ~103 HBM
-latencies and occupancy is the only thing hiding any of it.  That is the
-failure mode KernelForge's reduction card warns about (``local_knowledge/
-languages/triton/operators/reduction/tuning.md``: the thread-level pass is the
-bandwidth-bound part, the cross-lane combine is cheap -- so vectorize the
-load).  Instead each iteration loads ``BLOCK_S`` indices at once and issues a
-``[BLOCK_S, BLOCK_W]`` gather, giving ``BLOCK_S`` independent loads in flight,
-then folds the tile with ``tl.sum(axis=0)`` -- which lowers to the wave64
-shuffle reduce plus LDS combine.  One dependent chain per *chunk* rather than
-per row.
-
-**Ordering.**  TorchRec's dedup is hash-based and returns no permutation
-(``_dedup_indices`` stashes only ``reverse_indices``), so the ordering must be
-produced here.  ``argsort`` over 7.1M int64 is ~57 MB of index traffic -- a few
-percent of the prize, not the margin.
-
-**Numerics.**  Segment reduction changes the *order* of the fp32 adds.  Today's
-atomics are already nondeterministic, and ``dlrm_hstu.py:181-183`` records both
-orders scoring identically against a float64 reference, so this is expected to
-be fine -- but it is a reordering, and it owes a convergence A/B rather than an
-SNR check.  ``_seg_reduce_check.py`` scores it against float64 at production
-shape.
-
-**Measured at production shape** (``_seg_reduce_check.py``):
-
-    scatter_add_ (+ the fp32 upcast it needs)   16.763 ms
-    this, sort included                          2.668 ms    6.28x
-    this, ordering reused                        1.498 ms   11.19x   4.86 TB/s
-                                                                     = 83% of peak
-
-1.498 ms against a 1.25 ms HBM floor is 1.20x off -- the kernel is doing
-essentially nothing but streaming, which is the point.  Against the incumbent
-that is **-14.1 ms/rank/step = -4.86% of a 290.195 ms step**, ahead of the
-design note's "-12.4 ms even at 2x floor".  Accuracy improves rather than
-degrades: max error vs an fp64 reference is **0.61x** the incumbent's, because
-a segment tree reduce is better-conditioned than 103 racing atomics.
-
-⚠ **The measurement uses a SYNTHETIC uniform index distribution** (T/U = 102.6x
-duplication, segment lengths 64..148).  The real ``reverse_indices`` shape is
-not measured, and both the sort cost and the load balance depend on it: a
-skew=1.4 control run holds correctness and still wins 16.5x warm, but its sort
-costs 32 ms rather than 1.13 ms.  Before quoting the in-step delta, dump the
-real segment-length histogram.
-
-NOTHING IMPORTS THIS YET.  Wiring it into ``_CastExpandFp32Bwd.backward``
-belongs behind ``EC_SEGMENT_REDUCE`` and is a separate, gated change.
+The gradient is loaded as bf16 and upcast in registers. TorchRec's dedup does
+not return a permutation, so this kernel argsorts ``reverse_indices`` itself.
+The fp32 add order differs from ``scatter_add_``.
 """
 
 import logging
@@ -100,13 +32,10 @@ _NUM_WARPS: int = 2
 _BLOCK_W_CAP: int = 512
 _GPU_PLANNER: bool = False
 _FIXED_SIZE_OFFSETS: bool = False
-# DLRM_HSTU_FP8_EC_STRIDED_GRAD (gin default on, yambda_5b.gin item (13); absent = off): read a row-strided (column-slice view)
+# DLRM_HSTU_FP8_EC_STRIDED_GRAD (default on; absent = off): read a row-strided
 # gradient in place instead of materialising grad_out.contiguous() first.
-# The kernels load exactly the same elements in the same order (only the row
-# address uses the real row stride), so cold segments are bitwise identical and
-# hot pieces differ only by the pre-existing atomic-order nondeterminism; what
-# disappears is a full [T, W] bf16 read+write per call (artist/album grads are
-# column slices of the [N, 1024] cat gradient: 2 x ~0.94 ms/rank/step at 1n).
+# The kernels load the same elements in the same order. Cold segments match;
+# hot pieces differ only by atomic-add order.
 _STRIDED_GRAD: bool = os.environ.get("DLRM_HSTU_FP8_EC_STRIDED_GRAD", "0") != "0"
 
 
@@ -120,37 +49,18 @@ def configure_segment_reduce(
 ) -> None:
     """Set the segment-reduce kernel's launch geometry.
 
-    Plain setter, NOT a gin configurable: this module is imported lazily (to
-    keep triton off the import path of runs that do not arm the kernel), so it
-    is not registered when gin parses. The gin surface lives on
-    `ec_bf16_output.enable_segment_reduce`, which forwards into here -- that
-    module is light and is imported eagerly for exactly this reason.
-
-    DEFAULTS ARE MEASURED, not guessed (30-point sweep at production shape).
-    The spread across that sweep is 10x -- 1.488 ms at (32, 2, 512) against
-    14.50 ms at (8, 8, 256) -- so these are not free parameters.  Change one
-    only with a sweep behind it.
+    Plain setter, not a gin configurable: this module is imported lazily, so
+    it is not registered when gin parses. The gin surface is
+    `ec_bf16_output.enable_segment_reduce`.
 
     Args:
-      split_above: rows longer than this are cut into several pieces that
-        finish with an atomic add.  Segments average ~103 rows but are violently
-        non-uniform (production p50 43, p99 1,439, max 64,326), and a program
-        that owns a very hot row runs serially while its neighbours idle, so
-        this trades a handful of atomics for load balance.  1024 sits between
-        p99 and p999.  This exists for LOAD BALANCE, not occupancy: at ~54k
-        output rows the grid already fills the device.  0 disables splitting.
-      block_s: rows gathered per inner iteration -- the in-flight load count,
-        so this is what hides HBM latency.  The tile is [block_s, block_w] fp32
-        in registers.  Measured: 4 -> 3.70 ms, 8 -> 1.97, 16 -> 1.50,
-        32 -> 1.49, 64 -> 1.54.  Below 16 the kernel degenerates into a
-        dependent load chain, which is the whole cost this kernel removes.
-      num_warps: the sharp one, and the AMD trap.  2 wins EVERY one of the 10
-        (block_s, block_w) cells in the sweep, by 1.9-4.8x: 8 warps put two
-        waves on a SIMD at ~256 VGPR each and the tile spills to scratch.
-        Memory-bound Triton kernels on gfx950 want 2.
-      block_w_cap: upper bound on the width tile; the actual block_w is
-        min(next_pow2(W), block_w_cap), so at the production W=512 this is not
-        binding and exists to keep the register tile sane at wider embeddings.
+      split_above: rows longer than this are cut into pieces that finish with
+        an atomic add. 0 disables splitting.
+      block_s: rows gathered per inner iteration. The tile is
+        [block_s, block_w] fp32 in registers.
+      num_warps: warps per program. The default is 2; a wider tile spills.
+      block_w_cap: upper bound on the width tile. The actual block_w is
+        min(next_pow2(W), block_w_cap).
       gpu_planner: construct hot-piece metadata on the current GPU stream.
         Default off; reduction geometry and fp32 arithmetic stay unchanged.
       fixed_size_offsets: use exact GPU lower bounds in the incumbent sorted
@@ -303,12 +213,11 @@ def segment_reduce_rows(
     backward.  ``order``/``offsets`` may be supplied to reuse a prior sort.
     """
     # Both kernels address row t as grad_out + t * W, i.e. they assume a
-    # row-contiguous gradient. Since ec_merge_uih_candidate (iter 30) the
+    # row-contiguous gradient. Since ec_merge_uih_candidate the
     # artist/album expands feed torch.cat(dim=1) in ContextualPreprocessor, so
     # their incoming grads are column-slice VIEWS (row stride 2W): the kernel
     # read the wrong elements and those two tables' gradients were effectively
-    # uncorrelated with the true ones (rel-L2 err 1.41, eval_preproc_dedup /
-    # iter_31 dbg4). No-op for contiguous grads.
+    # uncorrelated with the true ones (rel-L2 err 1.41). No-op for contiguous grads.
     if _STRIDED_GRAD and grad_out.dim() == 2 and grad_out.stride(1) == 1:
         pass  # kernels take the row stride; no [T, W] copy
     elif not grad_out.is_contiguous():

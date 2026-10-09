@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """C8: bf16 dO -> e4m3 dO with device-side power-of-two block scales.
 
 Used only by the full-fp8 attention backward (f8b="all", do_blk=True), which
@@ -5,8 +6,8 @@ is gated behind $DLRM_HSTU_FP8_BWD_FULL (absent = OFF; gin default ON).
 
 One pow2 scale per (sequence, head, 32-token MX K-block group), no host sync.
 The earlier per-tensor variant (quantize_do_e4m3, kernel do_dyn) was removed
-on 2026-10-03: in-model dO rows span ~1e4 in magnitude and the single scale
-flushed 87-96% of dO elements to zero (Arbor 2026-10-02 iter 4), and nothing
+once block scales landed: in-model dO rows span ~1e4 in magnitude and the single scale
+flushed 87-96% of dO elements to zero, and nothing
 in the tree used it once the block scales became the only C8 path.
 """
 

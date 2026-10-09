@@ -75,7 +75,6 @@ _cont_mounts=(
     "--volume=${DATADIR}:/data"
     "--volume=${LOGDIR}:/results"
     "--volume=$(pwd):/workspace/code"
-    "--volume=$(pwd)/../../utilities:/workspace/utilities"
 )
 
 echo "Stopping all existing containers ..."

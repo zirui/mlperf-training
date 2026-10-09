@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # MLPerf Training reference script: verify the dataset.
 #
 # There are two supported layouts under ${DLRM_DATA_PATH}, and this script

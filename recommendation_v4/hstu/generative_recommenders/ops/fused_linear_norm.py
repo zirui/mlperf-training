@@ -1,31 +1,12 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # pyre-strict
 """F1: fold a Linear's bias gradient into the norm backward that follows it.
 
-WHAT IS BEING REMOVED. ContextualPreprocessor builds three MLPs, each
-Sequential(Linear, SwishLayerNorm, Linear, LayerNorm) -- six (Linear, Norm)
-pairs per step. For each pair autograd computes the Linear's bias gradient as a
-standalone aten::sum over the norm's dx. Measured on trace_ctl2 over 8 ranks x
-5 steps, per rank per step:
-
-    aten::sum [M, 512]   2.3425 ms    (the LayerNorm(512) side)
-    aten::sum [M, 256]   1.6183 ms    (the SwishLayerNorm(256) side)
-                         ------
-                         3.9608 ms
-
-That sum re-reads the entire [N, D] dx from HBM immediately after the norm
-backward has finished writing it. The column sum it wants is available for free
-while dx is still in registers, so the fused path computes it there and the
-reread is deleted outright. Both sides are HBM-bound, which is why the removal
-is worth more than the addition: the standalone sums run at 3.07 TB/s (D=512)
-and 2.22 TB/s (D=256) against the part's 5.84 TB/s, and a reduction that never
-touches HBM beats one that does at any bandwidth.
-
-WHAT IT COSTS. Measured directly by _f1_bench.py at the in-situ N=2358539,
-not estimated: the SUM_DX accumulator adds ~0.83 ms/rank/step across both
-sites at the shipped BLOCK_N=8 config, for a NET of +3.1314 ms/rank/step =
-+1.079% of the 290.195 ms step. No register spills at either shipped config;
-the D=256 swish kernel does go 180 -> 259 VGPRs (2 -> 1 wave/SIMD), which is
-already priced into that measured net.
+ContextualPreprocessor builds three MLPs, each Sequential(Linear,
+SwishLayerNorm, Linear, LayerNorm). For each pair autograd computes the
+Linear's bias gradient as a standalone aten::sum over the norm's dx. That sum
+re-reads dx from HBM after the norm backward has written it. The fused path
+computes the column sum while dx is still in registers.
 
 WHY A Sequential SUBCLASS AND NOT A NEW MODULE. The children, their order, and
 their attribute names are unchanged, so state_dict keys stay exactly
@@ -41,10 +22,7 @@ LayerNorm/SwishLayerNorm and the 3-tuple triton_weighted_layer_norm_bwd -- and
 its six external unpack sites -- are untouched.
 
 NUMERICS. dxsum reduces the fp32 dx still in registers, where aten::sum reduces
-the bf16 dx after it was stored. This is the MORE accurate of the two, but it
-is not bit-identical: measured relative difference 1.6-2.1e-3, the bf16
-rounding scale. That is why this arm owes a convergence gate and not merely a
-timing gate.
+the bf16 dx after it was stored. The two are not bit-identical.
 """
 
 import logging
@@ -79,8 +57,7 @@ def _norm_fwd(
     call LayerNormFunction.forward makes. The swish side has no such wrapper --
     SwishLayerNormFunction.forward launches _weighted_layer_norm_fwd inline --
     so that launch is mirrored here argument for argument. Both must stay
-    identical to the shipped forward, because F1 is a BACKWARD-only change and
-    any forward difference would make the A/B unattributable.
+    identical to the shipped forward. F1 changes only the backward.
 
     F2 adds the optional `residual`. When it is given the result is
     ``LN(x) + residual`` computed in ONE pass, replacing a separate [M, D]
@@ -89,8 +66,7 @@ def _norm_fwd(
     is a registered torch.library custom op, so extending its schema would
     change the op signature for every existing caller. Launching the kernel
     inline here instead leaves the shipped wrapper untouched, which is also why
-    the ADD_RESIDUAL=False path below still routes through it unchanged --
-    the control arm must stay byte-identical to today.
+    the ADD_RESIDUAL=False path below still routes through it unchanged.
     """
     if not is_swish and residual is None:
         return triton_weighted_layer_norm_fwd(x=x, weight=weight, bias=bias, eps=eps)
@@ -308,17 +284,10 @@ class FusedLinearNormMLP(torch.nn.Sequential):
         return True
 
     def _report_once(self, fused: bool, x: torch.Tensor) -> None:
-        """Say, from inside the fused path, whether it actually fused.
+        """Log whether this forward actually fused.
 
-        make_model's "armed OK: fuse_linear_norm ACTIVE" line fires at model
-        CONSTRUCTION -- it proves the gin flag reached the process, and nothing
-        more. _can_fuse is evaluated per forward and bails to nn.Sequential on
-        the non-Triton ladder rungs, so a run can print ACTIVE and still never
-        fuse a single pair. That is the inert-arm failure mode in its most
-        flattering form: the campaign's arming check passes, the A/B measures
-        nothing, and the delta reads as a null result for the optimization
-        rather than for the plumbing. This line is emitted by the code that
-        does the work, which is the only kind of proof worth having.
+        The construction log only shows that the flag was set. `_can_fuse`
+        can still decline and run `nn.Sequential`.
         """
         self._f1_reported = True
         if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
@@ -349,10 +318,8 @@ class FusedLinearNormMLP(torch.nn.Sequential):
         not to each intermediate norm -- so it is threaded to the final
         iteration and nowhere else.
 
-        When the fused path declines (`_can_fuse` false, e.g. a non-Triton
-        ladder rung) the residual is added the shipped way, outside. That is a
-        fallback in the mechanism, not in the semantics: the value is identical
-        either way, so no arm can be inert without the F1 report saying so.
+        When the fused path declines, the residual is added outside. The value
+        is the same either way.
         """
         can = self._can_fuse(x)
         if not self._f1_reported:

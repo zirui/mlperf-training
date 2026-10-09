@@ -1,64 +1,17 @@
-"""bf16 EC output: cast the *unique* rows, not the expanded ones.
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""bf16 EC output: cast the unique rows, then expand.
 
-TorchRec's index dedup hands
-``torchrec.modules.utils.construct_jagged_tensors`` a **unique-row** embedding
-tensor plus ``reverse_indices``, and expands it to one row per token *inside*
-the call::
+``construct_jagged_tensors`` receives a unique-row embedding tensor plus
+``reverse_indices`` and gathers one row per token. This patch casts those
+unique rows to bf16 before the gather when the consumer is bf16.
 
-    expanded_indices = reverse_indices.unsqueeze(1).expand(-1, embeddings.size(-1))
-    embeddings = torch.gather(embeddings, 0, expanded_indices)
+The forward matches ``gather`` then ``to(bf16)``: gather is a copy, so the
+cast commutes with it. The backward upcasts the incoming gradient to fp32 and
+reduces in fp32.
 
-At this model's yambda-5b shape that is 69,256 unique rows against 7,108,550
-token rows -- **102.6x**. Everything downstream of the expand on the three big
-UIH features runs in bf16 anyway (``modules/dlrm_hstu.py:645`` casts
-``item_id`` explicitly; autocast casts the ``cat`` of ``artist_id`` and
-``album_id`` at ``_additional_embedding_mlp``), so the fp32 rows are produced
-only to be rounded one op later.
-
-What the hoist removes, measured on a both-arms trace
-(steady steps 53-55, per rank per
-step; the join keys ``(rank, External id)`` because External id is a
-per-process namespace):
-
-=========================================================  =========  =========
-component                                                     today     hoisted
-=========================================================  =========  =========
-``aten::gather`` -- the expand                              3.838 ms    ~1.98
-``embedding.to(bf16)``  [2.37M, 512]   (dlrm_hstu.py:645)   1.207 ms    deleted
-autocast cast [2.37M, 1024] at ``_additional_embedding_mlp``2.521 ms    deleted
-``aten::cat`` dim=1 of the two additional features          3.189 ms    ~1.77
-new: cast of the unique rows [69k, 512]                          --     0.04 ms
-``aten::cat`` of 11 keys under ``SplitWithSizesBackward0``  5.797 ms    ~2.9
-the two ``ToCopyBackward0`` partners (1.248 + 2.521)        3.769 ms    deleted
-new: one bf16->fp32 upcast of the [T,512] gradient               --     ~3.7 ms
-``aten::scatter_add_``                                     18.394 ms  unchanged
-=========================================================  =========  =========
-
-**The forward is bitwise exact.** ``gather`` is a pure copy, so
-``gather(x, i).to(bf16)`` and ``gather(x.to(bf16), i)`` produce identical bit
-patterns, and the same commutation holds for the ``cat`` on the
-additional-feature path. ``_bf16ec_verify.py`` checks both as raw int16 bit
-patterns, and checks the patched ``construct_jagged_tensors`` against the
-unpatched one at production shape.
-
-**The backward is deliberately NOT changed.** Letting the expand's backward run
-in bf16 would accumulate ~103 duplicates per unique row in bf16 instead of
-fp32 -- a real numerics change needing a convergence A/B, not an SNR check.
-:class:`_CastExpandFp32Bwd` therefore owns both halves: the forward casts and
-gathers in bf16, and the backward **upcasts the incoming bf16 gradient to fp32
-and runs ``scatter_add_`` in fp32**. The accumulator dtype, the accumulator
-shape and the set of atomic adds are exactly what they are today. That upcast
-is relocated, not added: today the same 7.1M x 512 of rows are upcast anyway,
-as the ``ToCopyBackward0`` partners of the two deleted forward casts.
-
-**Only large key-segments are hoisted.** ``construct_jagged_tensors`` splits the
-expanded tensor by ``length_per_key``, and not every key's consumer is in bf16:
-``DlrmHSTU._item_forward`` runs ``_item_embedding_mlp`` on the candidate-side
-features **outside any autocast**, so handing it bf16 would raise on the fp32
-weight. Segments below ``min_rows`` are therefore re-expanded from the original
-fp32 tensor and substituted back, which is bitwise identical to today for those
-keys. At this model's shape that is 8 segments of 1024 rows against 3 of
-~2.37M -- 0.1% of the rows, and the re-gather is free.
+Segments smaller than ``min_rows`` stay in the original dtype. The candidate
+item MLP runs outside autocast, so a bf16 tensor there would not match its
+fp32 weight.
 """
 
 import logging
@@ -81,29 +34,14 @@ _BWD_CHUNK_ROWS: int = 0
 # A key-segment smaller than this keeps its original dtype (see the docstring).
 _MIN_ROWS: int = 100_000
 
-# Replace the backward's ``scatter_add_`` with the sort-then-segment-reduce
-# kernel in ``ec_segment_reduce``.  Default OFF: this is the arm of a ladder,
-# not a default, until the ladder says otherwise.  Standalone at the production
-# shape it is 16.763 -> 2.668 ms (6.28x) sort included; see that module.
-#
-# Set by ``enable_segment_reduce()``, which ``make_model`` calls when the gin
-# param ``make_model.ec_segment_reduce`` is true -- NOT by an import-time read
-# of ``os.environ``.  An import-time constant cannot be reported in gin's
-# operative config, so a run could not say what it had been built with; every
-# other arm in this stack is a gin param and this one now matches.
+# Replace the backward's scatter_add_ with the kernel in ec_segment_reduce.
+# Set by enable_segment_reduce(), which make_model calls from the gin param.
 _SEGMENT_REDUCE: bool = False
-# One-shot dump of the REAL reverse_indices segment-length distribution.  The
-# kernel's standalone numbers were taken on a synthetic uniform index draw, and
-# both the sort cost and the load balance depend on the real shape, so this is
-# how that assumption gets checked against the training path rather than argued.
+# Dump the reverse_indices segment-length distribution. Default off.
 _SEG_HIST: bool = False
 _SEG_ARMED_LOGGED: bool = False
-# The histogram is a RUNNING MAX on T, not a one-shot.  A "log the first call"
-# guard samples whichever call happens to come first, and at step 0 of window 0
-# that is the SMALLEST call in the run -- the first probe reported T=12288
-# U=4076 dup=3.01x, an early short-history window, when the call this
-# optimization exists for is ~580x larger.  Logging only on a new maximum means
-# the LAST line printed describes the dominant call.
+# Log the histogram on a new maximum token count, so the last line is the
+# largest call rather than whichever call happens first.
 _SEG_HIST_MAX_T: int = 0
 
 
@@ -128,7 +66,7 @@ _SEG_HIST_MAX_T: int = 0
 #
 # Numerics: forward bitwise identical (the concat is a pure copy and cast;
 # the candidate rows are rounded fp32->bf16 by the gather's up-front cast
-# rather than by the concat's store -- both RNE; eval/eval_ec_merge.py checks
+# rather than by the concat's store -- both RNE; a bit-level check confirms
 # raw bits). Backward: the same fp32 addends in fp32 accumulators, summed in
 # a different order (per key instead of one pass; candidate-row merged
 # gradients join the segment reduce instead of the fp32 gather backward).
@@ -155,19 +93,12 @@ def enable_ec_merge_uih_candidate(pairs: List[Tuple[str, str]]) -> None:
     )
 
 
-# DLRM_HSTU_FP8_EC_CAT_FUSE (default on; =0 disables): the ContextualPreprocessor concatenates the
-# merged artist_id/album_id expands along dim=1 ([N,512]+[N,512] -> [N,1024],
-# 1.68 ms/rank/step at 1n) and the cat's backward hands each expand a
-# column-slice gradient that the segment reduce then copies contiguous
-# (2 x 0.94 ms). When every key of the registered group is merged in one call
-# with equal row counts, ONE expand is issued with the per-key indices
-# interleaved row-wise ([idx_a[0], idx_b[0], idx_a[1], ...]); its [k*N, W]
-# output viewed as [N, k*W] IS the cat, byte for byte. Each key's values are
-# column views of it, tagged with CATFUSED_ATTR so the preprocessor can use
-# the base instead of torch.cat. The backward is one segment reduce over the
-# contiguous [k*N, W] gradient (same per-row addends; the keys index disjoint
-# unique rows, and the stable argsort keeps each segment in ascending token
-# order, so the sums are the incumbent's up to the hot-piece atomics).
+# DLRM_HSTU_FP8_EC_CAT_FUSE (default on; =0 disables): when every key of the
+# registered group is merged in one call with equal row counts, one expand
+# writes the concatenated layout. Its [k*N, W] output viewed as [N, k*W] is
+# the cat. Each key is a column view, tagged with CATFUSED_ATTR so the
+# preprocessor uses that base instead of torch.cat. The backward is one
+# segment reduce over the contiguous gradient.
 _CAT_GROUP: List[str] = []
 CATFUSED_ATTR: str = "_dlrmv4_catfused"
 _CAT_LOGGED: bool = False
@@ -366,52 +297,24 @@ def enable_segment_reduce(
 ) -> None:
     """Arm the sort-then-segment-reduce backward for the hoisted EC expand.
 
-    This is the third rung of the measured ladder (`+4.37%` e2e on top of
-    `ec_bf16_output`).  It replaces `scatter_add_` -- which serialises ~7.9M
-    token rows into ~54k unique rows through global atomics -- with a sort that
-    makes each output row a contiguous segment one program folds with `tl.sum`,
-    so there is no atomic on the cold path.
+    It sorts token rows so each output row is a contiguous segment, then folds
+    that segment with `tl.sum`. Cold segments store once. Hot pieces still use
+    an atomic add.
 
-    Arm it with `make_model.ec_segment_reduce = True` (the gin binds
-    `$EC_SEGMENT_REDUCE`), never by calling this directly: `make_model` is where
-    the `ec_bf16_output` precondition is enforced, and this function does not
-    re-check it.
+    Turn it on with `make_model.ec_segment_reduce = True`. `make_model` checks
+    that `ec_bf16_output` is on; this function does not.
 
-    NOT bit-identical to `scatter_add_`, and cannot be: atomics accumulate in
-    nondeterministic order, so there are no bits to match.  Both were scored
-    against an fp64 `index_add_` reference instead and the segment kernel's max
-    error is 0.61x the incumbent's -- better conditioned than what it replaces.
-    It carries a 3-seed convergence gate (delta 0) for that reason; see
-    `docs/perf_opt.md`.
+    Reduction order differs from `scatter_add_`. Both are nondeterministic.
 
     Args:
-      seg_hist: dump the REAL `reverse_indices` segment-length distribution.
-        Diagnostic, default off.  The kernel's standalone 6.28x was measured on
-        a synthetic UNIFORM index draw while production is violently skewed
-        (p50 43, p99 1,439, max 64,326), and both the sort cost and the load
-        balance depend on that shape -- this is how the assumption gets checked
-        against the training path rather than argued.  Costs a `bincount` plus a
-        `quantile` on each new maximum-size call, so leave it off for timing.
-
-      gpu_planner: keep hot-piece planning on the GPU. Preserves the host
-        planner's piece boundaries and fp32 reduction arithmetic; hot-piece
-        atomic accumulation remains nondeterministic. Default off.
+      seg_hist: dump the `reverse_indices` segment-length distribution.
+        Default off.
+      gpu_planner: keep hot-piece planning on the GPU. Default off.
       fixed_size_offsets: construct offsets on the GPU using the unchanged
-        argsort order. Requires the EC caller's valid IDs in [0, num_rows).
-        Independent of gpu_planner; default off.
-
-      split_above, block_s, num_warps, block_w_cap: the kernel's launch
-        geometry, forwarded verbatim to `ec_segment_reduce`.  They live on THIS
-        function rather than on that module's own `configure_segment_reduce`
-        because `ec_segment_reduce` imports triton and so is imported lazily,
-        which puts it past the point where gin parses -- a knob bound there
-        would raise "No configurable matching".  Full per-argument notes,
-        including the sweep each default came from, are in that function's
-        docstring; the headline is that the 30-point sweep spans 10x
-        (1.488 ms at (32, 2, 512) against 14.50 ms at (8, 8, 256)), so these
-        are MEASURED defaults, not free parameters.  `num_warps` is the sharp
-        one: 2 wins every cell of the sweep by 1.9-4.8x because 8 warps spill
-        the register tile to scratch on gfx950.
+        argsort order. Requires valid IDs in [0, num_rows). Default off.
+      split_above, block_s, num_warps, block_w_cap: launch geometry, forwarded
+        to `ec_segment_reduce`. They are bound here because that module imports
+        triton and is loaded lazily, after gin parses.
     """
     if type(gpu_planner) is not bool or type(fixed_size_offsets) is not bool:
         raise ValueError("gpu_planner and fixed_size_offsets must be booleans")
@@ -464,10 +367,7 @@ def _segment_reduce_backward(
 ) -> tuple:
     """``scatter_add_`` replaced by sort-then-segment-reduce.
 
-    Deliberately does NOT fall back.  A knob that silently does nothing and a
-    knob that does nothing useful are indistinguishable in a step time, and
-    this one is measured as an A/B arm -- an inert arm would be read as a null
-    result rather than as a broken one.
+    Does not fall back. A request that cannot run raises.
     """
     global _SEG_ARMED_LOGGED, _SEG_HIST_MAX_T
     if _BWD_CHUNK_ROWS > 0:
@@ -602,10 +502,7 @@ def enable_bf16_ec_output(out_dtype: torch.dtype = torch.bfloat16) -> bool:
         seq_vbe_ctx=None,
         use_gather_select: bool = False,
     ):
-        # Engage only on the path this was measured on: dedup on (there is an
-        # expand to hoist above), gather-select on (so the backward being
-        # preserved really is scatter_add_), no VBE reindex (fbgemm's permute
-        # runs after the expand and is out of scope), and an fp32 input.
+        # Dedup on, gather-select on, no VBE reindex, and an fp32 input.
         if (
             reverse_indices is None
             or not use_gather_select

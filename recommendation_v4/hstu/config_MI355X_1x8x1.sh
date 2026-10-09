@@ -1,4 +1,5 @@
 #!/bin/bash
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # MLPerf DLRMv4 Configuration for MI355X (1x8x1), global batch 8192
 
 export DGXSYSTEM=MI355X_1x8x1

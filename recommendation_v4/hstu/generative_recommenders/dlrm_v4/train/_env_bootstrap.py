@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Gin-driven env-var bootstrap.
 
 Some env vars must be set *before* certain modules import (e.g. Triton's
@@ -18,19 +19,8 @@ import gin
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-# The certified FP8 HSTU forward arm: the exact knob set Plan 09 measured and
-# docs/perf_opt.md reports (-7.05% ms/step, +7.59% samples/s, samples-to-AUC
-# identical seed for seed against the paired bf16 arm).
-#
-# It is ONE named unit rather than eighteen separate bindings because a run that
-# gets seventeen of them right is not a weaker version of this arm, it is a
-# different and unmeasured one. The memory sweep shows how sharp that edge is:
-# FUSE_QKV and ATTN together recover 10.23 of the 14.23 GiB the fused path costs,
-# and dropping either one lands back at +14.23 GiB.
-#
-# The evidence for each value lives in the FP8 section of
-# train/gin/yambda_5b.gin. A pre-set environment variable still wins per knob,
-# so an A/B can move exactly one and hold the rest of the arm.
+# The FP8 HSTU forward knob set. It is one unit: a partial set is a different
+# configuration. A pre-set environment variable still wins per knob.
 _FP8_FORWARD_ARM: Dict[str, str] = {
     # e4m3 operands for the HSTU linear layers, and for attention q/k/v.
     "DLRM_HSTU_FP8_GEMM": "1",
@@ -44,9 +34,8 @@ _FP8_FORWARD_ARM: Dict[str, str] = {
     "DLRM_HSTU_FP8_FUSE_RESIDUAL": "1",
     "DLRM_HSTU_FP8_FUSE_RESIDUAL_ALGORITHM": "1",
     # Keep the e4m3 uvqk pack so the backward re-reads it instead of
-    # recomputing the projection. All three HSTU layers as of 2026-09-10
-    # (was layer 1 only). One pack is 3.26 GiB, hence a layer mask; the
-    # extra layers measured at zero HBM cost.
+    # recomputing the projection. All three HSTU layers. A layer mask selects
+    # which layers keep the pack.
     "DLRM_HSTU_FP8_SAVE_UVQK": "1",
     "DLRM_HSTU_FP8_SAVE_UVQK_LAYERS": "0,1,2",
     "DLRM_HSTU_FP8_EARLY_RELEASE_UVQK": "1",
@@ -64,10 +53,8 @@ _FP8_FORWARD_ARM: Dict[str, str] = {
 }
 
 # The knobs that actually engage FP8 compute. Any of these set without the
-# master switch is a partial arm nothing has measured, so it fails loudly rather
-# than degrading silently -- this campaign already paid for that failure once,
-# when six "control" jobs inherited an FP8 environment from the submitting shell
-# and reported a -0.24% A/B before anyone noticed.
+# master switch is a partial configuration, so it fails loudly rather than
+# degrading silently.
 # Spelled out rather than imported from ops/blas_solution_pins.py, which owns
 # them: this module exists to set env vars BEFORE the heavy imports, and that
 # module imports torch. Keep the two spellings in step by hand -- a bootstrap
@@ -108,7 +95,7 @@ def _truthy(raw: Optional[str]) -> bool:
     return (raw or "").strip().lower() in ("1", "true", "on", "yes")
 
 
-# Folded into DLRM_HSTU_FP8_BWD_FULL (C8) on 2026-10-03: block dO scales and
+# Folded into DLRM_HSTU_FP8_BWD_FULL: block dO scales and
 # the saturating cast are now its only code path. Kept as names only so a
 # stale opt-out fails loudly instead of being silently ignored.
 _REMOVED_C8_KNOBS: Tuple[str, ...] = (
@@ -248,12 +235,8 @@ def apply_env_bootstrap(
         os.environ[_PIN_ENV] = GR_PIN_BF16_BLAS_SOLUTIONS
         logger.info("env bootstrap: %s=%s", _PIN_ENV, os.environ[_PIN_ENV])
 
-    # Pinning only takes effect with TunableOp enabled and its tuning sweep off,
-    # so those are set here too rather than left to the caller. Getting that
-    # combination wrong is silent in the worst way: with tuning ON, TunableOp
-    # sweeps every new token count instead of honouring the pin, which costs
-    # minutes per step; with TunableOp OFF the pins are simply ignored and the
-    # run looks like a null result. Both were hit during development.
+    # Pinning needs TunableOp enabled and tuning off. Tuning on ignores the
+    # pin and retunes every new token count. TunableOp off ignores the pins.
     if os.environ.get(_PIN_ENV, "0") not in ("0", ""):
         os.environ.setdefault("PYTORCH_TUNABLEOP_ENABLED", "1")
         os.environ.setdefault("PYTORCH_TUNABLEOP_TUNING", "0")
@@ -276,8 +259,7 @@ def apply_env_bootstrap(
     # RAISES on a layer no STUStack owns.
     _bind_bool("DLRM_HSTU_FP8_FWD", DLRM_HSTU_FP8_FWD)
     if os.environ.get("DLRM_HSTU_FP8_FWD", "0") == "1":
-        # _bind_value honors a pre-set env var, so per-knob A/B overrides win
-        # over the arm while the rest of it holds.
+        # _bind_value honors a pre-set env var over the preset.
         for name, value in _FP8_FORWARD_ARM.items():
             _bind_value(name, value)
         # HSTU_ATTN_FWD=flydsl (the gin default) with this switch on selects
@@ -297,20 +279,14 @@ def apply_env_bootstrap(
                 "against that arm."
             )
 
-    # The backward arm is one switch and nothing else. bwd_fp8.py reads it
-    # directly and carries the measured values for the four tunables, so there
-    # is no preset to expand here and no partial arm to fail on: the forward's
-    # two-tier guard exists because seventeen knobs can be combined into an
-    # unmeasured configuration, and one knob cannot.
+    # The backward is one switch. bwd_fp8.py reads it directly.
     _bind_bool("DLRM_HSTU_FP8_BWD", DLRM_HSTU_FP8_BWD)
     # Attention-backward qk GEMM math. Independent of the projection-dgrad
     # switch above. Default fp8: k128 MFMA on calls whose q and k are already
     # e4m3 (calibration stays bf16 math). Opt out with QK_MFMA=bf16.
     _bind_value("DLRM_HSTU_FP8_BWD_QK_MFMA", DLRM_HSTU_FP8_BWD_QK_MFMA)
 
-    # Arbor 2026-09-30 units (C8, C4, C5), each a separate measured increment and each read
-    # per call by its kernel module (absent = off). See the gin file for the
-    # evidence and the numerics class of each.
+    # Each backward unit is read per call by its kernel module (absent = off).
     # C8 always runs with its numerics fix: per-(sequence, head, MX token
     # group) dO scales (DOBLK) and the saturating e4m3 cast (SAT). Those used
     # to be separate knobs; they are now the only C8 path.
@@ -365,7 +341,7 @@ def apply_env_bootstrap(
     _bind_value("DLRM_HSTU_FP8_ALLOC_PREGROW", DLRM_HSTU_FP8_ALLOC_PREGROW)
     # The sync-free step launches FlyDSL work while torchrec side streams are
     # current; on the legacy null-stream launch that raced its producers (20/20
-    # wrong outputs, Arbor iter 6). Refuse the combination at startup.
+    # wrong outputs). Refuse the combination at startup.
     if (
         os.environ.get("DLRM_HSTU_FP8_SYNCFREE", "0") == "1"
         # Same deny-list parse as ops/flydsl current_stream_launch(), so the
@@ -376,16 +352,12 @@ def apply_env_bootstrap(
         raise RuntimeError(
             "DLRM_HSTU_FP8_SYNCFREE=1 requires DLRM_HSTU_FP8_FLYDSL_CURRENT_STREAM=1: "
             "the legacy FlyDSL null-stream launch races side-stream producers "
-            "(20/20 wrong outputs in Arbor iter 6). Set "
+            "(the launch raced its producers and produced wrong outputs). Set "
             "DLRM_HSTU_FP8_SYNCFREE=0 to test the legacy launch stream."
         )
 
-    # The backward has only ever been measured on top of the FP8 forward. A
-    # bf16 forward with an FP8 backward is a combination nothing has
-    # benchmarked or converged, and now that both default ON it is what a
-    # launcher lands on by opting out of the forward alone -- which is exactly
-    # how a non-gfx950 host opts out. Raise rather than run it: the same
-    # fail-closed rule the rest of this arm follows.
+    # An FP8 backward requires the FP8 forward. Opting out of the forward
+    # alone is how a non-gfx950 host selects bf16, so both must be off together.
     if (
         os.environ.get("DLRM_HSTU_FP8_BWD", "0") == "1"
         and os.environ.get("DLRM_HSTU_FP8_FWD", "0") != "1"

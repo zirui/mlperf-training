@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Stage the DLRMv4 dataset from shared storage onto node-local disk.
 # Skips files that are already the right size. Writes ${DST}/.stage_complete on success.
 set -uo pipefail

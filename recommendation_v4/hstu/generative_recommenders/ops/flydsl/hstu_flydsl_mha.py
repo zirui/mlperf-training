@@ -1,17 +1,12 @@
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """HSTU jagged attention with FlyDSL forward and backward kernels, each optional.
 
 THE TWO HALVES ARE SELECTED INDEPENDENTLY, because HSTU has no softmax: the
 forward hands the backward no lse and no rowsum(dO*O), so nothing couples them.
-$HSTU_ATTN_BWD defaults to flydsl and is worth -10.77% step time. $HSTU_ATTN_FWD
-defaults to **flydsl** in gin (FlyDSL e4m3 forward + fused-silu when
-DLRM_HSTU_FP8_FWD is on). $HSTU_ATTN_FWD=triton is the opt-out. The bf16
-FlyDSL forward is the same knob with FP8 off:
-bit-identical, -19.6% on the traced attention forward, e2e UNRESOLVED --
-+0.41% over 3 pairs with a 95% CI of [-2.07%, +2.88%] against a +1.28%
-ceiling. See hstu_attention_forward_e2e.md (git history at 33610d2).
-
-That the forward's e2e contribution is smaller and harder to measure than the
-backward's is also why its `$HSTU_ATTN_FWD_DUMP_LENS` hook below exists.
+$HSTU_ATTN_BWD defaults to flydsl. $HSTU_ATTN_FWD defaults to **flydsl** in gin
+(FlyDSL e4m3 forward + fused-silu when DLRM_HSTU_FP8_FWD is on).
+$HSTU_ATTN_FWD=triton is the opt-out. The bf16 FlyDSL forward is the same knob
+with FP8 off. `$HSTU_ATTN_FWD_DUMP_LENS` below dumps the forward lengths.
 
 `hstu_mha` mirrors the signature of
 `generative_recommenders.ops.triton.triton_hstu_attention.triton_hstu_mha`, so
@@ -22,9 +17,8 @@ behind $HSTU_ATTN_BWD, which **defaults to flydsl** (gin:
 TWO KINDS OF "CAN'T RUN", DELIBERATELY HANDLED DIFFERENTLY.
 
   * The HOST cannot run it -- not a gfx950 GPU, or flydsl is not installed.
-    That is a property of the whole process, it makes every backward ~2x
-    slower, and now that flydsl is the default it would otherwise be an
-    invisible regression. So it RAISES `FlyDSLUnavailableError` on first use
+    That is a property of the whole process. FlyDSL is the default, so a
+    missing install raises `FlyDSLUnavailableError` on first use
     rather than degrading. Opt out explicitly with $HSTU_ATTN_BWD=triton.
   * The SHAPE cannot be served -- see SPECIALIZATIONS below. That is per call
     and legitimately varies across configs and tests, so it falls back to the
@@ -41,14 +35,11 @@ it cannot serve is slower, never wrong:
   * causal, max_attn_len == 0, contextual_seq_len == 0
   * num_targets is None, or every entry is <= 1
 
-  The last one deserves its reason. HSTU's target-aware masking clamps positions
-  to max_ids = seq_len - n_targets and then applies the ordinary >= mask to the
-  clamped values. At n_targets = 1 the only affected position is seq_len-1, which
-  clamps to itself, so the clamp is an identity and plain causal is exactly right
-  -- measured BIT-IDENTICAL against Triton at num_targets=1, and genuinely
-  different at 2 and 8. yambda-5b sets hstu_config.max_num_candidates = 1, so
-  this covers production, but a config that raises it must fall back rather than
-  quietly compute the wrong function.
+  HSTU's target-aware masking clamps positions to max_ids = seq_len - n_targets
+  and then applies the ordinary >= mask. At num_targets = 1 the clamp is the
+  identity, so plain causal is the same function. At num_targets > 1 it is not.
+  yambda-5b sets hstu_config.max_num_candidates = 1. A config that raises it
+  falls back rather than computing the wrong mask.
 
   `heads` is a compile-time constant (it keys the kernel cache) -- not a
   correctness limit, just a fresh JIT per distinct head count. max_seq_len is NOT
@@ -56,10 +47,9 @@ it cannot serve is slower, never wrong:
   it per batch as max_uih_len + num_candidates.
 
 NON-DETERMINISM.  dq is accumulated with global atomics, so the order of the
-float adds varies run to run and dq is NOT bitwise reproducible. dk and dv are
-deterministic and come back bit-identical (dv) or within a few ulps (dk) of
-Triton. Run-to-run dq agreement is ~144 dB, i.e. reassociation only. A caller
-needing bitwise reproducibility across runs must use the Triton path.
+float adds varies run to run and dq is not bitwise reproducible. dk and dv are
+deterministic. A caller that needs bitwise reproducibility must use the Triton
+path.
 """
 
 from __future__ import annotations
@@ -120,13 +110,7 @@ _e1_bwd_calls: int = 0
 def _maybe_dump_lengths(seq_offsets: torch.Tensor) -> None:
     """Save one batch's sequence lengths to $HSTU_ATTN_FWD_DUMP_LENS, once.
 
-    The offline benchmark samples lengths from a saved pool, and which pool it is
-    decides the measured speedup: the same kernel scored 2.02x against a pool with
-    a 3x length spread and 1.19x against production's, because a bound-sized grid
-    penalises the two kernels differently when the bound exceeds the work. So the
-    pool has to come from here rather than from a plausible-looking file.
-
-    Off unless the variable is set, and writes exactly once per process.
+    Off unless the variable is set. Writes once per process.
     """
     path = os.environ.get("HSTU_ATTN_FWD_DUMP_LENS", "")
     if not path:
@@ -405,7 +389,7 @@ def bwd_qk_mfma_mode() -> str:
     return "fp8"
 
 
-# Removed 2026-10-03: block dO scales (DOBLK) and the saturating cast (SAT)
+# Removed: block dO scales (DOBLK) and the saturating cast (SAT)
 # are the only C8 path now. An off value must not be silently ignored.
 _REMOVED_C8_KNOBS = ("DLRM_HSTU_FP8_BWD_FULL_DOBLK", "DLRM_HSTU_FP8_BWD_FULL_SAT")
 
@@ -431,11 +415,8 @@ def bwd_full_fp8_enabled() -> bool:
         "1", "true", "on", "yes")
 
 
-# $DLRM_HSTU_FP8_BWD_FULL_HYBRID = dq | dkdv (default unset; DIAGNOSTIC ONLY:
-# it runs BOTH backward kernels per call, so it is slower than either). With
-# the full-fp8 backward armed, the bf16-backward kernel's dq (resp. dk and dv)
-# replaces the full-fp8 kernel's. It isolates which gradient's fp8 error owns
-# a convergence deficit at L1 without writing a new kernel.
+# $DLRM_HSTU_FP8_BWD_FULL_HYBRID = dq | dkdv (default unset). Diagnostic only:
+# it runs both backward kernels and keeps one gradient from each.
 _hybrid_force_off = [False]
 _hybrid_inner = [False]
 
@@ -608,7 +589,7 @@ def _dq_split_order(N: int) -> str:
     """Grid order of the dq-split kernel ($DLRM_HSTU_FP8_BWD_DQ_SPLIT_ORDER).
 
     "xcd" (default) groups each (b, h)'s row blocks on one XCD so its K tiles
-    stay in that XCD's L2; "bh" is the iter-4 order.  Bitwise-identical dq.
+    stay in that XCD's L2; "bh" is the row-major order.  Bitwise-identical dq.
     """
     order = os.environ.get("DLRM_HSTU_FP8_BWD_DQ_SPLIT_ORDER", "xcd").strip().lower()
     if order not in ("bh", "xcd"):
@@ -736,20 +717,10 @@ def flydsl_hstu_attention_bwd(
         config["sched"] = "iglp3"
     if q_bf16 and kernel.cvt_scale_is_exact(qkv_scale):
         # ONLY when the scale is an exact power of two. scale_in_cvt folds
-        # qkv_scale into cvt_scalef32_pk_bf16_fp8 instead of applying it in the
-        # score/epilogue math, and that instruction's scale operand is
-        # exponent-only on gfx950 -- see cvt_scale_is_exact. With the calibrated
-        # `_fp8_qkv_scale` (amax/448, a power of two with probability zero) the
-        # fold silently rescales every gradient: measured dq 3.1 dB against
-        # 28.1 dB for the same build with a power-of-two scale.
-        #
-        # Declining the fold is not a fallback to something worse -- it is the
-        # arithmetically correct path, and the only cost is that
-        # score_input_scale/value_input_scale no longer collapse to 1.0, so
-        # their per-element multiplies stay in the elementwise chain (worth
-        # 40.126 -> 34.689 ms on the full-fp8 arm; the q_bf16 arm was never
-        # timed correct). The kernel re-checks this at every launch, so a caller
-        # that sets the flag by hand gets a ValueError, not wrong numbers.
+        # qkv_scale into cvt_scalef32_pk_bf16_fp8. That instruction's scale
+        # operand is exponent-only on gfx950. A scale that is not a power of
+        # two would silently rescale the values. The kernel checks this at
+        # every launch and raises if the flag is set by hand.
         config["scale_in_cvt"] = True
     elif q_bf16 and "q_bf16_scale_in_cvt" not in _logged_layouts:
         _logged_layouts.add("q_bf16_scale_in_cvt")
@@ -820,9 +791,7 @@ def flydsl_hstu_attention_bwd(
                 f"DLRM_HSTU_FP8_BWD_FULL_{name}_K", k_default)))
         config.update(
             f8b="all", mu2="k128", do_dyn=False, do_blk=True, f8_sat=True,
-            # Defaults sit mid-plateau of the 51381 in-model sweep: operand
-            # SNR is flat ~31.5 dB for silu K in [-2, 8] and ds K in [-6, 0]
-            # (ds falls off a cliff at K >= 2 on some layers).
+            # silu and ds pre-scales. Override with DLRM_HSTU_FP8_BWD_FULL_*_K.
             mu2_ssc=_sc("SSC", "3"),
             mu2_dsc=_sc("DSC", "-3"),
             ds8_pad=int(os.environ.get("DLRM_HSTU_FP8_BWD_FULL_DS8_PAD", "16")),
@@ -857,7 +826,6 @@ def flydsl_hstu_attention_bwd(
                 fp8_mfma or "bf16", input_fp8, q_bf16, _blk_ok, heads, dim,
                 config.get("BM", 64), config.get("BN", 128),
             )
-    # silu/grad-coefficient epilogue form (roadmap R3).
     # $DLRM_HSTU_FP8_BWD_EPILOGUE = legacy (default when absent) | reuse
     # (gin: apply_env_bootstrap.DLRM_HSTU_FP8_BWD_EPILOGUE).
     _epilogue = os.environ.get("DLRM_HSTU_FP8_BWD_EPILOGUE", "legacy") or "legacy"
@@ -866,13 +834,9 @@ def flydsl_hstu_attention_bwd(
             f"DLRM_HSTU_FP8_BWD_EPILOGUE={_epilogue!r}: expected "
             "reuse|legacy|reuse_pk"
         )
-    # R15 VALU diet: "reuse_pk" runs the "reuse" silu/grad-coefficient chain
-    # on packed f32 (v_pk_mul/add/fma_f32, two accumulator elements per issue;
-    # exp2/rcp stay scalar).  Same ops in the same order, so the outputs are
-    # bitwise equal to "reuse"; only the VALU issue count drops (and the
-    # 8-VGPR spill of the scalar build goes away: 484 -> 424 regs).  Default
-    # OFF (gin keeps "reuse"); arm with $DLRM_HSTU_FP8_BWD_EPILOGUE=reuse_pk
-    # or $DLRM_HSTU_FP8_BWD_PK=1 (upgrades "reuse" to "reuse_pk").
+    # "reuse_pk" runs the "reuse" silu chain on packed f32. Same ops in the
+    # same order. Default off. Set DLRM_HSTU_FP8_BWD_EPILOGUE=reuse_pk or
+    # DLRM_HSTU_FP8_BWD_PK=1.
     if (os.environ.get("DLRM_HSTU_FP8_BWD_PK", "").strip().lower()
             in ("1", "true", "on", "yes") and _epilogue == "reuse"):
         _epilogue = "reuse_pk"
@@ -881,14 +845,8 @@ def flydsl_hstu_attention_bwd(
         logger.warning(
             "[hstu-attn] bwd_dkdv packed-f32 epilogue ARMED: epilogue=reuse_pk "
             "(DLRM_HSTU_FP8_BWD_PK)")
-    # Workgroup grid order of bwd_dkdv (roadmap R15).
-    # $DLRM_HSTU_FP8_BWD_GORDER = xcd | xcdn; absent = kernel default "xcd",
-    # i.e. the identical compiled kernel. "xcdn" puts n-blocks fastest inside
-    # an XCD. R15 iter-1 microbench (C8 kernel, e15-08, paired 10 rounds):
-    # -2.27% on prod lens, +0.81% on dense lens -- the sign follows the length
-    # distribution, so it needs an in-model screen (bench.sh ARM_ENV) before
-    # any default change. Grid order only: same math; the bf16p dq atomics
-    # are already order-nondeterministic.
+    # $DLRM_HSTU_FP8_BWD_GORDER = xcd | xcdn. Absent keeps the kernel default
+    # "xcd". "xcdn" puts n-blocks fastest inside an XCD. Same math.
     _gorder = os.environ.get("DLRM_HSTU_FP8_BWD_GORDER", "").strip().lower()
     if _gorder:
         if _gorder not in ("xcd", "xcdn"):
@@ -902,7 +860,7 @@ def flydsl_hstu_attention_bwd(
                 "[hstu-attn] bwd_dkdv grid order ARMED: gorder=%s "
                 "(DLRM_HSTU_FP8_BWD_GORDER)", _gorder,
             )
-    # R15 iter11 intra-pair lookahead ($DLRM_HSTU_FP8_BWD_PIPE = 1..6,
+    # Intra-pair lookahead ($DLRM_HSTU_FP8_BWD_PIPE = 1..6,
     # default OFF).  dq-split C8 kernel only: both m tiles of an mu2 pair are
     # staged in LDS up front and tile B's qk/dp MFMAs share a scheduling
     # region with tile A's silu/ds VALU chain.  Same math on every element
@@ -934,9 +892,7 @@ def flydsl_hstu_attention_bwd(
         fp8_mfma=fp8_mfma,
         **config,
     )
-    # Logged once per distinct layout: whether the wrapper tax is being paid is
-    # invisible in the numerics and costs ~15 ms/step/rank when it is, so it
-    # should not take a profile to find out.
+    # Logged once per distinct layout.
     _e1_period = int(
         os.environ.get("DLRM_HSTU_FP8_BWD_CENSUS")
         or os.environ.get("DLRM_E1_BWD_CENSUS", "0")
@@ -1168,8 +1124,7 @@ def try_flydsl_attention_bwd(
 # Selected independently of the backward ($HSTU_ATTN_FWD vs $HSTU_ATTN_BWD),
 # because the two kernels are genuinely decoupled: HSTU has no softmax, so there
 # is no lse and no rowsum(dO*O) for the forward to hand the backward. Either can
-# run while the other stays on Triton, which is also what makes an A/B of one
-# half meaningful.
+# run while the other stays on Triton.
 # ---------------------------------------------------------------------------
 
 
@@ -1276,9 +1231,7 @@ def flydsl_hstu_attention_fwd(q, k, v, seq_offsets, N, alpha) -> torch.Tensor:
 
     # Read q/k/v where they already live. On the fused preprocess+attention path
     # they are column slices of one uvqk buffer at stride 2048, and packing them
-    # would cost three full copies of the attention input per layer per call --
-    # the same class of wrapper tax the backward measured at ~15 ms/step/rank,
-    # which is enough to eat this kernel's entire win.
+    # would copy the attention input once per tensor per layer per call.
     rs = _common_row_stride((q, k, v), heads, dim)
     if rs is None:
         q, k, v = (t.contiguous() for t in (q, k, v))
@@ -1289,10 +1242,8 @@ def flydsl_hstu_attention_fwd(q, k, v, seq_offsets, N, alpha) -> torch.Tensor:
     if key not in _logged_fwd_layouts:
         _logged_fwd_layouts.add(key)
         _maybe_dump_lengths(seq_offsets)
-        # tokens and N are logged because the grid is sized by N (see below) while
-        # the work is set by the real lengths, so the ratio of the two is how much
-        # of the launch is doing nothing -- and it is not otherwise visible in
-        # either a profile or the numerics.
+        # tokens and N are logged because the grid is sized by N while the
+        # work is set by the real lengths.
         logger.warning(
             "[hstu-attn] FlyDSL forward %s (heads=%d dim=%d tokens=%d N=%d "
             "mean_len=%.0f)",
@@ -1389,38 +1340,17 @@ def try_flydsl_attention_fwd(
 # column slices of one vqk buffer, plus ONE per-tensor scale. Today that goes to
 # the Triton e4m3 forward. This is the FlyDSL alternative for the same contract.
 #
-# Selected by the same $HSTU_ATTN_FWD=flydsl that picks the bf16 FlyDSL
-# forward, once $DLRM_HSTU_FP8_FWD is on. That combination used to raise;
-# it now compiles this specialization (fp8_mfma="k128", fp8_v=True) plus the
-# fused-silu epilogue (epi_fold / mask_split / iglp0). $HSTU_ATTN_FWD=triton
-# with FP8 on keeps the certified Triton e4m3 forward.
-#
-# CONFIG. `k128` at waves=2, which is `hstu_fwd.SHIPPED` plus the two fp8 flags.
-# waves=1 measures ~4% faster standalone and is NOT used: that arm sits at 248 of
-# 256 VGPR, eight registers from dropping to one wave per SIMD and off a ~4x
-# cliff. waves=2 is the robust point.
-#
-# fp8_v=True is not an extra approximation here even though it is one in the
-# standalone bench. Production's V is already e4m3 -- it comes out of the same
-# vqk GEMM as q and k -- so feeding it as e4m3 is what the incumbent Triton
-# kernel already does. Measured on the production ragged pool (bench/
-# fwd_baseline.py, 3 reps): SNR_e2e 26.99 dB for both this arm and triton-fp8,
-# i.e. identical, while fp8_v=False reads 28.75 dB because it is a DIFFERENT
-# (more accurate) function than the one production runs. Matching the incumbent
-# is the point; the kernel-vs-oracle SNR is 52.55 dB either way.
+# Selected by $HSTU_ATTN_FWD=flydsl once $DLRM_HSTU_FP8_FWD is on.
+# Compiles fp8_mfma="k128", fp8_v=True, plus the fused-silu epilogue.
+# $HSTU_ATTN_FWD=triton with FP8 on keeps the Triton e4m3 forward.
+# V is already e4m3 from the same projection as q and k.
 # ---------------------------------------------------------------------------
 
 _FP8_FWD_CFG = {"fp8_mfma": "k128", "fp8_v": True}
 
-# Silu-epilogue VALU reductions (hstu_fwd.py's `epi_fold` and `mask_split`)
-# are part of this kernel, not a second env var. SHIPPED is iglp1, and
-# mask_split is INCOMPATIBLE with it -- the n-loop split trips
-# AMDGPUIGroupLP.cpp:2087 -- so the config also moves the scheduling hint to
-# iglp0. That is a CONFOUND and it is on the record: the shippable stack is
-# (epi_fold, mask_split, iglp0) against (--, --, iglp1). The BASELINE was
-# swept across iglp1/iglp0/none at both the bench shape and production's
-# (bench/s1_shapes.sh): the whole sched spread is 1.2% at N=4096 and 1.3% at
-# N=2994, against a 17% candidate win, so the sched move is not the source.
+# epi_fold and mask_split are part of this kernel. mask_split is incompatible
+# with the SHIPPED iglp1 hint (the n-loop split trips AMDGPUIGroupLP), so this
+# config uses iglp0.
 _FP8_FWD_E2_CFG = {"epi_fold": True, "mask_split": True, "sched": "iglp0"}
 
 
@@ -1535,8 +1465,7 @@ def try_flydsl_attention_fwd_fp8(
     FAIL-CLOSED. Returns None only when the knob is off. Once it is on, every
     other way this could decline -- host cannot run FlyDSL, kernel import
     failed, shape outside the specialization -- RAISES. A knob whose entire
-    purpose is to be A/B'd against the incumbent must not be able to silently
-    measure the incumbent twice.
+    purpose is the FlyDSL kernel must not silently run Triton instead.
     """
     if not flydsl_fp8_fwd_selected():
         return None

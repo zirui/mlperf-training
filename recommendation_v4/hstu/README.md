@@ -10,6 +10,8 @@ Build the submission image from `recommendation_v4/hstu`:
 docker build --network=host -t rocm/amd-mlperf:dlrmv4_training_6.1 -f Dockerfile .
 ```
 
+The commands below use that local tag. It is not a published image, so build it before running.
+
 The Dockerfile specifies the pinned dependencies. FBGEMM-GPU has no public gfx950 build, so it is compiled from source; the build takes 30–60 minutes. `--build-arg MAX_JOBS=<n>` sets the compile parallelism.
 
 # 2. Prepare Dataset

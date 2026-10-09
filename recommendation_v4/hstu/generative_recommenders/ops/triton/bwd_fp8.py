@@ -1,52 +1,19 @@
-"""FP8 machinery for the HSTU backward projection GEMMs.
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""FP8 cast and scale for the HSTU backward projection GEMMs.
 
-Separate from `triton_fp8.py` on purpose: that module is the promoted forward
-arm, and the two should not share a blast radius while this one is younger.
+Separate from `triton_fp8.py`. Gradients use E5M2 and weights use E4M3.
+The scale refreshes on a cadence with headroom over the observed amax. The
+cast computes that amax in the same pass and does not copy it back to the
+host on the steady-state step.
 
-Measured deltas are deliberately NOT quoted here. They are a property of a
-build, a library version and a host, so a number inlined in a comment is stale
-the first time any of those move, and a reader has no way to tell. They live in
-`docs/perf_opt.md` -- the evaluation row for the current figure, the
-FP8-backward optimization-log row for the kernel-level accounting -- and the
-mechanism and campaign history are in `docs/fp8/fp8.md` (§12).
-
-Two things live here, and they are one thing in practice.
-
-**The cast.** `quantize_with_scale` in the forward module is
-`(v / scale).clamp(...).to(fp8)`, an elementwise chain that materializes
-full-size intermediates, which is expensive enough to put every unfused site
-underwater. A one-pass Triton cast is substantially faster at the same shapes
-and bit-exact, and that is what lets `output_projection` pay for itself with no
-epilogue work.
-
-**The scale.** The gradient amax *grows* over training by orders of magnitude,
-so the forward's calibrate-then-freeze policy drifts badly here. This one
-refreshes on a cadence at a margin, and the margin does the work: single-step
-spikes are large enough that no cadence tracks a spike.
-
-**The format.** E5M2 for gradients, E4M3 for weights. E4M3 was tried for both
-and lost samples-to-AUC against the control, because at this margin it rounds a
-large fraction of the gradient to zero and Adam gives a flushed coordinate no
-update at all. See the format note below.
-
-Refreshing needs an amax, and a separate reduction pass over a multi-GB tensor
-would cost about what the GEMM saves. It does not need one: the cast already
-reads every element, so the reduction rides along for a negligible share of it.
-The controller is therefore effectively free, and it never reads a device value
-back to the host in the steady-state step.
-
-Enable with the single switch, exactly as the forward arm is enabled:
+Enable with:
 
     DLRM_HSTU_FP8_BWD=1                (gin: apply_env_bootstrap.DLRM_HSTU_FP8_BWD)
-
-That switch is the whole arm -- there is nothing else to set. The knobs below
-are tunables carrying the values this campaign measured; override one to A/B it
-against the arm, not to assemble the arm by hand.
 
     DLRM_HSTU_FP8_BWD_MARGIN=8         headroom over the observed amax
     DLRM_HSTU_FP8_BWD_REFRESH_CALLS    steps between scale refreshes
     DLRM_HSTU_FP8_BWD_WARMUP_CALLS     backward calls run in BF16 first
-    DLRM_HSTU_FP8_BWD_GRAD_FORMAT      e5m2 (default) or e4m3, for A/B only
+    DLRM_HSTU_FP8_BWD_GRAD_FORMAT      e5m2 (default) or e4m3
 """
 
 from __future__ import annotations
@@ -59,22 +26,7 @@ import torch
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-# Weights are E4M3 and gradients are E5M2. That split is the standard FP8
-# training recipe and this campaign arrived at it the long way round.
-#
-# E4M3 was picked for the gradients too at first, on spike data -- evidence that
-# only describes the *top* of the range. In a float format the margin costs
-# nothing in mantissa, so its entire price is paid at the bottom, and scoring
-# the bottom against the gradient histograms shows E4M3 flushing a large
-# fraction of this gradient to zero. Adam normalizes per parameter, so a flushed
-# coordinate receives no update at all, and paired seeds duly came in behind the
-# control on samples-to-AUC.
-#
-# E5M2 spends one mantissa bit for four decades of range, which moves that
-# underflow fraction by orders of magnitude and beats E4M3 at any margin.
-# Weights keep E4M3: their range is narrow, so for them the mantissa bit is the
-# better buy. The underflow table, with the measured fractions per site, is in
-# docs/fp8/fp8.md §12.
+# Weights are E4M3 and gradients are E5M2.
 _FP8_E4M3: Optional[torch.dtype] = getattr(torch, "float8_e4m3fn", None)
 _FP8_E5M2: Optional[torch.dtype] = getattr(torch, "float8_e5m2", None)
 _E4M3_MAX: float = 448.0
@@ -86,27 +38,15 @@ _GRAD_DTYPE: Optional[torch.dtype] = (
 )
 _GRAD_MAX: float = _E4M3_MAX if _GRAD_FORMAT == "e4m3" else _E5M2_MAX
 
-# The whole arm, from one switch. There is one site and it is meaningless
-# without the scale controller, so a separate "enable the controller" knob and a
-# separate "enable the site" knob could only ever be set together -- they were
-# two spellings of this one. The forward arm keeps its two-tier structure
-# because seventeen knobs really can be combined into an unmeasured arm; one
-# cannot.
 _BWD_ENABLED: bool = os.environ.get("DLRM_HSTU_FP8_BWD", "0") == "1"
-
-# Tunables, not gates. Each has the value this campaign measured and is here to
-# be moved for an A/B, not to be assembled into the arm.
 _BWD_MARGIN: float = float(os.environ.get("DLRM_HSTU_FP8_BWD_MARGIN", "8"))
-# Ship-4 submission logging profile: the per-refresh scale line (two blocking
-# .item() reads per site every DLRM_HSTU_FP8_BWD_REFRESH_CALLS steps, mid-backward)
-# is a diagnostic, not an MLPerf requirement. Off by default; DLRM_HSTU_FP8_BWD_SCALE_LOG=1
-# restores it. The scale and clipped_windows state is unchanged either way.
+# Off by default. DLRM_HSTU_FP8_BWD_SCALE_LOG=1 prints the per-refresh scale.
+# The scale itself is unchanged either way.
 _BWD_SCALE_LOG: bool = os.environ.get("DLRM_HSTU_FP8_BWD_SCALE_LOG", "0") == "1"
 _BWD_REFRESH_CALLS: int = max(
     1, int(os.environ.get("DLRM_HSTU_FP8_BWD_REFRESH_CALLS", "200"))
 )
-# Long enough to see a representative amax, short enough to be a rounding error
-# against a 7.5k step run. The forward arm uses 4 for the same reason.
+# Backward calls that run in BF16 before the first scale refresh.
 _BWD_WARMUP_CALLS: int = max(
     1, int(os.environ.get("DLRM_HSTU_FP8_BWD_WARMUP_CALLS", "4"))
 )
@@ -287,7 +227,7 @@ def _log_resolved_once() -> None:
     Not deferred to D5. A smoke run of D2 produced a sane loss curve and no
     record whatsoever of whether the FP8 path had executed -- at warmup learning
     rates the loss is identical either way -- which is the exact condition that
-    cost the forward campaign a full round of runs.
+    cost a full round of forward runs.
     """
     global _logged_resolved
     if _logged_resolved:
@@ -424,14 +364,7 @@ def output_projection_dgrad(
 ) -> Optional[torch.Tensor]:
     """`dy = dout @ weight^T` in FP8, or None to fall back to BF16.
 
-    The only site in the arm. It is the one that needs no epilogue work: the
-    gradient is already row-major, which is the layout `_scaled_mm` wants, so
-    the cast is cheap enough here to pay for itself out of one GEMM. The wgrads
-    would need both operands re-laid-out along K and do not.
-
-    Current measured delta: `docs/perf_opt.md`, FP8-backward optimization-log
-    row. Note it is quoted against the *pinned* BF16 baseline this site actually
-    runs, which is a smaller win than against a stock GEMM.
+    The gradient is already row-major, which is the layout `_scaled_mm` wants.
     """
     if not _BWD_ENABLED:
         return None

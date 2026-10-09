@@ -508,8 +508,8 @@ def _trim_warmup_from_trace(
     ranks at the end of the WARMUP step, so the first recorded step starts
     from an empty GPU queue. With the host-sync-free step the host normally
     runs one step ahead of the GPU; the first step after a drain has no such
-    lead and is not a steady-state step (about -5% at 1n against the steps
-    after it). Recording one step more and not exporting it keeps that
+    lead and is not a steady-state step. Recording one step more and not
+    exporting it keeps that
     rebuild step out of the artifact.
 
     ``lead_in`` (with ``skip_head``). Under the host-sync-free step the GPU is
@@ -529,10 +529,10 @@ def _trim_warmup_from_trace(
     ``keep_head_active``. The last recorded steps of a window carry the
     tracing session's teardown, and what that costs is cross-rank SKEW -- the
     eight ranks finish flushing at different times, so the tail steps go
-    ragged. Job 36227 (``active=6``, exported tail == recorded tail) against
-    job 36446 (``active=7``), same arm, 8 ranks:
+    ragged. One export (``active=6``, exported tail == recorded tail) against
+    another (``active=7``), same arm, 8 ranks:
 
-                 36227 active=6            36446 active=7
+                 active=6                  active=7
         step 46  270.66 ms  spread 17.56   270.89 ms  spread 3.10
         step 56  279.30 ms  spread 25.06   280.82 ms  spread 0.66
 
@@ -592,7 +592,7 @@ def _trim_warmup_from_trace(
     # of the GPU (a pipelined / sync-free step), the GPU copy of
     # ``ProfilerStep#N`` ends after CPU ``ProfilerStep#N+1`` has begun, so a
     # range built from the merged CPU+GPU spans leaks the next CPU step into
-    # the export as an extra, unpaired step (iter-8/9 bench traces: one extra
+    # the export as an extra, unpaired step (pipelined traces: one extra
     # ProfilerStep per rank -> trace_status=error).
     name_to_cpu: Dict[str, tuple] = {}
     for e in events:
@@ -1566,8 +1566,7 @@ def lead_in_trace_bounds(
 
     Computed in one pass, not iterated to a fixed point: following items
     that cross ``trace_start_us`` back in time cascades through staggered
-    ranks (measured on the 1/2/4n MI350X captures: 17+ steps back to 57-113
-    ms before the cut, almost half a step, without reducing blank time).
+    ranks, walking back through earlier steps without reducing blank time.
     The one item per stream still running at ``trace_start_us`` is dropped
     whole instead (see :func:`clip_lead_in`). Both values are fixed points
     of a re-stitch: the work that defines them starts at or after

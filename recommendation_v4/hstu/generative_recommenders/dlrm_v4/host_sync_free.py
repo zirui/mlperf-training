@@ -16,16 +16,9 @@
 # pyre-unsafe
 """Drain-free training step: move the per-step host reads off the GPU queue.
 
-Arbor 2026-10-02 iter 8. Trace attribution of the base tree (5ae3127, 1n,
-TB1/TB2 steps 54-56; probes/iter8/{idle,comm}) found one blocking read per
-step that EMPTIES the launch queue: ``torchrec.metrics.gauc.get_auc_states``
-does ``int(num_candidates.max().item())`` right after ``progress()`` has
-queued fwd+bwd+opt, so the host blocks ~110-130 ms until the GPU drains, and
-every later launch (metric ops, loss all_reduce, MLLOG, the next forward's
-preprocess) lands on an empty queue. Critical-rank cost: a 5-6 ms GPU bubble
-per step. Removing it alone only moves the drain to the next host read in
-line -- the forward's ``fx_length_stats`` ``.tolist()`` and the per-step
-MLPerf train-loss ``float()`` -- so all three go together:
+A blocking device read after ``progress()`` empties the launch queue, so the
+host reads that used to sit on that queue are taken from values the host
+already has. The three reads move together:
 
 1. ``Samples.to`` (CPU -> device) computes the batch's length statistics from
    the CPU lengths it is about to copy (max/sum of num_candidates, per-key max
@@ -38,34 +31,23 @@ MLPerf train-loss ``float()`` -- so all three go together:
    pinned D2H copy; the pending event is emitted before ANY other MLLOG event
    (pre-emit hook on MLPerfLogger), so ordering and metadata are unchanged.
 
-4. (iters 12-15) torchrec's KJT input_dist reads ``length_per_key`` back from
-   the device after the values all_to_all (a pageable 112 B D2H that became
-   the next drain point). The per-key counts are host-known on the sender, so
+4. torchrec's KJT input_dist reads ``length_per_key`` back from
+   the device after the values all_to_all. The per-key counts are host-known
+   on the sender, so
    they ride along as K extra rows of the splits all_to_all (non-fused and
    fused ``FusedKJTListSplitsAwaitable`` paths; one pinned H2D for the rows,
    and torchrec's debug ``_safe_tolist`` is answered from the host copy).
    Knob ``DLRM_HSTU_FP8_SYNCFREE_LPK`` (default 1).
-5. (iter 15) The forward's ``uih_features[key]`` / ``candidates`` KJT access
-   computed ``length_per_key`` with a pageable 120 B D2H -- the drain point
-   once (4) landed. ``Samples.to`` now caches it from the CPU lengths
+5. The forward's ``uih_features[key]`` / ``candidates`` KJT access
+   computed ``length_per_key`` with a device read. ``Samples.to`` caches it
+   from the CPU lengths
    (``KeyedJaggedTensor.to`` carries ``_length_per_key``). Knob
    ``DLRM_HSTU_FP8_SYNCFREE_FWDLPK`` (default 1). Same integers.
-   1n same-allocation ABBA (job 54854): sync-free +4.95/+5.00% vs off
-   (control spread 0.31%), +1.3/+2.3% over (4) alone. 2n (job 54852): still
-   -2.5/-2.8% vs off -- at 2n the regression grows with the host lead
-   (draining at the forward instead: -1.5/-1.8%), so the single-node gate
-   stays (probes/iter15/FINDINGS.md).
 
-6. (iter 19) Multi-node: the +31 us/dispatch penalty came from the
-   HIGH-priority torchrec data-dist queue holding blocked waits while the host
-   ran ahead. ``dist_init_on_main`` moves the forward's dist_init wait to the
-   main stream (with the record_stream bookkeeping that makes that safe) and
+6. ``dist_init_on_main`` moves the forward's dist_init wait to the main
+   stream (with the record_stream bookkeeping that makes that safe) and
    ``split_wait_poll_on`` issues the deferred splits wait only once the
-   collective has finished. One configuration, prio -1 kept, at 1n/2n/4n
-   (probes/iter19/FINDINGS.md). Knobs ``..._DISTINIT_MAIN``,
-   ``..._SPLITWAIT_POLL`` (default 1 when sync-free is active). With that,
-   the single-node gate of (5) was removed (2026-10-03): ``enabled()`` follows
-   the knob alone at every node count.
+   collective has finished. ``enabled()`` follows the knob at every node count.
 
 A one-step lag fence (``StepFence``) keeps the host at most one step ahead of
 the GPU, which bounds queued memory/allocator state the same way the drain
@@ -119,15 +101,7 @@ _multinode_noop_logged = False
 
 
 def enabled() -> bool:
-    """On when the knob is set, at every node count.
-
-    History: iters 8-15 gated this to single-node (2n ABBA -3.56/-3.61%, job
-    53941; still -2.5/-2.8% at iter 15, job 54852). Iter 19 found the 2n/4n
-    mechanism (blocked waits on torchrec's high-priority data-dist queue) and
-    removed it with dist_init_on_main() + split_wait_poll_on(), one
-    configuration for 1n/2n/4n (probes/iter19, iter21). The node-count gate
-    is gone; DLRM_HSTU_FP8_SYNCFREE_MULTINODE is accepted and ignored.
-    """
+    """On when ``DLRM_HSTU_FP8_SYNCFREE=1``, at every node count."""
     # Read per call (cheap): the gin env bootstrap may set it after import.
     global _enabled_logged, _multinode_noop_logged
     on = os.environ.get(_ENV, "0") == "1"
@@ -154,11 +128,8 @@ _DISTINIT_ENV = _ENV + "_DISTINIT_MAIN"  # DLRM_HSTU_FP8_SYNCFREE_DISTINIT_MAIN
 def pipe_stream_priority() -> Optional[int]:
     """Explicit priority for torchrec's pipeline memcpy / data-dist streams.
 
-    None (the default) keeps torchrec's own choice (-1, high priority) at every
-    node count. ``DLRM_HSTU_FP8_PIPE_STREAM_PRIO=<p>`` overrides it; it exists
-    for A/B arms (iter 16-18: prio 0 was the per-topology workaround for the
-    2n/4n sync-free penalty; iter 19 replaced it with one configuration for
-    every node count: dist_init_on_main() + split_wait_poll_on()).
+    None keeps torchrec's own stream priority. ``DLRM_HSTU_FP8_PIPE_STREAM_PRIO``
+    overrides it.
     """
     v = os.environ.get(_PRIO_ENV)
     if v is not None and v != "":
@@ -167,32 +138,10 @@ def pipe_stream_priority() -> Optional[int]:
 
 
 def dist_init_on_main() -> bool:
-    """Run the forward's input-dist completion (dist_init) on the main stream.
+    """Run the forward's input-dist completion on the main stream.
 
-    Iter 18 root cause of the multi-node sync-free regression (trace
-    probes/iter15/sfv3_a/traces/TD, 2n, ranks 0 and 9, steps 53-57): the
-    data-dist stream kernels that sit queued behind an unmet event for 100+ ms
-    -- the +31 us/dispatch penalty of probes/iter16 -- are launched by
-    torchrec ``PipelinedForward.__call__``: ``with stream(data_dist):
-    request.wait()`` makes the HIGH-priority data-dist stream wait on the
-    current batch's lengths/values all_to_all, which sits on the NCCL stream
-    behind the previous backward's collectives, and the KJT dist_init kernels
-    (``dist_init:recat_values``, 28/step >20 ms late) queue behind it; the
-    next batch's ``dedup_ec_indices`` / start kernels (16 + 7/step) then queue
-    behind those on the same FIFO stream. With the host a step ahead, that
-    holds a blocked high-priority queue through the whole backward.
-
-    torchrec's own ``PipelinedForward._use_main_stream_for_dist_init`` (set by
-    torchrec itself for ``clear_data_dist_inputs``) issues that wait and those
-    kernels on the current (main, normal-priority) stream instead. The forward
-    waits on them either way (``current_stream().wait_stream(data_dist)`` right
-    after), so the main stream reaches them in the same order; only the HW
-    queue that holds the blocked barrier changes, and the pipeline streams keep
-    torchrec's priority (-1), which measured +2.5% at 1n. Same kernels, same
-    values, same collective issue order.
-
-    On whenever the host-sync-free step is active; ``..._DISTINIT_MAIN=0``
-    turns it off for A/B.
+    On when the host-sync-free step is active. ``DLRM_HSTU_FP8_SYNCFREE_DISTINIT_MAIN=0``
+    keeps torchrec's data-dist stream.
     """
     return enabled() and os.environ.get(_DISTINIT_ENV, "1") != "0"
 
@@ -201,26 +150,10 @@ _SPLITPOLL_ENV = _ENV + "_SPLITWAIT_POLL"  # DLRM_HSTU_FP8_SYNCFREE_SPLITWAIT_PO
 
 
 def split_wait_poll_on() -> bool:
-    """Gate the splits all_to_all wait on a non-blocking completion query.
+    """Issue the splits all_to_all wait only after the collective has finished.
 
-    Iter 19 trace (probes/iter19/sf2nt/traces/TU1, 2n, 16 ranks, steps 53-56;
-    probes/iter19/blocked.py): with dist_init on main, the remaining block on
-    the HIGH-priority data-dist queue is the deferred next-batch splits wait
-    that ``dequeue_batch`` issues after backward N (``SplitsAllToAllAwaitable
-    wait()``: work.wait() on the splits all_to_all, then the .tolist() copy)
-    -- 56 blocks, mean 119 ms, kernels queued behind; the control has none.
-
-    The host blocks on that .tolist() anyway. Instead of enqueueing the stream
-    wait first and blocking in the copy, poll ``Work.is_completed()`` (an
-    event query; it never blocks the GPU or a queue) and issue the stock wait +
-    copy only once the collective has finished: the data-dist stream then only
-    ever sees an already-satisfied wait. Same collective, same stream, same
-    values. (Iter 19 W/W' held the wait on a priority-0 helper stream instead:
-    2n/4n matched the prio-0 topology rule, but at 1n the helper shared the
-    main stream's HW queue -- same trace stream id -- so the copy waited behind
-    the whole backward and the host drained every step: 1n +1-2% vs +5.7%.)
-
-    On with dist_init_on_main(); ``..._SPLITWAIT_POLL=0`` turns it off for A/B.
+    On with ``dist_init_on_main()``. ``DLRM_HSTU_FP8_SYNCFREE_SPLITWAIT_POLL=0``
+    uses the stock wait.
     """
     return dist_init_on_main() and os.environ.get(_SPLITPOLL_ENV, "1") != "0"
 
@@ -288,9 +221,7 @@ def host_stats_from_cpu(
         return None
     nkc, sc = gc
     nku, su = gu
-    # numpy, not torch: a torch CPU reduction here runs on the intra-op thread
-    # pool, which contends with the dataloader/pin threads and measured 5-8 ms
-    # per call in the trace (probes/iter8); numpy over ~10k ints is ~10 us.
+    # numpy, not torch: a torch CPU reduction contends with the dataloader threads.
     # Integer max/sum: identical values either way.
     cn = cl.numpy().reshape(nkc, sc)[0]
     max_c = int(cn.max()) if sc > 0 else 0
@@ -300,19 +231,16 @@ def host_stats_from_cpu(
 
 
 def _fwd_lpk_on() -> bool:
-    # A/B switch (iter 15): DLRM_HSTU_FP8_SYNCFREE_FWDLPK=0 restores the device
-    # read of the uih/candidate length_per_key in the forward preprocess.
+    # DLRM_HSTU_FP8_SYNCFREE_FWDLPK=0 reads length_per_key from the device.
     return os.environ.get(_ENV + "_FWDLPK", "1") == "1"
 
 
 def seed_host_length_per_key(*kjts: Any) -> None:
-    """Cache length_per_key on CPU KJTs before the H2D copy (iter 15).
+    """Cache length_per_key on CPU KJTs before the H2D copy.
 
     ``KeyedJaggedTensor.to`` carries ``_length_per_key`` to the device copy, so
     the forward's ``kjt[key]`` (offset_per_key -> length_per_key) needs no
-    device-to-host read. At 2n that pageable 120 B read was where the host
-    drained every step once the splits path stopped draining (iter15 trace
-    r1). Same integers: a per-key sum of the same CPU lengths.
+    device-to-host read. Same integers: a per-key sum of the same CPU lengths.
     """
     if not _fwd_lpk_on():
         return
@@ -521,22 +449,10 @@ class StepFence:
 
 
 # ---------------------------------------------------------------------------
-# Host-known length_per_key for the KJT input_dist all-to-all (iter 12).
+# Host-known length_per_key for the KJT input_dist all-to-all.
 #
-# Trace finding (probes/iter12, operator 2n ABBA job 54372): with the three
-# per-step reads gone, the drain moved into the NEXT batch's input_dist:
-# KJTAllToAllTensorsAwaitable.wait() -> KeyedJaggedTensor.dist_init() ->
-# kjt.sync() -> length_per_key() does lengths.view(keys, stride).sum(1).tolist(),
-# a 112 B pageable D2H that waits for the KJT values all_to_all, which sits in
-# FIFO order on the NCCL stream behind the current step's DDP allreduces and
-# Seq_bwd all_to_all. The host therefore still drained every step (129-140 ms,
-# 96/96 rank-steps at 2n; 0.75/step at 1n), and while it was blocked in that
-# copy the small backward kernels ran ~20-50 us longer each (+11.8 ms/step,
-# 48/48 pairs, both nodes).
-#
-# Fix (same values, same collectives): every sender already knows its per-key
-# value counts on the host (dist_splits needs them), so K extra rows are added
-# to the splits all_to_all that start_sparse_data_dist already issues and
+# Every sender already knows its per-key value counts on the host, so K extra
+# rows are added to the splits all_to_all that start_sparse_data_dist already issues and
 # reads back. Row j carries, for each destination rank r, the value count of
 # the j-th key that r receives. The receiver sums row j over sources to get the
 # length_per_key of its post-all_to_all KJT and builds it with that list, so
@@ -565,7 +481,7 @@ def _lpk_rows(input_kjt: Any, splits: List[int]) -> Optional[List[List[int]]]:
 
 
 def _lpk_on() -> bool:
-    # Sub-switch for A/B: DLRM_HSTU_FP8_SYNCFREE_LPK=0 restores the device read.
+    # DLRM_HSTU_FP8_SYNCFREE_LPK=0 reads length_per_key from the device.
     return os.environ.get(_ENV + "_LPK", "1") == "1"
 
 
@@ -647,8 +563,7 @@ def install_kjt_lpk_patch() -> None:
             # With the wait on main, the next batch's input dist (issued on
             # data-dist right after the forward, host a step ahead) can reuse
             # either set while NCCL is still sending or before the permute has
-            # read it. iter 18/19 U arms died of that (GPU memory-access fault
-            # in every 1n/2n/4n run). Mark both in use on the current stream
+            # read it. Mark both in use on the current stream
             # BEFORE work.wait(), so the allocator's reuse event is recorded
             # after main's wait on the collective (and after the permute).
             cur = torch.cuda.current_stream()
@@ -717,15 +632,13 @@ def install_kjt_lpk_patch() -> None:
         _announce("kjt length_per_key")
         return kjt.sync()
 
-    # ---- Fused splits path (iter 14). ------------------------------------
+    # ---- Fused splits path. ----------------------------------------------
     # The train pipeline's start_sparse_data_dist does NOT build a
     # KJTAllToAllSplitsAwaitable per KJT: runtime_forwards.KJTAllToAllForward
     # returns a KJTSplitsAllToAllMeta and FusedKJTListSplitsAwaitable issues ONE
     # splits all_to_all for all of them, then constructs the
-    # KJTAllToAllTensorsAwaitable directly. The hooks above never saw it, so at
-    # 2n (job 54719 traces: splits a2a 48 elems in 320/320, aten::sum [14,16384]
-    # + 112 B pageable D2H every step) the host still drained. Same rows, same
-    # check, on this path: append K rows to each meta's splits_tensors (K is
+    # KJTAllToAllTensorsAwaitable directly. The hooks above never see that path.
+    # Append K rows to each meta's splits_tensors (K is
     # max(splits), rank-invariant), strip them per meta after the fused wait,
     # and hand the summed list to the tensors awaitable built for that input.
     import torchrec.distributed.embedding_sharding as es
