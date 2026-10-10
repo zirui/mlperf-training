@@ -1094,36 +1094,42 @@ class DLRMv4YambdaDataset(DLRMv4RandomDataset):
         # ---- Build UIH KJT ----
         # Contextual features (length-1 each) iterated in the same order as
         # `_contextual_feature_to_max_length` (matches movielens reference).
-        uih_kjt_values: List[int] = []
+        contextual_values: List[int] = []
         uih_kjt_lengths: List[int] = []
         for name, length in (self._contextual_feature_to_max_length or {}).items():
             assert length == 1, f"yambda contextuals are length-1, got {name}={length}"
             if name == "uid":
-                uih_kjt_values.append(uid)
+                contextual_values.append(uid)
             else:
-                uih_kjt_values.append(int(cross_ids[name]))
+                contextual_values.append(int(cross_ids[name]))
             uih_kjt_lengths.append(1)
 
-        # Sequential features — order must match the trailing entries of
-        # hstu_uih_feature_names in configs.py:
-        #   item_id, artist_id, album_id, action_weight, action_timestamp, dummy_watch_time
-        uih_kjt_values.extend(items.tolist())
-        uih_kjt_values.extend(artists.tolist())
-        uih_kjt_values.extend(albums.tolist())
-        uih_kjt_values.extend(weight.tolist())
-        uih_kjt_values.extend(ts.tolist())
-        uih_kjt_values.extend(dummy_watch_time.tolist())
         n_sequential = len(self._uih_keys) - len(self._contextual_feature_to_max_length or {})
         uih_kjt_lengths.extend([uih_seq_len] * n_sequential)
 
         dummy_query_time = int(ts[-1]) if uih_seq_len > 0 else target_ts
-        uih_kjt_values.append(dummy_query_time)
         uih_kjt_lengths.append(1)
+
+        # Sequential features — order must match the trailing entries of
+        # hstu_uih_feature_names in configs.py:
+        #   item_id, artist_id, album_id, action_weight, action_timestamp, dummy_watch_time
+        uih_values = np.concatenate(
+            [
+                np.asarray(contextual_values, dtype=np.int64),
+                items,
+                artists,
+                albums,
+                weight,
+                ts,
+                dummy_watch_time,
+                np.asarray([dummy_query_time], dtype=np.int64),
+            ]
+        ).astype(np.int64, copy=False)
 
         uih_features_kjt = KeyedJaggedTensor(
             keys=self._uih_keys + ["dummy_query_time"],
             lengths=torch.tensor(uih_kjt_lengths, dtype=torch.long),
-            values=torch.tensor(uih_kjt_values, dtype=torch.long),
+            values=torch.from_numpy(uih_values),
         )
 
         # ---- Build candidates KJT ----
