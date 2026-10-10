@@ -2174,8 +2174,9 @@ def build_train_pipeline(
         # batch's forward. The compute stream has nothing queued in that window,
         # so it idles at the top of every step while the CPU works on a batch it
         # will not train for another step; the splits wait also needs the sizes on
-        # the host, so the CPU blocks there too. Deferring both to the
-        # wait_sparse_data_dist that follows the forward means the forward's
+        # the host, so the CPU blocks there too. Deferring both until
+        # after the forward is launched (enqueue_batch or
+        # wait_sparse_data_dist, whichever runs first) means the forward's
         # kernels are already queued, so the GPU has ~130 ms of work to chew on
         # while the CPU pays for the next batch's prep.
         _deferred_input_dist = None
@@ -2195,6 +2196,15 @@ def build_train_pipeline(
                 self._deferred_input_dist = (batch, context)
                 return
             super().start_sparse_data_dist(batch, context)
+
+        def enqueue_batch(self, dataloader_iter):
+            deferred = self._deferred_input_dist
+            if deferred is not None and getattr(
+                self, "_enqueue_batch_after_forward", False
+            ):
+                self._deferred_input_dist = None
+                super().start_sparse_data_dist(*deferred)
+            return super().enqueue_batch(dataloader_iter)
 
         def wait_sparse_data_dist(self, context):
             deferred = self._deferred_input_dist
@@ -2675,8 +2685,11 @@ def streaming_train_eval_loop(
     # num_workers of the persistent EVAL DataLoader pool only (double-buffer
     # path); the train pools keep the gin num_workers ($NUM_WORKERS). < 0 =
     # inherit NUM_WORKERS (the previous behaviour). Wired to $EVAL_NUM_WORKERS
-    # via gin (default 8). Input pipeline only: same eval set, order and metric.
+    # via gin (default 16). Input pipeline only: same eval set, order and metric.
     eval_num_workers: int = -1,
+    # Eval pool prefetch_factor after each re-arm; <= 0 keeps prefetch_factor.
+    # Wired to $EVAL_REARM_PREFETCH_FACTOR via gin.
+    eval_rearm_prefetch_factor: int = 0,
     checkpoint_frequency: int = 100,
     start_ts: int = 0,
     persistent_loader: bool = False,
@@ -3907,12 +3920,9 @@ def streaming_train_eval_loop(
             train_ts_list
         ) > 0:
             eval_sampler = StreamingWindowSampler(rank, world_size)
-            # $EVAL_NUM_WORKERS (gin default 8; < 0 inherits NUM_WORKERS, the
-            # previous pool). The holdout eval pass is input-pipeline
-            # bound at 4 workers/rank (~255-285 ms per 1024-sample batch, as
-            # long as a training step); 8 workers halve it
-            # (64-70 s -> 33-40 s per 1-node eval, identical eval_accuracy). Only
-            # this persistent eval pool changes; train pools keep NUM_WORKERS.
+            # $EVAL_NUM_WORKERS (gin default 16; < 0 inherits NUM_WORKERS). The
+            # eval pass reads the whole holdout set at once, so it gets its own
+            # pool size; train pools keep NUM_WORKERS.
             _eval_dl_kwargs = resolve_eval_dataloader_kwargs(eval_num_workers)
             if rank == 0:
                 logger.warning(eval_pool_log_line(_eval_dl_kwargs))
@@ -3945,18 +3955,27 @@ def streaming_train_eval_loop(
             # + convergence, then opens the next block. The block thus brackets
             # exactly one eval_interval_steps of training (MLPerf block == work
             # between two evals), instead of one timestamp window.
+            nonlocal eval_iter
             dataset.dataset.is_eval = True  # pyre-ignore [16]
             assert eval_dl is not None
             mlt.block_stop()
             mlt.eval_start()
+            armed_iter = eval_iter if eval_iter is not None else iter(eval_dl)
+            eval_iter = None
             eval_metrics = _run_eval_window(
-                iter(eval_dl),
+                armed_iter,
                 label=f"eval_holdout@train_ts={train_ts}@step={gstep}",
             )
             # Emits RUN_STOP (sets mlt.run_stopped) if the target is met;
             # _run_train_window / the window loop break on that flag.
             mlt.eval_stop(eval_metrics)
             if not mlt.run_stopped:
+                _pool_iter = getattr(eval_dl, "_iterator", None)
+                if eval_rearm_prefetch_factor > 0 and hasattr(
+                    _pool_iter, "_prefetch_factor"
+                ):
+                    _pool_iter._prefetch_factor = eval_rearm_prefetch_factor
+                eval_iter = iter(eval_dl)
                 mlt.block_start()
 
         _db_do_eval = _do_eval_db if eval_interval_steps > 0 else None

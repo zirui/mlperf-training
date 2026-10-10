@@ -45,7 +45,10 @@ apply_env_bootstrap.DLRM_HSTU_FP8_SYNCFREE = True
 
 streaming_train_eval_loop.eval_num_workers = @enw/env_int()
 enw/env_int.key     = "EVAL_NUM_WORKERS"
-enw/env_int.default = 8
+enw/env_int.default = 16
+streaming_train_eval_loop.eval_rearm_prefetch_factor = @erpf/env_int()
+erpf/env_int.key     = "EVAL_REARM_PREFETCH_FACTOR"
+erpf/env_int.default = 1
 apply_env_bootstrap.DLRM_HSTU_FP8_PREBUILD = True
 apply_env_bootstrap.DLRM_HSTU_FP8_AUTOTUNE_PINS = True
 apply_env_bootstrap.DLRM_HSTU_FP8_ALLOC_PREGROW = "memcpy=2.81,data_dist=1.82,main=rest,memcpy_small=0.02,data_dist_small=0.03,main_small=0.22,eval_memcpy=1.6,eval_data_dist=1.6,eval_memcpy_small=0.01,eval_data_dist_small=0.01,margin=56"
