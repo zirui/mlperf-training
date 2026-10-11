@@ -283,8 +283,7 @@ class MLPerfLogger:
             key=c.OPT_LR_WARMUP_STEPS,
             value=int(_gin_param("streaming_train_eval_loop.lr_warmup_steps", 0)),
         )
-        # No upstream constant for the absolute LR the warmup ramp starts from;
-        # registered alongside the sparse keys in the mlcommons/logging PR.
+        # No upstream constant for the absolute LR the warmup ramp starts from.
         self.event(
             key="opt_learning_rate_warmup_start_lr",
             value=float(
@@ -656,6 +655,15 @@ class MLPerfRunTracker:
         )
         self.run_stopped = True
         self._log_run_summary(int(progress[c.SAMPLES_COUNT]))
+        # TSPEC monitor (TRITON_SPEC_MONITOR=1): the
+        # per-rank "[triton-spec] monitor post-run_start: compiles=N ..." line at
+        # RUN_STOP. No-op when the monitor is off; never raises.
+        try:
+            from generative_recommenders.dlrm_v4.train import triton_spec as _tspec
+
+            _tspec.on_run_stop()
+        except Exception:
+            pass
 
     def _log_run_summary(self, samples: int) -> None:
         """Emit the primus_mllog end-of-run lines the other models print.
@@ -765,7 +773,7 @@ def get_mlperf_logger(
     Disable knob: set ``$MLPERF_LOGGING=0`` (or false/no/off) to turn the whole
     MLPerf event stream off — returns ``None`` on EVERY rank, so the train loop's
     ``is not None`` guards skip emission AND the cross-rank train-loss all-reduce
-    in lockstep. Default (unset / "1") = enabled, preserving prior behavior.
+    in lockstep. Default (unset / "1") = enabled.
     """
     if not _MLLOG_AVAILABLE:
         return None

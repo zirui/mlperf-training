@@ -123,6 +123,61 @@ def xxhash_cross(
     return digest.intdigest() % table_size
 
 
+_XXH_P1 = np.uint64(0x9E3779B185EBCA87)
+_XXH_P2 = np.uint64(0xC2B2AE3D27D4EB4F)
+_XXH_P3 = np.uint64(0x165667B19E3779F9)
+_XXH_P4 = np.uint64(0x85EBCA77C2B2AE63)
+_XXH_P5 = 0x27D4EB2F165667C5
+_U64 = (1 << 64) - 1
+
+
+def _rotl64(x: np.ndarray, r: int) -> np.ndarray:
+    return (x << np.uint64(r)) | (x >> np.uint64(64 - r))
+
+
+def xxhash_cross_np_supported(n_keys: int, table_size: int, salt: int) -> bool:
+    """True when xxhash_cross_np reproduces xxhash_cross exactly: 2..3 int64
+    lanes (16/24-byte input, the XXH64 short-input path), a uint64 seed and a
+    table size in [1, 2**63] (every id fits int64). Anything else stays on the
+    per-row xxhash call."""
+    return (
+        2 <= n_keys <= 3
+        and isinstance(salt, int)
+        and 0 <= salt <= _U64
+        and isinstance(table_size, int)
+        and 0 < table_size <= (1 << 63)
+    )
+
+
+def xxhash_cross_np(
+    cols: Sequence[np.ndarray],
+    table_size: int,
+    salt: int = 0,
+) -> np.ndarray:
+    """Bit-exact numpy XXH64 of xxhash_cross for a whole column of anchors.
+
+    ``cols[j][i]`` is key j of row i (int64). Row i equals
+    ``xxhash_cross({k_j: cols[j][i]}, [k_0, ...], table_size, salt)``:
+    xxh64(seed=salt) over the little-endian int64 concat of the row, mod
+    table_size. This is the XXH64 short-input (< 32 byte) path in wrapping
+    uint64 arithmetic; callers check xxhash_cross_np_supported first.
+    """
+    n = len(cols)
+    assert xxhash_cross_np_supported(n, table_size, salt)
+    rows = int(np.asarray(cols[0]).shape[0])
+    h = np.full(rows, (int(salt) + _XXH_P5 + 8 * n) & _U64, dtype=np.uint64)
+    for c in cols:
+        k = np.ascontiguousarray(c, dtype=np.int64).view(np.uint64)
+        h ^= _rotl64(k * _XXH_P2, 31) * _XXH_P1
+        h = _rotl64(h, 27) * _XXH_P1 + _XXH_P4
+    h ^= h >> np.uint64(33)
+    h *= _XXH_P2
+    h ^= h >> np.uint64(29)
+    h *= _XXH_P3
+    h ^= h >> np.uint64(32)
+    return (h % np.uint64(table_size)).astype(np.int64)
+
+
 def xxhash_cross_batch(
     arr_by_key: Dict[str, np.ndarray],
     keys: Sequence[str],

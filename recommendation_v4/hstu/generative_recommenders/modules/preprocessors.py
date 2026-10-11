@@ -17,12 +17,14 @@
 # pyre-strict
 
 import abc
+import os
 from math import sqrt
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import torch
 from generative_recommenders.common import (
     fx_unwrap_optional_tensor,
+    HammerKernel,
     HammerModule,
     init_mlp_weights_optional_bias,
     jagged_to_padded_dense,
@@ -33,6 +35,25 @@ from generative_recommenders.ops.blas_solution_pins import install_for_tokens
 from generative_recommenders.ops.fused_linear_norm import FusedLinearNormMLP
 from generative_recommenders.ops.jagged_tensors import concat_2D_jagged
 from generative_recommenders.ops.layer_norm import LayerNorm, SwishLayerNorm
+from generative_recommenders.ops.triton import preproc_fp8_snr
+
+if TYPE_CHECKING:
+    from generative_recommenders.ops.preproc_grouped_tail import GroupedTail
+
+
+# E-M1 (ops/preproc_grouped_tail.py): run the three MLPs' final LayerNorm(512)s
+# as ONE grouped launch instead of three chained ones. Bitwise identical to the
+# shipped F1+F2 chain given the LayerNorm autotune pins (otherwise ulp-level;
+# the armed line says which). Read once at import; absent or "0" (code default)
+# = shipped; the gin turns it on.
+_PREPROC_GROUPED_TAIL: bool = (
+    os.environ.get("DLRM_HSTU_FP8_PREPROC_GROUPED_TAIL", "0") == "1"
+)
+
+# Payload key carrying the un-concatenated contextual rows when
+# ContextualPreprocessor.forward(fold_contextual_concat=True)
+# (DLRM_HSTU_FP8_POSENC_CONCAT_FOLD); consumed and removed by HSTUTransducer.
+CONTEXTUAL_FOLD_KEY: str = "__dlrm_hstu_fp8_contextual_fold_left__"
 
 
 class InputPreprocessor(HammerModule):
@@ -89,6 +110,37 @@ def get_contextual_input_embeddings(
     contextual_feature_to_min_uih_length: Dict[str, int],
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    if (
+        not torch.jit.is_scripting()
+        and not is_fx_tracing()
+        and all(
+            contextual_feature_to_min_uih_length.get(key, 0) <= 0
+            for key in contextual_feature_to_max_length
+        )
+    ):
+        # DLRM_HSTU_FP8_CONTEXTUAL_FUSE (ops/glue_fusion.py): the casts, the
+        # per-feature jagged_to_padded_dense and the cat in one Function --
+        # same RNE casts, same zero padding, same column blocks; its backward
+        # replaces the zeros + j2pd backward + ToCopyBackward0 per feature.
+        from generative_recommenders.ops import glue_fusion as _gf
+
+        _keys = list(contextual_feature_to_max_length.keys())
+        _vals = [seq_payloads[k] for k in _keys]
+        _offs = [seq_payloads[k + "_offsets"] for k in _keys]
+        _lens = [int(contextual_feature_to_max_length[k]) for k in _keys]
+        if _gf.contextual_pad_cat_fusable(_vals, _offs, _lens, dtype):
+            try:
+                _out = _gf.contextual_pad_cat(_vals, _offs, _lens)
+            except Exception as exc:  # fail closed to the shipped ops below
+                _gf.disable("contextual", exc)
+            else:
+                _gf.note_armed(
+                    "contextual",
+                    f"{len(_keys)} contextual features cast+pad+cat in one "
+                    "Function, offsets in one row-wise scan (kill switch "
+                    "DLRM_HSTU_FP8_CONTEXTUAL_FUSE=0)",
+                )
+                return _out
     padded_values: List[torch.Tensor] = []
     for key, max_len in contextual_feature_to_max_length.items():
         v = torch.flatten(
@@ -151,14 +203,12 @@ class ContextualPreprocessor(InputPreprocessor):
     ) -> None:
         super().__init__(is_inference=is_inference)
         # F1: fold each Linear's bias gradient into the following norm's
-        # backward, deleting the standalone aten::sum over dx. Off by default
-        # until an e2e ladder has measured it. See ops/fused_linear_norm.py.
+        # backward, deleting the standalone aten::sum over dx. Off by default.
+        # See ops/fused_linear_norm.py.
         self._fuse_linear_norm: bool = fuse_linear_norm
         # F2 rides INSIDE F1's container -- it is the same norm kernel gaining
         # an epilogue -- so it cannot be armed on its own. Asking for it
-        # without F1 is a request this code cannot honour, and honouring it
-        # silently at False would produce an arm that measures nothing while
-        # the log says it is on. Raise instead.
+        # without F1 raises rather than silently running without it.
         if fuse_ln_residual and not fuse_linear_norm:
             raise ValueError(
                 "fuse_ln_residual=True requires fuse_linear_norm=True: the "
@@ -251,14 +301,47 @@ class ContextualPreprocessor(InputPreprocessor):
         x: torch.Tensor,
         residual: torch.Tensor,
     ) -> torch.Tensor:
-        """`residual + mlp(x)`, folded into the MLP's last norm when enabled.
+        """`residual + mlp(x)`, folded into the MLP's last norm when F2 is on.
 
-        The fused path adds the residual inside the last norm. Otherwise this
-        is `residual + mlp(x)`.
+        The shipped expression is a full [M, 512] read-modify-write against
+        HBM issued immediately after the MLP's final LayerNorm has just
+        finished writing that same tensor. Handing the residual to the norm makes it an epilogue on a tile the
+        kernel already holds.
+
+        The fused epilogue rounds to the output dtype before adding, which is
+        what the shipped `+` does too (it adds a bf16 residual to an
+        already-stored bf16 norm output), so the FUSION's arithmetic is exact.
+        The container is not quite bit-identical: the residual makes a distinct
+        Triton autotune key, so the kernel is benchmarked again as a second
+        variant and may pick a different num_warps, which moves rstd by an fp32
+        ulp. Pinned to one config the two agree exactly; as autotuned they
+        can differ by a few bf16 ulp on rare elements.
         """
         if self._fuse_ln_residual:
             return mlp(x, residual=residual)
         return residual + mlp(x)
+
+    @torch.jit.unused
+    def _grouped_tail_begin(
+        self, seq_embeddings: torch.Tensor
+    ) -> Optional["GroupedTail"]:
+        """DLRM_HSTU_FP8_PREPROC_GROUPED_TAIL: the chain object that defers each
+        MLP's last (Linear, LayerNorm) pair to ONE grouped launch, or None when
+        the preconditions fail (shipped path; one WARNING). See
+        ops/preproc_grouped_tail.py."""
+        from generative_recommenders.ops.preproc_grouped_tail import (
+            begin_grouped_tail,
+        )
+
+        return begin_grouped_tail(
+            mlp_add=self._mlp_add,
+            content_mlp=self._content_embedding_mlp,
+            content_x=seq_embeddings,
+            fuse_linear_norm=self._fuse_linear_norm,
+            fuse_ln_residual=self._fuse_ln_residual,
+            has_additional=len(self._additional_embedding_features) > 0,
+            output_dim=self._output_embedding_dim,
+        )
 
     def forward(  # noqa C901
         self,
@@ -271,6 +354,7 @@ class ContextualPreprocessor(InputPreprocessor):
         seq_embeddings: torch.Tensor,
         num_targets: torch.Tensor,
         seq_payloads: Dict[str, torch.Tensor],
+        fold_contextual_concat: bool = False,
     ) -> Tuple[
         int,
         int,
@@ -282,6 +366,12 @@ class ContextualPreprocessor(InputPreprocessor):
         torch.Tensor,
         Dict[str, torch.Tensor],
     ]:
+        """fold_contextual_concat (DLRM_HSTU_FP8_POSENC_CONCAT_FOLD, set only by
+        HSTUTransducer when the positional encoder can consume the two pieces):
+        the contextual/UIH concat is NOT materialized; the returned
+        seq_embeddings are the UIH rows only and the contextual rows
+        [B * max_contextual_seq_len, D] are returned in a copy of seq_payloads
+        under CONTEXTUAL_FOLD_KEY. Everything else is unchanged."""
         # The preprocessor MLP GEMM pins (ops/blas_solution_pins.py, preproc_*)
         # are keyed on this row count. _item_forward normally registers the same
         # count first; registering here too keeps the pins reachable without
@@ -290,7 +380,21 @@ class ContextualPreprocessor(InputPreprocessor):
         num_rows = seq_embeddings.shape[0]
         if isinstance(num_rows, int):
             install_for_tokens(num_rows)
-        output_seq_embeddings = self._content_embedding_mlp(seq_embeddings)
+        if preproc_fp8_snr.ENABLED:
+            # Default-off FP8 numerics probe: count training
+            # forwards only (grad mode reads False inside autograd.Function).
+            preproc_fp8_snr.note_grad_mode(torch.is_grad_enabled())
+        # E-M1 grouped tail (default off). When armed, each MLP call below runs
+        # only its first (Linear, SwishLayerNorm) pair, in the same place, and
+        # tail.finish() runs all the last pairs at the end of the MLP section.
+        # The non-MLP work in between keeps its order.
+        tail = None
+        if _PREPROC_GROUPED_TAIL and not torch.jit.is_scripting():
+            tail = self._grouped_tail_begin(seq_embeddings)
+        if tail is not None:
+            tail.head(self._content_embedding_mlp, seq_embeddings)
+        else:
+            output_seq_embeddings = self._content_embedding_mlp(seq_embeddings)
         if len(self._additional_embedding_features) > 0:
             _parts = [
                 seq_payloads[feature]
@@ -303,11 +407,14 @@ class ContextualPreprocessor(InputPreprocessor):
                 additional_embeddings = _fused
             else:
                 additional_embeddings = torch.cat(_parts, dim=1)
-            output_seq_embeddings = self._mlp_add(
-                self._additional_embedding_mlp,
-                additional_embeddings,
-                output_seq_embeddings,
-            )
+            if tail is not None:
+                tail.head(self._additional_embedding_mlp, additional_embeddings)
+            else:
+                output_seq_embeddings = self._mlp_add(
+                    self._additional_embedding_mlp,
+                    additional_embeddings,
+                    output_seq_embeddings,
+                )
         max_seq_len = max_uih_len + max_targets
         target_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(num_targets)
         seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(seq_lengths)
@@ -320,12 +427,22 @@ class ContextualPreprocessor(InputPreprocessor):
                 target_offsets=target_offsets,
                 seq_embeddings=seq_embeddings,
                 seq_payloads=seq_payloads,
+                # The result's only consumer is the action MLP below, whose
+                # first Linear casts it to the autocast dtype (both the
+                # grouped-tail head and the _mlp_add path run
+                # _LinearNormFunction, which does x.to(amp_dtype)).
+                bf16_consumer=True,
             )
-            output_seq_embeddings = self._mlp_add(
-                self._action_embedding_mlp,
-                action_embeddings,
-                output_seq_embeddings,
-            )
+            if tail is not None:
+                tail.head(self._action_embedding_mlp, action_embeddings)
+            else:
+                output_seq_embeddings = self._mlp_add(
+                    self._action_embedding_mlp,
+                    action_embeddings,
+                    output_seq_embeddings,
+                )
+        if tail is not None:
+            output_seq_embeddings = tail.finish()
 
         output_max_seq_len = max_seq_len
         output_total_uih_len = total_uih_len
@@ -356,37 +473,59 @@ class ContextualPreprocessor(InputPreprocessor):
                     contextual_input_embeddings.dtype
                 ),
             ).transpose(0, 1)
-            output_seq_embeddings = concat_2D_jagged(
-                max_seq_len=self._max_contextual_seq_len + output_max_seq_len,
-                values_left=fx_unwrap_optional_tensor(contextual_embeddings).reshape(
-                    -1, self._output_embedding_dim
-                ),
-                values_right=output_seq_embeddings,
-                max_len_left=self._max_contextual_seq_len,
-                max_len_right=output_max_seq_len,
-                offsets_left=None,
-                offsets_right=output_seq_offsets,
-                kernel=self.hammer_kernel(),
-            )
-            output_seq_timestamps = concat_2D_jagged(
-                max_seq_len=self._max_contextual_seq_len + output_max_seq_len,
-                values_left=torch.zeros(
-                    (output_seq_lengths.size(0) * self._max_contextual_seq_len, 1),
-                    dtype=output_seq_timestamps.dtype,
-                    device=output_seq_timestamps.device,
-                ),
-                values_right=output_seq_timestamps.unsqueeze(-1),
-                max_len_left=self._max_contextual_seq_len,
-                max_len_right=output_max_seq_len,
-                offsets_left=None,
-                offsets_right=output_seq_offsets,
-                kernel=self.hammer_kernel(),
-            ).squeeze(-1)
-            output_max_seq_len = output_max_seq_len + self._max_contextual_seq_len
-            output_seq_lengths = output_seq_lengths + self._max_contextual_seq_len
-            output_seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                output_seq_lengths
-            )
+            if fold_contextual_concat:
+                seq_payloads = seq_payloads.copy()
+                seq_payloads[CONTEXTUAL_FOLD_KEY] = fx_unwrap_optional_tensor(
+                    contextual_embeddings
+                ).reshape(-1, self._output_embedding_dim)
+            else:
+                output_seq_embeddings = concat_2D_jagged(
+                    max_seq_len=self._max_contextual_seq_len + output_max_seq_len,
+                    values_left=fx_unwrap_optional_tensor(
+                        contextual_embeddings
+                    ).reshape(-1, self._output_embedding_dim),
+                    values_right=output_seq_embeddings,
+                    max_len_left=self._max_contextual_seq_len,
+                    max_len_right=output_max_seq_len,
+                    offsets_left=None,
+                    offsets_right=output_seq_offsets,
+                    kernel=self.hammer_kernel(),
+                )
+            ctx_ts_fold: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+            if not torch.jit.is_scripting() and not is_fx_tracing():
+                # DLRM_HSTU_FP8_CONCAT_FOLD (ops/glue_fusion.py section 4): the
+                # zero-padded timestamp concat, lengths + L and their complete
+                # cumsum in one integer kernel (bitwise). output_seq_offsets is
+                # complete_cumsum(output_seq_lengths) here (computed above).
+                ctx_ts_fold = self._ctx_ts_pad_fold(
+                    output_seq_timestamps,
+                    output_seq_lengths,
+                    output_seq_offsets,
+                    output_max_seq_len,
+                )
+            if ctx_ts_fold is not None:
+                output_seq_timestamps, output_seq_lengths, output_seq_offsets = ctx_ts_fold
+                output_max_seq_len = output_max_seq_len + self._max_contextual_seq_len
+            else:
+                output_seq_timestamps = concat_2D_jagged(
+                    max_seq_len=self._max_contextual_seq_len + output_max_seq_len,
+                    values_left=torch.zeros(
+                        (output_seq_lengths.size(0) * self._max_contextual_seq_len, 1),
+                        dtype=output_seq_timestamps.dtype,
+                        device=output_seq_timestamps.device,
+                    ),
+                    values_right=output_seq_timestamps.unsqueeze(-1),
+                    max_len_left=self._max_contextual_seq_len,
+                    max_len_right=output_max_seq_len,
+                    offsets_left=None,
+                    offsets_right=output_seq_offsets,
+                    kernel=self.hammer_kernel(),
+                ).squeeze(-1)
+                output_max_seq_len = output_max_seq_len + self._max_contextual_seq_len
+                output_seq_lengths = output_seq_lengths + self._max_contextual_seq_len
+                output_seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+                    output_seq_lengths
+                )
             output_total_uih_len = (
                 output_total_uih_len
                 + self._max_contextual_seq_len * output_seq_lengths.size(0)
@@ -403,3 +542,39 @@ class ContextualPreprocessor(InputPreprocessor):
             output_num_targets,
             seq_payloads,
         )
+
+    @torch.jit.unused
+    def _ctx_ts_pad_fold(
+        self,
+        seq_timestamps: torch.Tensor,
+        seq_lengths: torch.Tensor,
+        seq_offsets: torch.Tensor,
+        max_seq_len: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """DLRM_HSTU_FP8_CONCAT_FOLD[_CTX_TS]: (zero-padded timestamps,
+        seq_lengths + L, complete_cumsum(seq_lengths + L)) from one integer
+        kernel, or None for the shipped ops (switch off, not the TRITON kernel,
+        unexpected dtype/layout, or a launch failure). seq_offsets must be
+        complete_cumsum(seq_lengths)."""
+        if self.hammer_kernel() != HammerKernel.TRITON:
+            return None
+        from generative_recommenders.ops import glue_fusion as _gf
+
+        L = self._max_contextual_seq_len
+        if not _gf.ctx_ts_pad_fusable(seq_timestamps, seq_lengths, seq_offsets, L):
+            return None
+        try:
+            out = _gf.ctx_ts_pad(
+                seq_timestamps, seq_lengths, seq_offsets, L, max_seq_len
+            )
+        except Exception as exc:  # fail closed to the shipped ops
+            _gf.disable("concat_fold_ctx_ts", exc)
+            return None
+        _gf.note_armed_rank0(
+            "concat_fold ctx_ts",
+            "contextual timestamp zeros + concat_2D_jagged + lengths add + "
+            "complete_cumsum as one integer kernel, _ctx_ts_pad_kernel (kill "
+            "switch DLRM_HSTU_FP8_CONCAT_FOLD=0 or "
+            "DLRM_HSTU_FP8_CONCAT_FOLD_CTX_TS=0)",
+        )
+        return out

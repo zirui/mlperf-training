@@ -1,9 +1,10 @@
 batch_size = @bs/env_int()
 bs/env_int.key     = "BATCH_SIZE"
 bs/env_int.default = 1024
+
 num_workers = @nw/env_int()
 nw/env_int.key     = "NUM_WORKERS"
-nw/env_int.default = 4
+nw/env_int.default = 6
 prefetch_factor = @pf/env_int()
 pf/env_int.key     = "PREFETCH_FACTOR"
 pf/env_int.default = 8
@@ -11,9 +12,11 @@ dataset = "yambda-5b"
 
 make_model.dataset = %dataset
 make_model.bf16_training = True
+
 make_model.transducer_bf16_dtype = @tbd/env_int()
 tbd/env_int.key     = "TRANSDUCER_BF16_DTYPE"
 tbd/env_int.default = 1
+
 make_model.hammer_kernel = "TRITON"
 
 apply_env_bootstrap.TRITON_FULL_AUTOTUNE = False
@@ -37,36 +40,177 @@ apply_env_bootstrap.DLRM_HSTU_FP8_BWD = True
 apply_env_bootstrap.DLRM_HSTU_FP8_BWD_QK_MFMA = "fp8"
 
 apply_env_bootstrap.DLRM_HSTU_FP8_BWD_FULL = True
+
 apply_env_bootstrap.DLRM_HSTU_FP8_MASK16 = True
+
 apply_env_bootstrap.DLRM_HSTU_FP8_BWD_EPILOGUE = "reuse_pk"
+
 apply_env_bootstrap.DLRM_HSTU_FP8_GC_FREEZE = True
+
 apply_env_bootstrap.DLRM_HSTU_FP8_FLYDSL_CURRENT_STREAM = True
+
 apply_env_bootstrap.DLRM_HSTU_FP8_SYNCFREE = True
 
 streaming_train_eval_loop.eval_num_workers = @enw/env_int()
 enw/env_int.key     = "EVAL_NUM_WORKERS"
-enw/env_int.default = 16
+enw/env_int.default = 8
 streaming_train_eval_loop.eval_rearm_prefetch_factor = @erpf/env_int()
 erpf/env_int.key     = "EVAL_REARM_PREFETCH_FACTOR"
 erpf/env_int.default = 1
+streaming_train_eval_loop.eval_arm_lead_steps = @eals/env_int()
+eals/env_int.key     = "EVAL_ARM_LEAD_STEPS"
+eals/env_int.default = 64
+streaming_train_eval_loop.eval_warm_lead_steps = @ewls/env_int()
+ewls/env_int.key     = "EVAL_WARM_LEAD_STEPS"
+ewls/env_int.default = 560
+
 apply_env_bootstrap.DLRM_HSTU_FP8_PREBUILD = True
+
 apply_env_bootstrap.DLRM_HSTU_FP8_AUTOTUNE_PINS = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_AUTOTUNE_PIN_POSENC_CONCAT = True
+
 apply_env_bootstrap.DLRM_HSTU_FP8_ALLOC_PREGROW = "memcpy=2.81,data_dist=1.82,main=rest,memcpy_small=0.02,data_dist_small=0.03,main_small=0.22,eval_memcpy=1.6,eval_data_dist=1.6,eval_memcpy_small=0.01,eval_data_dist_small=0.01,margin=56"
+
 apply_env_bootstrap.DLRM_HSTU_FP8_BWD_DQ_SPLIT = True
 apply_env_bootstrap.DLRM_HSTU_FP8_BWD_PIPE = 2
+
 apply_env_bootstrap.DLRM_HSTU_FP8_EC_CAT_FUSE = True
 apply_env_bootstrap.DLRM_HSTU_FP8_EC_STRIDED_GRAD = True
 apply_env_bootstrap.DLRM_HSTU_FP8_POSENC_FAST = True
+
 apply_env_bootstrap.DLRM_HSTU_FP8_WLN_BWD_V2 = True
 apply_env_bootstrap.DLRM_HSTU_FP8_WLN_BWD_V2_FAST_SIGMOID = True
 apply_env_bootstrap.DLRM_HSTU_FP8_LNMD_BWD_V2 = True
+
 apply_env_bootstrap.DLRM_HSTU_FP8_SAVE_NORMED_X = True
 apply_env_bootstrap.DLRM_HSTU_FP8_SAVE_TARGETS_VK = True
+
 apply_env_bootstrap.DLRM_HSTU_FP8_COLSUM = True
+
+apply_env_bootstrap.TRITON_SPEC_REPLAY = "generative_recommenders/ops/triton/triton_spec_table.jsonl"
+
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_VALU = "undef,rfl,ilp,msat"
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_MSPLIT = 1
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_MSPLIT_SCHED = "mid,sb,wsl,sgv5,la"
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_DQ_SPLIT_SCHED = "ilr"
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_DQ_SPLIT_OPT = "sp,r1,wcg"
+
+apply_env_bootstrap.DLRM_HSTU_FP8_WLN_FWD_V2 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_LNMD_FWD_V2 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_POSENC_CONCAT_FOLD = True
+apply_env_bootstrap.DLRM_HSTU_FP8_DROPOUT_MSCALE_FOLD = True
+apply_env_bootstrap.DLRM_HSTU_FP8_TGT_SPARSE_RESID = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_EC_GROUP_BWD = True
+apply_env_bootstrap.DLRM_HSTU_FP8_SEQ_A2A_ROWPERM = True
+apply_env_bootstrap.DLRM_HSTU_FP8_UNBUCKETIZE_GATHER = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_OUT_WGRAD = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_UVQK = True
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_UVQK_WGRAD = "fp8t"
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_UVQK_STORE_T = True
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_VK_PRODUCER = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_EC_SORT32 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_EC_GATHER_V2 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_WLN_BWD_POW2 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_WSHADOW_FUSED = True
+apply_env_bootstrap.DLRM_HSTU_FP8_DDP_BATCHED_COPY = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_TARGET_B = True
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_STORE_T_V2 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_VKP_V2 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_COLSUM_V2 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_DQ_E5M2 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_SHADOW_FUSED = True
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_HELPERS_FUSED = True
+apply_env_bootstrap.DLRM_HSTU_FP8_FWD_U_DP = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_FWD_PIPE = True
+apply_env_bootstrap.DLRM_HSTU_FP8_DELTA_FWD_BM16 = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_ATTN_V2 = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_D256_V3 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_WLN_DXSUM_V3 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_LNMD_FWD_V3 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_EC_REDUCE_LPT = True
+apply_env_bootstrap.DLRM_HSTU_FP8_LNMD_FWD_MASKGEN = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_WLN_BWD_FLYDSL = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_PREPROC_GROUPED_TAIL = True
+
+window_single_pool.enabled = @dlsp/env_int()
+dlsp/env_int.key     = "DL_SINGLE_POOL"
+dlsp/env_int.default = 1
+
+window_prime_pacing.fraction = @dlpace/env_float()
+dlpace/env_float.key     = "DL_PRIME_PACE"
+dlpace/env_float.default = 0.75
+
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_DU_E5M2 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_TM_NONEXP = True
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_WGRAD_CK = True
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_WGRAD_CK_W3 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_WGRAD_CK_XT_TILED = True
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_WGRAD_CK_W3_TILED = True
+apply_env_bootstrap.DLRM_HSTU_FP8_TM_NONEXP_TILED = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_OUTPROJ_LNMD_FUSED = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_POSENC_DROPOUT_FUSE = True
+apply_env_bootstrap.DLRM_HSTU_FP8_POSENC_DROPOUT_V2 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_POSENC_SORT16 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_POSENC_BWD_V2 = True
+apply_env_bootstrap.DLRM_HSTU_FP8_EC_JOINT_SORT = True
+apply_env_bootstrap.DLRM_HSTU_FP8_ACTION_ENC_FUSE = True
+apply_env_bootstrap.DLRM_HSTU_FP8_EC_MERGED_INDEX_FUSE = True
+apply_env_bootstrap.DLRM_HSTU_FP8_CONTEXTUAL_FUSE = True
+apply_env_bootstrap.DLRM_HSTU_FP8_LAZY_FLOPS_STASH = True
+apply_env_bootstrap.DLRM_HSTU_FP8_IDIST_AFTER_PREV_FWD = 1
+
+apply_env_bootstrap.DLRM_HSTU_FP8_DROPOUT_MASK_BITS = True
+apply_env_bootstrap.DLRM_HSTU_FP8_CONCAT_FOLD = True
+apply_env_bootstrap.DLRM_HSTU_FP8_GLUE_FOLD3 = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_POSENC_DROP_HWEPI = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_FWD_K512 = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_FWD_K1536 = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_PREPROC_GROUPED_TAIL_BWD = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_WLN_BWD_FLYDSL_MSCALE = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_POSENC_POS_ARITH = True
+apply_env_bootstrap.DLRM_HSTU_FP8_POSENC_TS_ONESWEEP = True
+apply_env_bootstrap.DLRM_HSTU_FP8_EC_JOINT_ONESWEEP = True
+apply_env_bootstrap.DLRM_HSTU_FP8_EC_GATHER_WIDE = True
+apply_env_bootstrap.DLRM_HSTU_FP8_EC_REDUCE_FUSED = True
+apply_env_bootstrap.DLRM_HSTU_FP8_GLUE_FOLD4 = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_DKDV_E5M2 = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_DOBLK_WL = True
+apply_env_bootstrap.DLRM_HSTU_FP8_DELTA_BWD_V2_DIET = True
+apply_env_bootstrap.DLRM_HSTU_FP8_ATTN_GLUE_LAZY = True
+apply_env_bootstrap.DLRM_HSTU_FP8_FWD_MASK_ARITH = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_FWD_PV = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_PREPROC_L2 = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_VF3P = True
+
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_FULL_DSC_K = -4
 
 seed_everything.seed = @seed/env_int()
 seed/env_int.key     = "SEED"
-seed/env_int.default = 1
+seed/env_int.default = -1
 
 decorrelate_runtime_rng.enabled = @drr/env_int()
 drr/env_int.key     = "DECORRELATE_DROPOUT"
@@ -80,6 +224,8 @@ dense_optimizer_factory_and_class.momentum = 0
 dense_optimizer_factory_and_class.weight_decay = 0
 dense_optimizer_factory_and_class.eps = 1e-8
 dense_optimizer_factory_and_class.betas = (0.95, 0.999)
+
+apply_env_bootstrap.DLRM_HSTU_FP8_DENSE_ADAM_FUSED = True
 
 sparse_optimizer_factory_and_class.learning_rate = @slr/env_float()
 slr/env_float.key     = "SPARSE_LR"
@@ -183,6 +329,7 @@ flnr/env_int.default = 1
 
 get_dataset.name = %dataset
 get_dataset.new_path_prefix = %DATA_PATH
+
 get_dataset.history_length = @hl/env_int()
 hl/env_int.key     = "HISTORY_LENGTH"
 hl/env_int.default = 4086
@@ -205,16 +352,20 @@ nl/env_int.default = 3
 
 get_dataset.streaming_window_seconds = 86400
 get_dataset.streaming_sort_within_window = False
+
 get_dataset.use_offline_ts_indices = @swi/env_int()
 swi/env_int.key     = "DL_WINDOW_INDEX"
 swi/env_int.default = 1
+
 streaming_shuffle_fraction = 0.0
 get_dataset.streaming_shuffle_fraction = @ssf/env_float()
 ssf/env_float.key     = "STREAMING_SHUFFLE_FRACTION"
 ssf/env_float.default = %streaming_shuffle_fraction
+
 get_dataset.streaming_shuffle_seed = @ssfseed/env_int()
 ssfseed/env_int.key     = "STREAMING_SHUFFLE_SEED"
 ssfseed/env_int.default = 0
+
 get_dataset.train_split_percentage = %TRAIN_SPLIT_PERCENTAGE
 get_dataset.split_salt = @ssalt/env_int()
 ssalt/env_int.key     = "SPLIT_SALT"
@@ -225,6 +376,7 @@ make_streaming_dataloader.prefetch_factor = %prefetch_factor
 make_persistent_streaming_dataloader.batch_size = %batch_size
 make_persistent_streaming_dataloader.num_workers = %num_workers
 make_persistent_streaming_dataloader.prefetch_factor = %prefetch_factor
+
 pin_memory = @pin/env_int()
 pin/env_int.key     = "DL_PIN_MEMORY"
 pin/env_int.default = 1
@@ -232,44 +384,96 @@ make_streaming_dataloader.pin_memory = %pin_memory
 make_persistent_streaming_dataloader.pin_memory = %pin_memory
 streaming_train_eval_loop.num_train_ts = @nts/env_int()
 nts/env_int.key = "NUM_TRAIN_TS"
+
 nts/env_int.default = 299
+
 streaming_train_eval_loop.start_ts = @sts/env_int()
 sts/env_int.key = "START_TS"
 sts/env_int.default = 0
+
 streaming_train_eval_loop.metric_log_frequency = @mlf/env_int()
 mlf/env_int.key     = "METRIC_LOG_FREQ"
 mlf/env_int.default = 0
+
 streaming_train_eval_loop.eval_interim_metrics = @eil/env_int()
 eil/env_int.key     = "EVAL_INTERIM_LOG"
 eil/env_int.default = 0
+
 streaming_train_eval_loop.mlperf_train_loss_log_frequency = @mltlf/env_int()
 mltlf/env_int.key     = "MLPERF_TRAIN_LOSS_LOG_FREQ"
 mltlf/env_int.default = 0
+
 streaming_train_eval_loop.streaming_diag_unique_emb = @due/env_int()
 due/env_int.key     = "DIAG_UNIQUE_EMB"
 due/env_int.default = 0
+
 streaming_train_eval_loop.output_trace = @ot/env_int()
 ot/env_int.key     = "OUTPUT_TRACE"
 ot/env_int.default = 0
+
 streaming_train_eval_loop.persistent_loader = @pl/env_int()
 pl/env_int.key = "PERSISTENT_LOADER"
 pl/env_int.default = 1
+
 streaming_train_eval_loop.eval_every_n_windows = @evn/env_int()
 evn/env_int.key = "EVAL_EVERY_N_WINDOWS"
 evn/env_int.default = 0
+
 streaming_train_eval_loop.eval_every_data_pct = @edp/env_float()
 edp/env_float.key     = "EVAL_EVERY_DATA_PCT"
 edp/env_float.default = 0.001
+
 streaming_train_eval_loop.skip_eval_epoch_pct = @seep/env_float()
 seep/env_float.key     = "SKIP_EVAL_EPOCH_PCT"
-seep/env_float.default = 0.025
+seep/env_float.default = -1.0
+
 streaming_train_eval_loop.double_buffer = @db/env_int()
 db/env_int.key = "DOUBLE_BUFFER"
 db/env_int.default = 1
+
+prestart_streaming_loaders.enabled = @dlps/env_int()
+dlps/env_int.key = "DL_PRESTART"
+dlps/env_int.default = 2
+
+prestart_streaming_loaders.persistent_loader = @pl/env_int()
+prestart_streaming_loaders.double_buffer = @db/env_int()
+prestart_streaming_loaders.eval_num_workers = @enw/env_int()
+prestart_streaming_loaders.eval_every_n_windows = @evn/env_int()
+prestart_streaming_loaders.eval_every_data_pct = @edp/env_float()
+run_blas_warmup.enabled = @blasw/env_int()
+blasw/env_int.key = "BLAS_WARMUP"
+blasw/env_int.default = 1
+
+run_blas_warmup.m = @blaswm/env_int()
+blaswm/env_int.key = "BLAS_WARMUP_M"
+blaswm/env_int.default = 16
+run_startup_preload.enabled = @blasw/env_int()
+
+run_fp8_first_use_warmup.enabled = @fp8w/env_str()
+fp8w/env_str.key = "FP8_WARMUP"
+fp8w/env_str.default = "2"
+
+fast_batch_pools.train_pools = @dlfb/env_int()
+dlfb/env_int.key = "DL_FAST_BATCH"
+dlfb/env_int.default = 0
+fast_batch_pools.eval_pools = @dlfbe/env_int()
+dlfbe/env_int.key = "DL_FAST_BATCH_EVAL"
+dlfbe/env_int.default = 1
+
 streaming_train_eval_loop.use_pipeline = @tp/env_int()
 tp/env_int.key = "TRAIN_PIPELINE"
 tp/env_int.default = 1
+
 build_train_pipeline.defer_next_input_wait = True
+
+pin_free_shm_release.enabled = @dlpfs/env_int()
+dlpfs/env_int.key     = "DL_PIN_FREE_SHM"
+dlpfs/env_int.default = 1
+
+fast_batch_onestore.level = @dlfbos/env_int()
+dlfbos/env_int.key     = "DL_FAST_BATCH_ONESTORE"
+dlfbos/env_int.default = 2
+
 streaming_train_eval_loop.eval_holdout_ts = @eht/env_int()
 eht/env_int.key     = "EVAL_HOLDOUT_TS"
 eht/env_int.default = 299
@@ -283,6 +487,7 @@ train_eval_loop.eval_frequency = 500
 train_eval_loop.num_eval_batches = 200
 train_eval_loop.checkpoint_frequency = 1000000000
 train_eval_loop.output_trace = True
+
 train_eval_loop.use_pipeline = False
 
 RUN_NAME = @run/env_path()
@@ -292,11 +497,15 @@ run_results_dir.run_name = %RUN_NAME
 
 Profiler.trace_steps = [41, 51]
 Profiler.warmup = 1
+
 Profiler.active = 8
 Profiler.skip_head = 1
 Profiler.keep_active = 5
+
 Profiler.skip_boundary_steps = False
+
 Profiler.align_ranks = True
+
 tdir/env_path.key     = "TRACE_DIR"
 tdir/env_path.default = "/tmp/dlrm_v4_traces"
 Profiler.trace_dir = @tdir/env_path()
@@ -305,44 +514,57 @@ MetricsLogger.tensorboard_log_path = @tbp/env_path()
 tbp/env_path.key     = "TENSORBOARD_LOG_PATH"
 tbp/env_path.default = ""
 MetricsLogger.world_size = 8
+
 MetricsLogger.auc_threshold = @at/env_float()
 at/env_float.key     = "AUC_THRESHOLD"
 at/env_float.default = 0.75
+
 MetricsLogger.train_lifetime_auc_mode = @tlam/env_str()
 tlam/env_str.key     = "TRAIN_LIFETIME_AUC_MODE"
 tlam/env_str.default = "binned"
 MetricsLogger.eval_lifetime_auc_mode = @elam/env_str()
 elam/env_str.key     = "EVAL_LIFETIME_AUC_MODE"
 elam/env_str.default = "binned"
+
 MetricsLogger.cumulative_auc_bins = @cab/env_int()
 cab/env_int.key     = "CUMULATIVE_AUC_BINS"
 cab/env_int.default = 100000
+
 MetricsLogger.lifetime_auc_window = @law/env_int()
 law/env_int.key     = "LIFETIME_AUC_WINDOW"
 law/env_int.default = 10000000
+
 save_dmp_checkpoint.path = @ckpt/env_path()
 ckpt/env_path.key     = "CKPT_PATH"
 ckpt/env_path.default = ""
 load_dmp_checkpoint.path = @ckpt/env_path()
+
 save_dmp_checkpoint.keep_last_n = @kln/env_int()
 kln/env_int.key     = "KEEP_LAST_N"
 kln/env_int.default = 1
+
 streaming_train_eval_loop.in_window_checkpoint_frequency = @iwcf/env_int()
 iwcf/env_int.key     = "IN_WINDOW_CKPT_FREQ"
 iwcf/env_int.default = 0
+
 streaming_train_eval_loop.checkpoint_step_frequency = @csf/env_int()
 csf/env_int.key     = "CKPT_STEP_FREQ"
 csf/env_int.default = 0
+
 streaming_train_eval_loop.checkpoint_time_interval_s = @ctis/env_float()
 ctis/env_float.key     = "CKPT_TIME_INTERVAL_S"
 ctis/env_float.default = 3600.0
+
 streaming_train_eval_loop.skip_checkpoint_polling_when_disabled = True
+
 streaming_train_eval_loop.num_train_batches = @ntb/env_int()
 ntb/env_int.key     = "NUM_TRAIN_BATCHES"
 ntb/env_int.default = 0
+
 streaming_train_eval_loop.num_eval_batches = @neb/env_int()
 neb/env_int.key     = "NUM_EVAL_BATCHES"
 neb/env_int.default = 0
+
 streaming_train_eval_loop.die_at_step = @das/env_int()
 das/env_int.key     = "DIE_AT_STEP"
 das/env_int.default = -1

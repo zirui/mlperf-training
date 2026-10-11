@@ -1,12 +1,11 @@
-# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """HSTU jagged attention with FlyDSL forward and backward kernels, each optional.
 
 THE TWO HALVES ARE SELECTED INDEPENDENTLY, because HSTU has no softmax: the
 forward hands the backward no lse and no rowsum(dO*O), so nothing couples them.
-$HSTU_ATTN_BWD defaults to flydsl. $HSTU_ATTN_FWD defaults to **flydsl** in gin
-(FlyDSL e4m3 forward + fused-silu when DLRM_HSTU_FP8_FWD is on).
-$HSTU_ATTN_FWD=triton is the opt-out. The bf16 FlyDSL forward is the same knob
-with FP8 off. `$HSTU_ATTN_FWD_DUMP_LENS` below dumps the forward lengths.
+$HSTU_ATTN_BWD defaults to flydsl. $HSTU_ATTN_FWD
+defaults to **flydsl** in gin (FlyDSL e4m3 forward + fused-silu when
+DLRM_HSTU_FP8_FWD is on). $HSTU_ATTN_FWD=triton is the opt-out. The bf16
+FlyDSL forward is the same knob with FP8 off (bit-identical).
 
 `hstu_mha` mirrors the signature of
 `generative_recommenders.ops.triton.triton_hstu_attention.triton_hstu_mha`, so
@@ -17,8 +16,9 @@ behind $HSTU_ATTN_BWD, which **defaults to flydsl** (gin:
 TWO KINDS OF "CAN'T RUN", DELIBERATELY HANDLED DIFFERENTLY.
 
   * The HOST cannot run it -- not a gfx950 GPU, or flydsl is not installed.
-    That is a property of the whole process. FlyDSL is the default, so a
-    missing install raises `FlyDSLUnavailableError` on first use
+    That is a property of the whole process, it makes every backward
+    slower, and since flydsl is the default it would otherwise be an
+    invisible regression. So it RAISES `FlyDSLUnavailableError` on first use
     rather than degrading. Opt out explicitly with $HSTU_ATTN_BWD=triton.
   * The SHAPE cannot be served -- see SPECIALIZATIONS below. That is per call
     and legitimately varies across configs and tests, so it falls back to the
@@ -35,11 +35,13 @@ it cannot serve is slower, never wrong:
   * causal, max_attn_len == 0, contextual_seq_len == 0
   * num_targets is None, or every entry is <= 1
 
-  HSTU's target-aware masking clamps positions to max_ids = seq_len - n_targets
-  and then applies the ordinary >= mask. At num_targets = 1 the clamp is the
-  identity, so plain causal is the same function. At num_targets > 1 it is not.
-  yambda-5b sets hstu_config.max_num_candidates = 1. A config that raises it
-  falls back rather than computing the wrong mask.
+  The last one deserves its reason. HSTU's target-aware masking clamps positions
+  to max_ids = seq_len - n_targets and then applies the ordinary >= mask to the
+  clamped values. At n_targets = 1 the only affected position is seq_len-1, which
+  clamps to itself, so the clamp is an identity and plain causal is exactly
+  right. yambda-5b sets hstu_config.max_num_candidates = 1, so
+  this covers production, but a config that raises it must fall back rather than
+  quietly compute the wrong function.
 
   `heads` is a compile-time constant (it keys the kernel cache) -- not a
   correctness limit, just a fresh JIT per distinct head count. max_seq_len is NOT
@@ -47,9 +49,9 @@ it cannot serve is slower, never wrong:
   it per batch as max_uih_len + num_candidates.
 
 NON-DETERMINISM.  dq is accumulated with global atomics, so the order of the
-float adds varies run to run and dq is not bitwise reproducible. dk and dv are
-deterministic. A caller that needs bitwise reproducibility must use the Triton
-path.
+float adds varies run to run and dq is NOT bitwise reproducible. dk and dv are
+deterministic and come back bit-identical (dv) or within a few ulps (dk) of
+Triton. A caller needing bitwise reproducibility across runs must use the Triton path.
 """
 
 from __future__ import annotations
@@ -65,6 +67,7 @@ import torch
 from generative_recommenders.ops.flydsl import (
     DEFAULT_BWD_BACKEND,
     DEFAULT_FWD_BACKEND,
+    FLYDSL_ARCH_PIN,
 )
 from generative_recommenders.ops.triton.triton_hstu_attention import (
     triton_hstu_attention_bwd,
@@ -110,7 +113,10 @@ _e1_bwd_calls: int = 0
 def _maybe_dump_lengths(seq_offsets: torch.Tensor) -> None:
     """Save one batch's sequence lengths to $HSTU_ATTN_FWD_DUMP_LENS, once.
 
-    Off unless the variable is set. Writes once per process.
+    Captures the production length distribution for offline benchmarks, whose
+    bound-sized grids are sensitive to it.
+
+    Off unless the variable is set, and writes exactly once per process.
     """
     path = os.environ.get("HSTU_ATTN_FWD_DUMP_LENS", "")
     if not path:
@@ -142,8 +148,7 @@ def _max_num_targets(num_targets: torch.Tensor) -> int:
 
     Every HSTU layer's backward is handed the same num_targets tensor and asks
     the same question of it, but `.item()` is a device-to-host sync: it drains
-    the launch queue, and in the backward the queue is at its deepest. Profiled
-    at 31.7 ms per call against 0.6 ms for the same call in the forward, so the
+    the launch queue, and in the backward the queue is at its deepest, so the
     cost is the wait for queued work, not the 4-byte copy. Memoizing collapses
     the per-step cost from one sync per layer to one.
 
@@ -176,7 +181,7 @@ class FlyDSLUnavailableError(RuntimeError):
     """The FlyDSL backward was selected but this host cannot run it.
 
     Raised rather than falling back because flydsl is the default: a silent
-    downgrade to Triton is a ~2x slower backward that no log line would show.
+    downgrade to Triton is a slower backward that no log line would show.
     """
 
 
@@ -203,6 +208,41 @@ def unsupported_hardware_reason() -> Optional[str]:
     if not arch.startswith(SUPPORTED_ARCH):
         return f"device arch is {arch!r}, the kernel is built for {SUPPORTED_ARCH}"
     return None
+
+
+def _flydsl_arch_check(kernel_module) -> Tuple[str, Optional[str]]:
+    """(arch FlyDSL builds for, None), or (arch, why the kernel cannot run).
+
+    The device can be gfx950 while FlyDSL compiles for something else: its
+    get_rocm_arch() falls back to "gfx942" when $FLYDSL_GPU_ARCH and
+    $HSA_OVERRIDE_GFX_VERSION are unset and `rocm_agent_enumerator -name`
+    fails or exceeds 5 s, and the first gfx950-only MFMA intrinsic then aborts
+    the process (rc 139, no traceback). Read through the kernel module's own
+    module-scope import, i.e. the function its builders call. FlyDSL
+    lru_caches it per process, so this call fixes the arch the first build
+    will use, and repeats are free.
+    """
+    try:
+        get_arch = getattr(kernel_module, "get_rocm_arch", None)
+        if get_arch is None:
+            from flydsl.runtime.device import get_rocm_arch as get_arch
+        arch = str(get_arch())
+    except Exception as e:  # noqa: BLE001 - report it, do not mask it
+        return "", f"FlyDSL could not resolve its target arch ({type(e).__name__}: {e})"
+    if arch.startswith(SUPPORTED_ARCH):
+        return arch, None
+    return arch, (
+        f"FlyDSL resolved its compile target to {arch!r}, not {SUPPORTED_ARCH} "
+        f"(FLYDSL_GPU_ARCH={os.environ.get('FLYDSL_GPU_ARCH', '<unset>')}, "
+        f"arch pin at import: {FLYDSL_ARCH_PIN[1]}); every FlyDSL kernel would "
+        f"be built for it and abort the process at its first "
+        f"{SUPPORTED_ARCH}-only MFMA intrinsic (LLVM ERROR: Cannot select, rc "
+        f"139). FlyDSL fixes the arch at its first lookup in the process: "
+        f"FLYDSL_GPU_ARCH or HSA_OVERRIDE_GFX_VERSION, else "
+        f"'rocm_agent_enumerator -name' (5 s timeout, errors swallowed), else "
+        f"its 'gfx942' fallback. Fix: export FLYDSL_GPU_ARCH={SUPPORTED_ARCH} "
+        f"before the process starts (the launcher must set it)"
+    )
 
 
 def _load_kernel():
@@ -237,6 +277,9 @@ def require_flydsl() -> None:
     reason = unsupported_hardware_reason()
     if reason is None and _load_kernel() is None:
         reason = f"flydsl import failed ({type(_kernel_error).__name__}: {_kernel_error})"
+    fly_arch = ""
+    if reason is None:
+        fly_arch, reason = _flydsl_arch_check(_kernel)
     if reason is None:
         _host_ok = True
         # The one place both call sites pass through, and the only selection
@@ -244,12 +287,14 @@ def require_flydsl() -> None:
         # ops/hstu_attention.py's dispatch, so without this a production run
         # says nothing about which backward it ran.
         # The forward half is reported from the env rather than hardcoded: it is
-        # separately selectable and now defaults to flydsl too, so a fixed string
-        # here would misreport the run it is supposed to be the record of.
+        # separately selectable, so a fixed string here would misreport the run.
         logger.info(
-            "[hstu-attn] backward kernel: flydsl (forward: %s) on %s",
+            "[hstu-attn] backward kernel: flydsl (forward: %s) on %s "
+            "flydsl_arch=%s pin=%s",
             "flydsl" if flydsl_fwd_selected() else "triton",
             _device_arch(),
+            fly_arch,
+            FLYDSL_ARCH_PIN[1],
         )
         return
     raise FlyDSLUnavailableError(
@@ -298,7 +343,7 @@ def unsupported_shape_reason(
     if num_targets is not None:
         # Checked here rather than trusted from the caller: that is the
         # difference between falling back and silently computing a different
-        # function, which is the exact failure this kernel already shipped once.
+        # function.
         # The sync it costs is amortized to once per batch -- see _max_num_targets.
         n = _max_num_targets(num_targets)
         if n > 1:
@@ -389,13 +434,13 @@ def bwd_qk_mfma_mode() -> str:
     return "fp8"
 
 
-# Removed: block dO scales (DOBLK) and the saturating cast (SAT)
-# are the only C8 path now. An off value must not be silently ignored.
+# Removed knobs: block dO scales (DOBLK) and the saturating cast (SAT) are
+# always on in the full-fp8 backward. An off value must not be silently ignored.
 _REMOVED_C8_KNOBS = ("DLRM_HSTU_FP8_BWD_FULL_DOBLK", "DLRM_HSTU_FP8_BWD_FULL_SAT")
 
 
 def check_removed_c8_knobs() -> None:
-    """Raise if a removed C8 sub-knob is set to an off value (an on value is
+    """Raise if a removed full-fp8 sub-knob is set to an off value (an on value is
     the only behaviour and is accepted). Same rule as
     dlrm_v4/train/_env_bootstrap._check_removed_c8_knobs."""
     for name in _REMOVED_C8_KNOBS:
@@ -415,8 +460,11 @@ def bwd_full_fp8_enabled() -> bool:
         "1", "true", "on", "yes")
 
 
-# $DLRM_HSTU_FP8_BWD_FULL_HYBRID = dq | dkdv (default unset). Diagnostic only:
-# it runs both backward kernels and keeps one gradient from each.
+# $DLRM_HSTU_FP8_BWD_FULL_HYBRID = dq | dkdv (default unset; DIAGNOSTIC ONLY:
+# it runs BOTH backward kernels per call, so it is slower than either). With
+# the full-fp8 backward armed, the bf16-backward kernel's dq (resp. dk and dv)
+# replaces the full-fp8 kernel's. It isolates which gradient's fp8 error owns
+# a convergence deficit.
 _hybrid_force_off = [False]
 _hybrid_inner = [False]
 
@@ -521,7 +569,7 @@ _bwd_dump_calls = [0]
 def _bwd_dump_dir() -> str:
     """$DLRM_HSTU_FP8_BWD_DUMP=<dir> (default OFF; DEBUG ONLY, host-syncs on
     the selected calls). Rank 0 saves real backward operands for offline
-    numerics (C8 L0 harness) on the call indices listed in
+    numerics on the call indices listed in
     $DLRM_HSTU_FP8_BWD_DUMP_CALLS (comma list, 0-based over every backward
     call of this process). Inert when unset."""
     d = os.environ.get("DLRM_HSTU_FP8_BWD_DUMP", "")
@@ -567,7 +615,7 @@ def _bwd_dump(q, k, v, dout, do_scale, seq_offsets, N, alpha, qkv_scale,
         "dq": g(dq), "dk": g(dk), "dv": g(dv),
         "do_scale": (None if do_scale is None or do_scale.dtype == torch.uint8
                      else do_scale.cpu()),
-        # do_blk (C8 option B): the per-token group bytes E8 = 127 - e_g.
+        # do_blk: the per-token group bytes E8 = 127 - e_g.
         "do_e8": (g(do_scale) if do_scale is not None
                   and do_scale.dtype == torch.uint8 else None),
         # Whole-batch dO magnitude census, per token over heads x dim.
@@ -589,7 +637,8 @@ def _dq_split_order(N: int) -> str:
     """Grid order of the dq-split kernel ($DLRM_HSTU_FP8_BWD_DQ_SPLIT_ORDER).
 
     "xcd" (default) groups each (b, h)'s row blocks on one XCD so its K tiles
-    stay in that XCD's L2; "bh" is the row-major order.  Bitwise-identical dq.
+    stay in that XCD's L2; "bh" is the (b, h)-major order.  Bitwise-identical
+    dq.
     """
     order = os.environ.get("DLRM_HSTU_FP8_BWD_DQ_SPLIT_ORDER", "xcd").strip().lower()
     if order not in ("bh", "xcd"):
@@ -598,6 +647,130 @@ def _dq_split_order(N: int) -> str:
         _DQ_SPLIT_ORDER_LOGGED.add(order)
         logger.warning("[hstu-attn] bwd dq SPLIT grid order: %s", order)
     return order
+
+
+def _dq_split_ld():
+    """$DLRM_HSTU_FP8_DQ_SPLIT_LD (default unset = {}): cache policy of the dq-split kernel's ws loads (read exactly once).
+    Comma list of a Triton cache_modifier (.ca|.cg|.cv|.cs) and/or an
+    eviction_policy (evict_first|evict_last).  Same bytes loaded: bitwise."""
+    v = os.environ.get("DLRM_HSTU_FP8_DQ_SPLIT_LD", "").strip().lower()
+    kw = {}
+    for t in (x.strip() for x in v.split(",")):
+        if t in (".ca", ".cg", ".cv", ".cs"):
+            kw["ws_cm"] = t
+        elif t in ("evict_first", "evict_last"):
+            kw["ws_ev"] = t
+        elif t:
+            raise ValueError(f"DLRM_HSTU_FP8_DQ_SPLIT_LD={v!r}")
+    return kw
+
+
+_DQ_SPLIT_SCHED_LOGGED = set()
+
+
+def _dq_split_sched() -> str:
+    """XCD-balanced dq-split schedule ($DLRM_HSTU_FP8_BWD_DQ_SPLIT_SCHED,
+    default OFF = ""): "il" interleaves (b, h) units over the 8 XCDs instead of
+    giving each XCD a contiguous batch slice; "lpt" also walks them longest sequence first.  Bitwise dq."""
+    v = os.environ.get("DLRM_HSTU_FP8_BWD_DQ_SPLIT_SCHED", "").strip().lower()
+    if v in ("", "0", "off", "none"):
+        return ""
+    if v not in ("il", "lpt", "ilb", "ilr", "bc"):
+        raise ValueError(
+            f"DLRM_HSTU_FP8_BWD_DQ_SPLIT_SCHED={v!r}: use il|lpt|ilb|ilr|bc")
+    if v not in _DQ_SPLIT_SCHED_LOGGED:
+        _DQ_SPLIT_SCHED_LOGGED.add(v)
+        logger.warning("[hstu-attn] bwd dq SPLIT XCD-balanced schedule ARMED: %s", v)
+    return v
+
+
+_DQ_SPLIT_OPT_LOGGED = set()
+
+
+def _dq_split_opt() -> dict:
+    """dq-split load knobs ($DLRM_HSTU_FP8_BWD_DQ_SPLIT_OPT,
+    default OFF = no kwargs).  Comma tokens: r1 (mask ws rows past the
+    sequence end), sp (scalar per-tile base + int32 offsets: the ws stream
+    becomes buffer loads), wcg/wcv/wca (ws load cache_modifier), wef/wel (ws
+    eviction_policy evict_first/evict_last), kcg/kca (K cache_modifier),
+    kel/kef (K eviction_policy), e<N> (waves_per_eu), s<N> (num_stages).
+    Same tiles and dot order: bitwise dq.  Needs a DQ_SPLIT_SCHED."""
+    v = os.environ.get("DLRM_HSTU_FP8_BWD_DQ_SPLIT_OPT", "").strip().lower()
+    if v in ("", "0", "off", "none"):
+        return {}
+    o = {}
+    ev = {"ef": "evict_first", "el": "evict_last"}
+    for t in (x.strip() for x in v.split(",") if x.strip()):
+        if t == "r1":
+            o["rm"] = 1
+        elif t == "sp":
+            o["sptr"] = 1
+        elif t == "kb":
+            # constexpr K row stride -> K buffer loads.
+            o["rsk"] = 1
+        elif t[0] in "wk" and t[1:] in ("cg", "cv", "ca"):
+            o["cmw" if t[0] == "w" else "cmk"] = "." + t[1:]
+        elif t[0] in "wk" and t[1:] in ev:
+            o["evw" if t[0] == "w" else "evk"] = ev[t[1:]]
+        elif t[0] == "e" and t[1:].isdigit():
+            o["waves_per_eu"] = int(t[1:])
+        elif t[0] == "s" and t[1:].isdigit():
+            o["stages"] = int(t[1:])
+        else:
+            raise ValueError(f"DLRM_HSTU_FP8_BWD_DQ_SPLIT_OPT token {t!r}")
+    if v not in _DQ_SPLIT_OPT_LOGGED:
+        _DQ_SPLIT_OPT_LOGGED.add(v)
+        logger.warning("[hstu-attn] bwd dq SPLIT load opts ARMED: %s", o)
+    return o
+
+
+# vf3p guard: the token is added only when 0 < qkv_scale <= this
+# bound (one host float compare per armed call).  It keeps the regions where
+# the reassociated chain can differ from the default by more than one e4m3
+# code step, or in NaN behaviour, unreachable.
+_VF3P_QKV_SCALE_MAX = 0.25
+
+
+def _bwd_vf3p_tokens(vs: set, off_reason: str = "",
+                     qkv_scale: Optional[float] = None) -> set:
+    """$DLRM_HSTU_FP8_BWD_VF3P (read per call; code default OFF, gin binding
+    False, a pre-set "0" is the kill switch): add the VALU token "vf3p" (compile_hstu_bwd_dkdv(
+    valu=): the act chain by f32 reassociation at the default cast scales)
+    to the effective token set of a dq-split call.  It needs "ilp", excludes
+    vf/vf2/h16/vf3/vf3s and needs 0 < qkv_scale <= _VF3P_QKV_SCALE_MAX (no
+    scale = not taken); a call that cannot take it keeps the default chain
+    and logs one "ignored" line per reason.  A set that already names vf3p
+    (a pre-set DLRM_HSTU_FP8_BWD_VALU) is returned unchanged, so this knob
+    cannot remove it and the guard does not apply to it.  The token is part
+    of config["valu"], hence of the compile key."""
+    raw = os.environ.get("DLRM_HSTU_FP8_BWD_VF3P", "").strip().lower()
+    if raw not in ("1", "true", "on", "yes") or "vf3p" in vs:
+        return vs
+    clash = sorted(vs & {"vf", "vf2", "h16", "vf3", "vf3s"})
+    if off_reason:
+        why = off_reason
+    elif "ilp" not in vs:
+        why = "needs VALU ilp (valu=%s)" % (",".join(sorted(vs)) or "<none>")
+    elif clash:
+        why = "excludes %s (valu=%s)" % (",".join(clash), ",".join(sorted(vs)))
+    elif not (qkv_scale is not None
+              and 0.0 < float(qkv_scale) <= _VF3P_QKV_SCALE_MAX):
+        why = "qkv_scale outside the guard 0 < qkv_scale <= %g" % (
+            _VF3P_QKV_SCALE_MAX)
+    else:
+        vs = vs | {"vf3p"}
+        if ("vf3p", ",".join(sorted(vs))) not in _logged_layouts:
+            _logged_layouts.add(("vf3p", ",".join(sorted(vs))))
+            logger.warning(
+                "[hstu-attn] DLRM_HSTU_FP8_BWD_VF3P=%s armed: bwd_dkdv VALU "
+                "token vf3p added (valu=%s)", raw, ",".join(sorted(vs)))
+        return vs
+    if ("vf3p_ignored", why) not in _logged_layouts:
+        _logged_layouts.add(("vf3p_ignored", why))
+        logger.warning(
+            "[hstu-attn] DLRM_HSTU_FP8_BWD_VF3P=%s ignored: %s; default act "
+            "chain", raw, why)
+    return vs
 
 
 def flydsl_hstu_attention_bwd(
@@ -610,6 +783,8 @@ def flydsl_hstu_attention_bwd(
     alpha,
     out=None,
     qkv_scale: float = 1.0,
+    dq_fp8_sink=None,
+    dkdv_fp8_sink=None,
 ):
     """The five-gemm fused backward with BF16 or scaled-E4M3 Q/K/V.
 
@@ -618,10 +793,21 @@ def flydsl_hstu_attention_bwd(
     allocated and returned. The in-place form is what avoids the wrapper tax on
     the production path -- see try_flydsl_attention_bwd.
 
+    `dq_fp8_sink` (default None = no-op): a callable with
+    `hstu_dq_split.dq_from_ds`'s signature that the dq-split call uses
+    instead (hstu_dq_e5m2.DqE5m2Sink emits e5m2 dz q columns and leaves
+    the BF16 dq unwritten). Only the dq-split path calls it.
+
+    `dkdv_fp8_sink` (default None = no-op): a
+    hstu_dkdv_e5m2.DkdvE5m2Sink. When its decline_reason() accepts the
+    compiled config, bwd_dkdv writes the e5m2 dV|dK columns of the sink's
+    dz8 (+ amax/colsum partials) INSTEAD of the BF16 dV/dK; otherwise
+    sink.declined is set and the stock kernel runs.
+
     dq is accumulated across kv blocks with global atomics, so it must start at
     zero -- the zero-fill cannot be folded into the kernel, because nothing
     orders one workgroup's zeroing against another's atomic add. Under the
-    shipped dq16 mode dq is bf16 and IS the accumulator, so there is no
+    default dq16 mode dq is bf16 and IS the accumulator, so there is no
     down-convert pass and the zero-fill moves half the bytes.
     """
     _hy = os.environ.get("DLRM_HSTU_FP8_BWD_FULL_HYBRID", "")
@@ -693,10 +879,10 @@ def flydsl_hstu_attention_bwd(
         q, k, v = (t.contiguous() for t in (q, k, v))
         rs_in = heads * dim
         rs_q = rs_in
-    # R15 design B ($DLRM_HSTU_FP8_BWD_DQ_SPLIT=1, default OFF): dq is computed
+    # dq split ($DLRM_HSTU_FP8_BWD_DQ_SPLIT=1, default OFF): dq is computed
     # by hstu_dq_split from a stored e4m3 ds workspace with plain stores, so
-    # the zero-fill below is deferred until the C8 path is known not to take
-    # it.  Unset = the original zeroing at the original point.
+    # the zero-fill below is deferred until the full-fp8 path is known not to
+    # take it.  Unset = dq is zeroed here.
     _dqs_req = os.environ.get("DLRM_HSTU_FP8_BWD_DQ_SPLIT", "").strip().lower() \
         in ("1", "true", "on", "yes")
     if rs_out is None:
@@ -717,10 +903,18 @@ def flydsl_hstu_attention_bwd(
         config["sched"] = "iglp3"
     if q_bf16 and kernel.cvt_scale_is_exact(qkv_scale):
         # ONLY when the scale is an exact power of two. scale_in_cvt folds
-        # qkv_scale into cvt_scalef32_pk_bf16_fp8. That instruction's scale
-        # operand is exponent-only on gfx950. A scale that is not a power of
-        # two would silently rescale the values. The kernel checks this at
-        # every launch and raises if the flag is set by hand.
+        # qkv_scale into cvt_scalef32_pk_bf16_fp8 instead of applying it in the
+        # score/epilogue math, and that instruction's scale operand is
+        # exponent-only on gfx950 -- see cvt_scale_is_exact. With the calibrated
+        # `_fp8_qkv_scale` (amax/448, a power of two with probability zero) the
+        # fold silently rescales every gradient.
+        #
+        # Declining the fold is not a fallback to something worse -- it is the
+        # arithmetically correct path, and the only cost is that
+        # score_input_scale/value_input_scale no longer collapse to 1.0, so
+        # their per-element multiplies stay in the elementwise chain. The
+        # kernel re-checks this at every launch, so a caller
+        # that sets the flag by hand gets a ValueError, not wrong numbers.
         config["scale_in_cvt"] = True
     elif q_bf16 and "q_bf16_scale_in_cvt" not in _logged_layouts:
         _logged_layouts.add("q_bf16_scale_in_cvt")
@@ -734,7 +928,7 @@ def flydsl_hstu_attention_bwd(
     # True fp8 MFMA on the qk gemm. $DLRM_HSTU_FP8_BWD_QK_MFMA, DEFAULT fp8.
     #   "fp8"        k128 fp8 MFMA when this call's q AND k are already e4m3;
     #                calibration (bf16 q/k) stays bf16 math.
-    #   "bf16"       explicit opt-out -- shipped-before-this-default math.
+    #   "bf16"       explicit opt-out (bf16 math).
     #   "fp8_strict" engage, RAISE on any call whose q/k are not both e4m3.
     # Deprecated alias: $DLRM_HSTU_FP8_BWD_K128=0|auto|1 -> bf16|fp8|fp8_strict.
     fp8_mfma = ""
@@ -752,13 +946,13 @@ def flydsl_hstu_attention_bwd(
         else:
             fp8_mfma = "k128"
             config["sched"] = "iglp2"
-    # C8 full-fp8 backward. $DLRM_HSTU_FP8_BWD_FULL (absent = OFF; gin ON).
+    # Full-fp8 backward. $DLRM_HSTU_FP8_BWD_FULL (absent = OFF; gin ON).
     # All five gemms on mfma_scale_f32_16x16x128_f8f6f4. dO is quantized here
     # to e4m3 with one pow2 scale per (sequence, head, 32-token MX K-block
     # group) -- quantize_do_e4m3_blk, no host sync -- and the kernel undoes
     # them inside the out-gemm MFMAs (do_blk), with the saturating e4m3 cast
-    # of silu/ds (f8_sat). That is the ONLY C8 path: the per-tensor dO scale
-    # (do_dyn) flushed small dO rows to zero in-model and is no longer
+    # of silu/ds (f8_sat). That is the ONLY full-fp8 configuration: the
+    # per-tensor dO scale (do_dyn) flushes small dO rows to zero and is not
     # reachable from here, and do_blk without f8_sat NaNs gradients.  A call
     # shape do_blk cannot serve takes the bf16-dO kernel below instead.
     do_scale = None
@@ -777,9 +971,8 @@ def flydsl_hstu_attention_bwd(
         # silu and ds both carry the kernel's 1/N, so their e4m3 pre-scales
         # are N-RELATIVE: 2**(K + ceil(log2 N)) puts silu*N (resp. ds*N with
         # normalized dO) times 2**K..2**(K+1) on the e4m3 grid, and only one
-        # or two kernels compile (ceil(log2 N) is 12 for every in-model N
-        # seen in 51366).  In-model 51366: |silu*N| <= ~2 (|x| <= 2.2),
-        # |ds*N| 0.5..323 across layers.  An absolute *_LOG2 overrides.
+        # kernel compiles per distinct ceil(log2 N).  An absolute *_LOG2
+        # overrides.
         # f8_sat (always on) clamps before the cast: gfx950's
         # cvt_scalef32_pk_fp8_f32 returns NaN, not 448, on overflow.
         c = int(math.ceil(math.log2(max(int(N), 2))))
@@ -791,7 +984,6 @@ def flydsl_hstu_attention_bwd(
                 f"DLRM_HSTU_FP8_BWD_FULL_{name}_K", k_default)))
         config.update(
             f8b="all", mu2="k128", do_dyn=False, do_blk=True, f8_sat=True,
-            # silu and ds pre-scales. Override with DLRM_HSTU_FP8_BWD_FULL_*_K.
             mu2_ssc=_sc("SSC", "3"),
             mu2_dsc=_sc("DSC", "-3"),
             ds8_pad=int(os.environ.get("DLRM_HSTU_FP8_BWD_FULL_DS8_PAD", "16")),
@@ -813,7 +1005,7 @@ def flydsl_hstu_attention_bwd(
     elif f8b_full:
         # Two once-keys: the expected calibration-step skips (bf16 q/k) must
         # not hide a later block-dO shape fallback, which silently drops a
-        # production call from C8.
+        # production call from the full-fp8 path.
         _skip_key = "f8b_full_skip" if _blk_ok else "f8b_full_skip_shape"
         if _skip_key not in _logged_layouts:
             _logged_layouts.add(_skip_key)
@@ -826,6 +1018,7 @@ def flydsl_hstu_attention_bwd(
                 fp8_mfma or "bf16", input_fp8, q_bf16, _blk_ok, heads, dim,
                 config.get("BM", 64), config.get("BN", 128),
             )
+    # silu/grad-coefficient epilogue form.
     # $DLRM_HSTU_FP8_BWD_EPILOGUE = legacy (default when absent) | reuse
     # (gin: apply_env_bootstrap.DLRM_HSTU_FP8_BWD_EPILOGUE).
     _epilogue = os.environ.get("DLRM_HSTU_FP8_BWD_EPILOGUE", "legacy") or "legacy"
@@ -834,9 +1027,12 @@ def flydsl_hstu_attention_bwd(
             f"DLRM_HSTU_FP8_BWD_EPILOGUE={_epilogue!r}: expected "
             "reuse|legacy|reuse_pk"
         )
-    # "reuse_pk" runs the "reuse" silu chain on packed f32. Same ops in the
-    # same order. Default off. Set DLRM_HSTU_FP8_BWD_EPILOGUE=reuse_pk or
-    # DLRM_HSTU_FP8_BWD_PK=1.
+    # "reuse_pk" runs the "reuse" silu/grad-coefficient chain
+    # on packed f32 (v_pk_mul/add/fma_f32, two accumulator elements per issue;
+    # exp2/rcp stay scalar).  Same ops in the same order, so the outputs are
+    # bitwise equal to "reuse"; only the VALU issue count drops.  Default
+    # OFF (gin keeps "reuse"); arm with $DLRM_HSTU_FP8_BWD_EPILOGUE=reuse_pk
+    # or $DLRM_HSTU_FP8_BWD_PK=1 (upgrades "reuse" to "reuse_pk").
     if (os.environ.get("DLRM_HSTU_FP8_BWD_PK", "").strip().lower()
             in ("1", "true", "on", "yes") and _epilogue == "reuse"):
         _epilogue = "reuse_pk"
@@ -845,8 +1041,11 @@ def flydsl_hstu_attention_bwd(
         logger.warning(
             "[hstu-attn] bwd_dkdv packed-f32 epilogue ARMED: epilogue=reuse_pk "
             "(DLRM_HSTU_FP8_BWD_PK)")
-    # $DLRM_HSTU_FP8_BWD_GORDER = xcd | xcdn. Absent keeps the kernel default
-    # "xcd". "xcdn" puts n-blocks fastest inside an XCD. Same math.
+    # Workgroup grid order of bwd_dkdv.
+    # $DLRM_HSTU_FP8_BWD_GORDER = xcd | xcdn; absent = kernel default "xcd",
+    # i.e. the identical compiled kernel. "xcdn" puts n-blocks fastest inside
+    # an XCD. Grid order only: same math; the bf16p dq atomics
+    # are already order-nondeterministic.
     _gorder = os.environ.get("DLRM_HSTU_FP8_BWD_GORDER", "").strip().lower()
     if _gorder:
         if _gorder not in ("xcd", "xcdn"):
@@ -861,7 +1060,7 @@ def flydsl_hstu_attention_bwd(
                 "(DLRM_HSTU_FP8_BWD_GORDER)", _gorder,
             )
     # Intra-pair lookahead ($DLRM_HSTU_FP8_BWD_PIPE = 1..6,
-    # default OFF).  dq-split C8 kernel only: both m tiles of an mu2 pair are
+    # default OFF).  dq-split full-fp8 kernel only: both m tiles of an mu2 pair are
     # staged in LDS up front and tile B's qk/dp MFMAs share a scheduling
     # region with tile A's silu/ds VALU chain.  Same math on every element
     # (dk/dv/dq-workspace bitwise equal to the unpiped split kernel).  Unset
@@ -879,6 +1078,112 @@ def flydsl_hstu_attention_bwd(
                 "[hstu-attn] bwd_dkdv intra-pair lookahead ARMED: pipe=%s "
                 "(DLRM_HSTU_FP8_BWD_PIPE; dq-split mu2 pairs staged together)",
                 _pipe)
+    # VALU diet ($DLRM_HSTU_FP8_BWD_VALU, default OFF).  Comma list of
+    # undef|rfl|ilp ("1" = undef,rfl).  All bitwise neutral; see
+    # compile_hstu_bwd_dkdv(valu=).  Unset = no config key = the identical
+    # kernel and compile-cache key.  dq-split full-fp8 calls only: on the
+    # bf16 body "ilp"/"undef" trip an LLVM IGroupLP pre-RA assertion, so
+    # other calls ignore it.
+    _valu_env = os.environ.get("DLRM_HSTU_FP8_BWD_VALU", "").strip().lower()
+    _vf2_on = False
+    if (_valu_env and _valu_env not in ("0", "off", "false", "no")
+            and config.get("dqsplit")):
+        _vs = set()
+        for _t in _valu_env.split(","):
+            _t = _t.strip()
+            if _t in ("1", "on", "true", "yes"):
+                _vs |= {"undef", "rfl"}
+            elif _t in ("undef", "rfl", "ilp", "nobr", "h16", "vf", "vf2",
+                        "msat", "vf3", "vf3s", "vf3p"):
+                _vs.add(_t)
+            elif _t:
+                raise ValueError(
+                    f"DLRM_HSTU_FP8_BWD_VALU={_valu_env!r}: expected a comma "
+                    "list of 1|undef|rfl|ilp|nobr|h16|vf|vf2|msat")
+        if _epilogue != "reuse_pk":
+            _vs.discard("ilp")
+        if "vf2" in _vs and "ilp" in _vs and config.get("f8b") == "all":
+            # f16act vf2: ds carries alpha*qkv_scale; re-centre the
+            # e4m3 ds range with a pow2 and drop alpha*s from the dq scale.
+            config["mu2_ssc"] = config["mu2_ssc"] * 2.0 ** int(round(
+                math.log2(alpha * float(qkv_scale) ** 2)))
+            config["mu2_dsc"] = config["mu2_dsc"] * 2.0 ** int(round(
+                math.log2(float(qkv_scale))))
+            _vf2_on = True
+        else:
+            _vs.discard("vf2")
+        # DLRM_HSTU_FP8_BWD_VF3P (guard 0 < qkv_scale <= 0.25)
+        _vs = _bwd_vf3p_tokens(_vs, qkv_scale=qkv_scale)
+        if _vs:
+            config["valu"] = ",".join(sorted(_vs))
+        if ("valu", config.get("valu")) not in _logged_layouts:
+            _logged_layouts.add(("valu", config.get("valu")))
+            logger.warning(
+                "[hstu-attn] bwd_dkdv VALU diet ARMED: valu=%s "
+                "(DLRM_HSTU_FP8_BWD_VALU=%s)", config.get("valu", "<none>"),
+                _valu_env)
+    elif config.get("dqsplit"):
+        _bwd_vf3p_tokens(set(), "DLRM_HSTU_FP8_BWD_VALU=%s is off (vf3p is a "
+                         "VALU diet token)" % (_valu_env or "<unset>"))
+    # m-split ($DLRM_HSTU_FP8_BWD_MSPLIT = 1|2, default
+    # OFF).  dq-split full-fp8 calls only: 8 waves/WG, waves w and w+4 share 32 n
+    # rows, m-split score/act + d-split out-gemm, 2 waves/SIMD.  Bitwise
+    # dq/dk/dv vs the pair body (same MFMA operands and pair order); see
+    # compile_hstu_bwd_dkdv(msplit=).  It replaces the pair body, so any
+    # DLRM_HSTU_FP8_BWD_PIPE is dropped for these calls.  Unset = no config
+    # key = the identical kernel and compile-cache key.
+    _msplit = os.environ.get("DLRM_HSTU_FP8_BWD_MSPLIT", "").strip()
+    if _msplit and _msplit != "0" and config.get("dqsplit"):
+        if _msplit not in ("1", "2"):
+            raise ValueError(
+                f"DLRM_HSTU_FP8_BWD_MSPLIT={_msplit!r}: expected 1|2")
+        config.pop("pipe", None)
+        config["msplit"] = int(_msplit)
+        if ("msplit", _msplit) not in _logged_layouts:
+            _logged_layouts.add(("msplit", _msplit))
+            logger.warning(
+                "[hstu-attn] bwd_dkdv m-split ARMED: msplit=%s "
+                "(DLRM_HSTU_FP8_BWD_MSPLIT; 8 waves, pipe ignored)", _msplit)
+        # $DLRM_HSTU_FP8_BWD_MSPLIT_SCHED = comma tokens
+        # (so, anti, prio, iglpN, noiglp, sgK); unset = no config key.
+        _mss = os.environ.get("DLRM_HSTU_FP8_BWD_MSPLIT_SCHED", "").strip()
+        if _mss:
+            config["ms_sched"] = ",".join(t.strip() for t in _mss.split(",")
+                                          if t.strip())
+    # $DLRM_HSTU_FP8_BWD_WS_AUX = cache-policy aux bits
+    # of the dq-split ds workspace stores (0/unset = off = no config key).
+    _ws_aux = int(os.environ.get("DLRM_HSTU_FP8_BWD_WS_AUX", "0") or 0)
+    if _ws_aux and config.get("dqsplit"):
+        config["ws_aux"] = _ws_aux
+    # $DLRM_HSTU_FP8_BWD_WS_LAYOUT=c64: contiguous 64 B ws store halves (the
+    # dq-split kernel reads through the matching permutation).
+    _ws_lay = os.environ.get("DLRM_HSTU_FP8_BWD_WS_LAYOUT", "").strip().lower()
+    if _ws_lay not in ("", "0", "off", "c64", "l128", "l128t"):
+        raise ValueError(
+            f"DLRM_HSTU_FP8_BWD_WS_LAYOUT={_ws_lay!r}: use c64|l128|l128t")
+    if _ws_lay in ("c64", "l128", "l128t") and config.get("dqsplit"):
+        config["ws_" + _ws_lay] = True
+    if config.get("dqsplit") and (config.get("ws_aux") or any(
+            config.get("ws_" + x) for x in ("c64", "l128", "l128t"))):
+        if ("ws_store", _ws_lay, _ws_aux) not in _logged_layouts:
+            _logged_layouts.add(("ws_store", _ws_lay, _ws_aux))
+            logger.warning(
+                "[hstu-attn] bwd dq SPLIT ws store ARMED: layout=%s aux=%s "
+                "(DLRM_HSTU_FP8_BWD_WS_LAYOUT / DLRM_HSTU_FP8_BWD_WS_AUX)",
+                _ws_lay or "off", _ws_aux)
+    # dk/dv e5m2 emit (DLRM_HSTU_FP8_BWD_DKDV_E5M2, default OFF): with a
+    # DkdvE5m2Sink (hstu_dkdv_e5m2) the dk/dv epilogue writes the e5m2 dV/dK
+    # columns of the layer's dz8 + amax/colsum partials instead of BF16
+    # dk/dv.  No sink = no config key = the identical kernel and
+    # compile-cache key.
+    _e8 = None
+    if dkdv_fp8_sink is not None:
+        _why = dkdv_fp8_sink.decline_reason(config, heads, dim, q.shape[0])
+        if _why is None:
+            config["e8emit"] = dkdv_fp8_sink.mode
+            _e8 = dkdv_fp8_sink
+        else:
+            dkdv_fp8_sink.declined = _why
     fn = kernel.compile_hstu_bwd_dkdv(
         heads,
         dim,
@@ -892,7 +1197,8 @@ def flydsl_hstu_attention_bwd(
         fp8_mfma=fp8_mfma,
         **config,
     )
-    # Logged once per distinct layout.
+    # Logged once per distinct layout: whether the wrapper tax is being paid is
+    # invisible in the numerics.
     _e1_period = int(
         os.environ.get("DLRM_HSTU_FP8_BWD_CENSUS")
         or os.environ.get("DLRM_E1_BWD_CENSUS", "0")
@@ -956,10 +1262,9 @@ def flydsl_hstu_attention_bwd(
     batch = seq_offsets.numel() - 1
     # N, not seq_offsets.diff().max(): the caller's max_seq_len already bounds
     # every sequence, and reading the real max costs a device-to-host sync in
-    # the deepest part of the backward queue (profiled at 31.7 ms a call). The
-    # two agreed exactly on 1,600 audited calls across 8 ranks -- production
-    # derives N as max_uih_len + max_num_candidates, and with
-    # max_num_candidates = 1 the pair can differ by at most one token anyway,
+    # the deepest part of the backward queue. Production derives N as
+    # max_uih_len + max_num_candidates, and with
+    # max_num_candidates = 1 the pair can differ by at most one token,
     # which moves n_blocks only when N lands one past a block boundary. A larger
     # N would over-launch, never under-launch, so the failure mode is bounded
     # waste rather than a wrong answer.
@@ -970,6 +1275,16 @@ def flydsl_hstu_attention_bwd(
         dq.zero_()
     dq_slot = dq
     if _dqs:
+        # MSPLIT_SCHED dz/dzr (drop the ws stores of padding rows/tiles):
+        # the kernel pushes a dead store past the per-(b, h) descriptor end
+        # by +2^31, which needs nb*(nb+1)*8 KiB < 2^31, i.e. nb <= 511 blocks
+        # of 128 rows.
+        _ms_tok = set(str(config.get("ms_sched", "")).split(","))
+        if {"dz", "dzr"} & _ms_tok and int(N) > 65408:
+            raise AssertionError(
+                f"DLRM_HSTU_FP8_BWD_MSPLIT_SCHED dz/dzr: max seq len N={int(N)}"
+                " > 65408 (511 blocks of 128); the +2^31 ws store-drop offset"
+                " would wrap. Remove dz/dzr from MSPLIT_SCHED for this N.")
         from generative_recommenders.ops.flydsl import hstu_dq_split
         ws = hstu_dq_split.build_workspace(seq_offsets, heads, q.shape[0], N)
         dq_slot = ws.view(torch.bfloat16)
@@ -995,19 +1310,26 @@ def flydsl_hstu_attention_bwd(
         1.0 / float(N),
         qkv_scale,
         **({"do_scale": do_scale} if do_scale is not None else {}),
+        **(_e8.launch_kwargs(seq_offsets, q.shape[0], heads, dim)
+           if _e8 is not None else {}),
     )
     if _dqs:
-        hstu_dq_split.dq_from_ds(
+        (hstu_dq_split.dq_from_ds if dq_fp8_sink is None else dq_fp8_sink)(
             ws, k.detach(), do_scale, seq_offsets, dq, N,
             alpha * float(config.get("dq_scale", 1.0)) / config["mu2_dsc"]
-            * float(qkv_scale),
+            * float(qkv_scale) * (float(qkv_scale) if _vf2_on else 1.0),
             rs_in, rs_out,
             fp8_dot=os.environ.get("DLRM_HSTU_FP8_BWD_DQ_SPLIT_DOT", "fp8")
             != "bf16",
             bmq=int(os.environ.get("DLRM_HSTU_FP8_BWD_DQ_SPLIT_BM", "128")),
             num_warps=int(os.environ.get("DLRM_HSTU_FP8_BWD_DQ_SPLIT_NW", "8")),
-            stages=int(os.environ.get("DLRM_HSTU_FP8_BWD_DQ_SPLIT_STAGES", "2")),
-            order=_dq_split_order(int(N)))
+            **{"stages": int(os.environ.get(
+                "DLRM_HSTU_FP8_BWD_DQ_SPLIT_STAGES", "2")),
+               **_dq_split_opt()},
+            order=_dq_split_order(int(N)),
+            sched=_dq_split_sched(),
+            **({"ws_c64": True} if config.get("ws_c64") else {}),
+            **_dq_split_ld())
         del ws, dq_slot
     if do_scale is not None and _full_fp8_stats_left():
         _full_fp8_stats(q, k, v, dout, do_scale, seq_offsets, N, alpha,
@@ -1057,6 +1379,7 @@ def _log_shape_fallback(reason: str) -> None:
 def try_flydsl_attention_bwd(
     *, dout, q, k, v, dq, dk, dv, seq_offsets, num_targets, N, alpha,
     max_attn_len, contextual_seq_len, num_softmax_heads, qkv_scale=1.0,
+    dq_fp8_sink=None, dkdv_fp8_sink=None,
 ) -> bool:
     """Write the attention backward into dq/dk/dv with FlyDSL.
 
@@ -1069,13 +1392,13 @@ def try_flydsl_attention_bwd(
     consumes whole, so the gradients have to land in that buffer.
 
     The kernel is handed those views directly, and reads q/k/v out of `uvqk`
-    where they already sit. It used to require packed tensors, which cost three
-    pack copies in and three copy-backs out per call -- with a zero-fill for the
-    dq accumulator, seven extra kernels per layer. Passing the row stride
-    instead costs +0.16% inside the kernel and leaves only dq's zero-fill.
+    where they already sit. Passing the row stride avoids pack copies in and
+    copy-backs out, and leaves only dq's zero-fill.
     Layouts that cannot share one row stride still take the copy path.
     """
     if not flydsl_enabled():
+        if dkdv_fp8_sink is not None:
+            dkdv_fp8_sink.declined = "FlyDSL backward not selected"
         return False
     reason = unsupported_shape_reason(
         q, k, v, dout, num_targets, max_attn_len, contextual_seq_len,
@@ -1083,6 +1406,8 @@ def try_flydsl_attention_bwd(
     )
     if reason is not None:
         _log_shape_fallback(reason)
+        if dkdv_fp8_sink is not None:
+            dkdv_fp8_sink.declined = f"FlyDSL shape fallback: {reason}"
         return False
     global _backward_calls
     out_dq, out_dk, out_dv = flydsl_hstu_attention_bwd(
@@ -1095,10 +1420,24 @@ def try_flydsl_attention_bwd(
         alpha,
         out=(dq, dk, dv),
         qkv_scale=qkv_scale,
+        **({} if dq_fp8_sink is None else {"dq_fp8_sink": dq_fp8_sink}),
+        # Default None: the call above is unchanged.
+        **({} if dkdv_fp8_sink is None else {"dkdv_fp8_sink": dkdv_fp8_sink}),
+    )
+    # An engaged sink leaves the BF16 dV/dK unwritten, so neither
+    # the reference check nor a packed-path copy-back may read them.
+    _e8_only = (
+        dkdv_fp8_sink is not None
+        and dkdv_fp8_sink.declined is None
+        and dkdv_fp8_sink.filled
     )
 
     _backward_calls += 1
-    if _check_due(_backward_calls):
+    if _check_due(_backward_calls) and _e8_only:
+        logger.warning(
+            "[hstu-attn] HSTU_ATTN_BWD_CHECK skipped on a dkdv e5m2 sink "
+            "call (BF16 dV/dK not written)")
+    elif _check_due(_backward_calls):
         # sort_by_length_indices is a scheduling hint only, so the reference does
         # not need the caller's; enable_tma likewise does not change the result.
         _log_reference_snr(
@@ -1113,6 +1452,8 @@ def try_flydsl_attention_bwd(
     # No-ops when the kernel wrote in place; real copies only when the layout
     # forced the packed path and these are distinct tensors.
     for dst, src in ((dq, out_dq), (dk, out_dk), (dv, out_dv)):
+        if _e8_only and dst is not dq:
+            continue
         if dst.data_ptr() != src.data_ptr():
             dst.copy_(src)
     return True
@@ -1153,10 +1494,14 @@ def require_flydsl_fwd() -> None:
             f"flydsl forward import failed "
             f"({type(_fwd_kernel_error).__name__}: {_fwd_kernel_error})"
         )
+    fly_arch = ""
+    if reason is None:
+        fly_arch, reason = _flydsl_arch_check(_fwd_kernel)
     if reason is None:
         _fwd_host_ok = True
         logger.info(
-            "[hstu-attn] forward kernel: flydsl on %s", _device_arch()
+            "[hstu-attn] forward kernel: flydsl on %s flydsl_arch=%s pin=%s",
+            _device_arch(), fly_arch, FLYDSL_ARCH_PIN[1],
         )
         return
     raise FlyDSLUnavailableError(
@@ -1214,6 +1559,25 @@ def unsupported_fwd_shape_reason(
     return None
 
 
+def _fwd_seq_offsets_i32(seq_offsets: torch.Tensor) -> torch.Tensor:
+    """int32 seq offsets for fwd_kernel_0, padded for its XCD-pinned grid.
+
+    The forward's grid.z is cdiv(batch, 8), so for batch % 8 != 0 the padded
+    workgroup slots (batch index >= batch) read seq_offsets[b] and [b + 1]
+    past the end of the tensor through a max_size (unchecked) descriptor and
+    run with whatever stale bytes follow it: they overwrite real output rows
+    or write past `out` (memory access fault). Padding with the total token
+    count gives every padded slot seq_len 0. A no-op (no extra kernel) when
+    batch % 8 == 0, i.e. always in production (B = 1024, drop_last).
+    """
+    cu = seq_offsets.to(torch.int32)
+    batch = cu.numel() - 1
+    padded = -(-batch // 8) * 8
+    if padded == batch:
+        return cu
+    return torch.cat([cu, cu[-1:].expand(padded - batch)])
+
+
 def flydsl_hstu_attention_fwd(q, k, v, seq_offsets, N, alpha) -> torch.Tensor:
     """The two-gemm forward: out = silu(alpha * q @ k.T)/N masked causally, @ v.
 
@@ -1231,7 +1595,7 @@ def flydsl_hstu_attention_fwd(q, k, v, seq_offsets, N, alpha) -> torch.Tensor:
 
     # Read q/k/v where they already live. On the fused preprocess+attention path
     # they are column slices of one uvqk buffer at stride 2048, and packing them
-    # would copy the attention input once per tensor per layer per call.
+    # would cost three full copies of the attention input per layer per call.
     rs = _common_row_stride((q, k, v), heads, dim)
     if rs is None:
         q, k, v = (t.contiguous() for t in (q, k, v))
@@ -1242,8 +1606,10 @@ def flydsl_hstu_attention_fwd(q, k, v, seq_offsets, N, alpha) -> torch.Tensor:
     if key not in _logged_fwd_layouts:
         _logged_fwd_layouts.add(key)
         _maybe_dump_lengths(seq_offsets)
-        # tokens and N are logged because the grid is sized by N while the
-        # work is set by the real lengths.
+        # tokens and N are logged because the grid is sized by N (see below) while
+        # the work is set by the real lengths, so the ratio of the two is how much
+        # of the launch is doing nothing -- and it is not otherwise visible in
+        # either a profile or the numerics.
         logger.warning(
             "[hstu-attn] FlyDSL forward %s (heads=%d dim=%d tokens=%d N=%d "
             "mean_len=%.0f)",
@@ -1255,14 +1621,12 @@ def flydsl_hstu_attention_fwd(q, k, v, seq_offsets, N, alpha) -> torch.Tensor:
 
     # The kernel reads seq_offsets through a 32-bit buffer descriptor;
     # production carries it as int64.
-    cu = seq_offsets.to(torch.int32)
+    cu = _fwd_seq_offsets_i32(seq_offsets)
     batch = seq_offsets.numel() - 1
     # N rather than the real max, for the same reason as the backward: reading
     # the true max costs a device-to-host sync deep in the queue, and N already
     # bounds every sequence. Over-launching only wastes workgroups that exit
-    # immediately -- it cannot produce a wrong answer. Note this is also why the
-    # kernel-level benchmark must derive N the way production does: N sizes this
-    # grid, so a padded N would make the comparison meaningless.
+    # immediately -- it cannot produce a wrong answer.
     m_blocks = int((int(N) + fn.BM - 1) // fn.BM)
 
     out = torch.empty((q.shape[0], heads, dim), dtype=q.dtype, device=q.device)
@@ -1334,24 +1698,218 @@ def try_flydsl_attention_fwd(
 
 
 # ---------------------------------------------------------------------------
-# FP8 forward (Track I1)
+# FP8 forward
 #
 # The FP8 arm's fused preprocess hands attention q/k/v that are ALREADY e4m3
-# column slices of one vqk buffer, plus ONE per-tensor scale. Today that goes to
-# the Triton e4m3 forward. This is the FlyDSL alternative for the same contract.
+# column slices of one vqk buffer, plus ONE per-tensor scale. This is the
+# FlyDSL alternative to the Triton e4m3 forward for the same contract.
 #
-# Selected by $HSTU_ATTN_FWD=flydsl once $DLRM_HSTU_FP8_FWD is on.
-# Compiles fp8_mfma="k128", fp8_v=True, plus the fused-silu epilogue.
-# $HSTU_ATTN_FWD=triton with FP8 on keeps the Triton e4m3 forward.
-# V is already e4m3 from the same projection as q and k.
+# Selected by the same $HSTU_ATTN_FWD=flydsl that picks the bf16 FlyDSL
+# forward, once $DLRM_HSTU_FP8_FWD is on. That combination
+# compiles this specialization (fp8_mfma="k128", fp8_v=True) plus the
+# fused-silu epilogue (epi_fold / mask_split / iglp0). $HSTU_ATTN_FWD=triton
+# with FP8 on keeps the Triton e4m3 forward.
+#
+# CONFIG. `k128` at waves=2, which is `hstu_fwd.SHIPPED` plus the two fp8 flags.
+# waves=1 is NOT used: it sits at 248 of 256 VGPR, eight registers from
+# dropping to one wave per SIMD.
+#
+# fp8_v=True is not an extra approximation here. Production's V is already
+# e4m3 -- it comes out of the same vqk GEMM as q and k -- so feeding it as
+# e4m3 matches what the Triton e4m3 kernel does.
 # ---------------------------------------------------------------------------
 
 _FP8_FWD_CFG = {"fp8_mfma": "k128", "fp8_v": True}
 
-# epi_fold and mask_split are part of this kernel. mask_split is incompatible
-# with the SHIPPED iglp1 hint (the n-loop split trips AMDGPUIGroupLP), so this
-# config uses iglp0.
+# Silu-epilogue VALU reductions (hstu_fwd.py's `epi_fold` and `mask_split`)
+# are part of this kernel, not a second env var. SHIPPED is iglp1, and
+# mask_split is INCOMPATIBLE with it -- the n-loop split trips
+# AMDGPUIGroupLP.cpp:2087 -- so the config also moves the scheduling hint to
+# iglp0.
 _FP8_FWD_E2_CFG = {"epi_fold": True, "mask_split": True, "sched": "iglp0"}
+
+# DLRM_HSTU_FP8_FWD_PIPE (read per call; code default OFF, the gin config
+# binds it on): a
+# 128-row m-block over 4 waves (MT=2 per wave as before, half the K/V staging
+# per output row), the next n-iteration's K/V global loads carried as loop
+# iter_args (`kv_prefetch`), and the out-gemm P fragment built from registers
+# instead of a p_lds round trip (`p_direct`). Output bit-identical to the
+# default config for finite V: BM128 adds zero-weight (p=0) MFMAs over V
+# rows m0+64..m0+127 for the first half of each 128-row block, so a
+# non-finite V value can reach up to 127 (not 63) causally earlier rows of
+# its m-block; finite inputs give identical bits. Kernel name unchanged
+# (fwd_kernel_0). No causal tile is skipped. DLRM_HSTU_FP8_FWD_PIPE=0 (or
+# unset) restores the default compile kwargs exactly.
+_FP8_FWD_PIPE_CFG = {"BM": 128, "waves": 4, "kv_prefetch": True, "p_direct": True}
+_fp8_fwd_pipe_logged = False
+
+
+def fp8_fwd_pipe_enabled() -> bool:
+    """$DLRM_HSTU_FP8_FWD_PIPE=1 (read per call; logs one arming line)."""
+    global _fp8_fwd_pipe_logged
+    on = os.environ.get("DLRM_HSTU_FP8_FWD_PIPE", "0") == "1"
+    if on and not _fp8_fwd_pipe_logged:
+        _fp8_fwd_pipe_logged = True
+        print(
+            "[hstu-fwd] DLRM_HSTU_FP8_FWD_PIPE=1 armed: BM128 waves4 "
+            "kv_prefetch p_direct (bit-identical to the shipped BM64/waves2 for "
+            "finite V)",
+            flush=True,
+        )
+    return on
+
+
+# DLRM_HSTU_FP8_FWD_MASK_ARITH (read per call; also bound in gin): in the
+# diagonal (masked) n-iterations of fwd_kernel_0 the causal
+# mask is applied to the packed bf16 P fragment -- one v_and_b32 per bf16 pair,
+# with per-lane pair masks from two packed-int16 ops per distinct n-tile/m-tile
+# offset -- instead of an f32 compare + select per score element followed by a
+# bf16 unpack/repack (hstu_fwd.py mask_arith=3). Every score element is still
+# computed and the predicate stays a runtime per-lane value; only the
+# instructions that evaluate and apply m >= n change. Bit-identical output for
+# all inputs, including non-finite q/k/v (bf16(+0.0) is 0x0000). It needs
+# p_direct, so it applies only together with DLRM_HSTU_FP8_FWD_PIPE=1; set
+# alone it is ignored with one log line. Kernel name unchanged (fwd_kernel_0).
+_FP8_FWD_MASK_ARITH = 3
+_fp8_fwd_mask_arith_logged = set()
+
+
+def fp8_fwd_mask_arith_enabled(pipe_on: bool) -> bool:
+    """$DLRM_HSTU_FP8_FWD_MASK_ARITH=1 (read per call; logs one arming line)."""
+    on = os.environ.get("DLRM_HSTU_FP8_FWD_MASK_ARITH", "0") == "1"
+    if on and pipe_on not in _fp8_fwd_mask_arith_logged:
+        _fp8_fwd_mask_arith_logged.add(pipe_on)
+        print(
+            f"[hstu-fwd] DLRM_HSTU_FP8_FWD_MASK_ARITH=1 armed: mask_arith="
+            f"{_FP8_FWD_MASK_ARITH} (causal mask on the packed bf16 P fragment "
+            f"in the diagonal n-iterations; bit-identical)" if pipe_on else
+            "[hstu-fwd] DLRM_HSTU_FP8_FWD_MASK_ARITH=1 ignored: it needs "
+            "DLRM_HSTU_FP8_FWD_PIPE=1 (p_direct)",
+            flush=True,
+        )
+    return on and pipe_on
+
+
+# DLRM_HSTU_FP8_FWD_PV (read per call; code default OFF, NO gin
+# binding): FP8 P@V with a K = 128 retile in fwd_kernel_0 (hstu_fwd.py
+# pv="k128"). A DECLARED PRECISION CHANGE: the silu output
+# P is rounded to e4m3 (static scale, saturating; DLRM_HSTU_FP8_FWD_PV_SCALE
+# below) instead of bf16, V is
+# consumed as raw e4m3, and P@V runs as one v_mfma_scale_f32_16x16x128_f8f6f4
+# per 128 keys instead of four bf16 16x16x32. Output is NOT bit-identical to
+# the bf16-P forward. It is built on the FWD_PIPE config only,
+# so it arms only when the active config IS that config
+# (DLRM_HSTU_FP8_FWD_PIPE=1 and nothing else changed), alone or composed with
+# DLRM_HSTU_FP8_FWD_MASK_ARITH=1 (mask_arith=3 then applies the
+# causal mask to the packed e4m3 P of the tail group, bit-identical to the
+# pv=k128 select); otherwise it declines with one log line and the forward is
+# unchanged. Kernel name unchanged (fwd_kernel_0). Unset (or anything but
+# "1") = off, no log line.
+_FP8_FWD_PV_CFG = {"pv": "k128", "pv_k": 3, "pv_split": True,
+                   "pf_late": True, "pv_tg": True}
+_fp8_fwd_pv_logged = set()
+
+# DLRM_HSTU_FP8_FWD_PV_SCALE (read per call, used only when
+# DLRM_HSTU_FP8_FWD_PV=1 arms): the static scale s of the e4m3 P, P8 =
+# e4m3(sat(P' * s)) (hstu_fwd.py pv_s). Unset or "" = 10.04, a NON-power-of-
+# two scale folded into the silu chain's fma (it replaces the add; no extra
+# hot-loop instruction). So DLRM_HSTU_FP8_FWD_PV=1 ALONE means
+# s = 10.04. "pow2" or "0" = the power-of-two scale 2**pv_k (= 8).
+# Otherwise a float in [4, 32], canonicalized to 6 decimals (so one accepted
+# value = one kernel); any other value RAISES (fail closed: a typo must not
+# silently run the bf16-P path). The range keeps s * P' far below the
+# e4m3 saturation (448) and keeps small P' (|P'| >= 2**-12) out of the flush.
+# Why not a power of two: over negative scores P' = -log2(e) * silu peaks at
+# the silu minimum (score -1.27846, P' = 0.40174), where silu is stationary,
+# so many P' values pile up there. With s = 8 the pile sits at 3.2139, 1.1%
+# below the e4m3 grid point 3.25, and rounds up systematically: a coherent
+# bias on the outputs whose keys fall in the negative lobe. Every power of two
+# keeps that position inside the binade. s = 10.04 puts the pile 0.84% above
+# the grid point 4.0, where the mean rounding error of a flat score density
+# around the minimum crosses zero. Same declared precision class as FP8 P@V.
+_FP8_FWD_PV_SCALE_DEFAULT = 10.04
+_FP8_FWD_PV_SCALE_RANGE = (4.0, 32.0)
+
+
+def _fp8_fwd_pv_scale():
+    """(scale, raw): 0.0 for the power-of-two scale, a float in
+    _FP8_FWD_PV_SCALE_RANGE rounded to 6 decimals, or None for an invalid
+    $DLRM_HSTU_FP8_FWD_PV_SCALE."""
+    raw = os.environ.get("DLRM_HSTU_FP8_FWD_PV_SCALE", "")
+    v = raw.strip().lower()
+    if v == "":
+        return _FP8_FWD_PV_SCALE_DEFAULT, raw
+    if v == "pow2":
+        return 0.0, raw
+    try:
+        s = float(v)
+    except ValueError:
+        return None, raw
+    if s == 0.0:
+        return 0.0, raw
+    lo, hi = _FP8_FWD_PV_SCALE_RANGE
+    if not (lo <= s <= hi):    # also rejects nan / inf
+        return None, raw
+    return round(s, 6), raw
+
+
+def fp8_fwd_pv_config(cfg: dict) -> dict:
+    """$DLRM_HSTU_FP8_FWD_PV=1 (read per call): the pv kwargs to add to `cfg`,
+    or {} when the knob is off or `cfg` is not the FWD_PIPE config (with or
+    without mask_arith=3). Raises ValueError for an invalid
+    $DLRM_HSTU_FP8_FWD_PV_SCALE. Logs one decline line per process, and one
+    arming line per distinct armed configuration."""
+    if os.environ.get("DLRM_HSTU_FP8_FWD_PV", "0") != "1":
+        return {}
+    want = dict(_load_fwd_kernel().SHIPPED)
+    want.update(_FP8_FWD_CFG)
+    want.update(_FP8_FWD_E2_CFG)
+    want.update(_FP8_FWD_PIPE_CFG)
+    # The one composition supported with pv=k128.
+    ma = cfg.get("mask_arith") == _FP8_FWD_MASK_ARITH
+    if ma:
+        want["mask_arith"] = _FP8_FWD_MASK_ARITH
+    diff = sorted(k for k in set(want) | set(cfg) if cfg.get(k) != want.get(k))
+    if diff:
+        if "declined" not in _fp8_fwd_pv_logged:
+            _fp8_fwd_pv_logged.add("declined")
+
+            def _kv(d, k):
+                return f"{k}={d[k]!r}" if k in d else f"{k} unset"
+
+            print(
+                "[hstu-fwd] DLRM_HSTU_FP8_FWD_PV=1 declined: pv=k128 needs the "
+                "FWD_PIPE config (DLRM_HSTU_FP8_FWD_PIPE=1, optionally with "
+                "DLRM_HSTU_FP8_FWD_MASK_ARITH=1); active config has "
+                + ", ".join(_kv(cfg, k) for k in diff) + " (needs "
+                + ", ".join(_kv(want, k) for k in diff)
+                + "); running the bf16-P forward",
+                flush=True,
+            )
+        return {}
+    s, s_raw = _fp8_fwd_pv_scale()
+    if s is None:
+        lo, hi = _FP8_FWD_PV_SCALE_RANGE
+        raise ValueError(
+            f"DLRM_HSTU_FP8_FWD_PV_SCALE={s_raw!r}: use unset (10.04), 'pow2', "
+            f"'0' or a float in [{lo:g}, {hi:g}]")
+    out = dict(_FP8_FWD_PV_CFG)
+    if s:
+        out["pv_s"] = s
+    line = (
+        "[hstu-fwd] DLRM_HSTU_FP8_FWD_PV=1 armed: "
+        f"pv={_FP8_FWD_PV_CFG['pv']} pv_k={_FP8_FWD_PV_CFG['pv_k']} "
+        + (f"pv_s={s!r} (P8 = e4m3(P' * {s!r}), static scale folded "
+           "into the silu fma) " if s else
+           f"(P8 = e4m3(P' * 2**{_FP8_FWD_PV_CFG['pv_k']})) ")
+        + "(e4m3 P, K=128 P@V retile; declared precision change)"
+        + (f" with mask_arith={_FP8_FWD_MASK_ARITH} (causal mask on the "
+           "packed e4m3 P; bit-identical)" if ma else ""))
+    # Latched on the line text: once per distinct armed configuration.
+    if line not in _fp8_fwd_pv_logged:
+        _fp8_fwd_pv_logged.add(line)
+        print(line, flush=True)
+    return out
 
 
 def _fp8_fwd_config() -> dict:
@@ -1359,6 +1917,12 @@ def _fp8_fwd_config() -> dict:
     cfg = dict(_load_fwd_kernel().SHIPPED)
     cfg.update(_FP8_FWD_CFG)
     cfg.update(_FP8_FWD_E2_CFG)
+    pipe = fp8_fwd_pipe_enabled()
+    if pipe:
+        cfg.update(_FP8_FWD_PIPE_CFG)
+    if fp8_fwd_mask_arith_enabled(pipe):
+        cfg["mask_arith"] = _FP8_FWD_MASK_ARITH
+    cfg.update(fp8_fwd_pv_config(cfg))
     return cfg
 
 
@@ -1445,7 +2009,7 @@ def flydsl_hstu_attention_fwd_fp8(
             cfg,
         )
 
-    cu = seq_offsets.to(torch.int32)
+    cu = _fwd_seq_offsets_i32(seq_offsets)
     batch = seq_offsets.numel() - 1
     m_blocks = int((int(N) + fn.BM - 1) // fn.BM)
     out = torch.empty(
@@ -1464,8 +2028,8 @@ def try_flydsl_attention_fwd_fp8(
 
     FAIL-CLOSED. Returns None only when the knob is off. Once it is on, every
     other way this could decline -- host cannot run FlyDSL, kernel import
-    failed, shape outside the specialization -- RAISES. A knob whose entire
-    purpose is the FlyDSL kernel must not silently run Triton instead.
+    failed, shape outside the specialization -- RAISES, so the knob can never
+    silently run the Triton forward instead.
     """
     if not flydsl_fp8_fwd_selected():
         return None

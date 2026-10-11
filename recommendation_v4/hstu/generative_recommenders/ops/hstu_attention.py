@@ -94,9 +94,9 @@ logger: logging.Logger = logging.getLogger(__name__)
 # precedence, so a non-gfx950 launcher opts out without editing the config.
 #
 # NO SILENT DOWNGRADE. Because flydsl is the default, a host that cannot run it
-# (not gfx950, or flydsl not installed) RAISES rather than quietly reverting to a
-# ~2x slower backward — as does an unrecognized value, which would otherwise be a
-# typo that costs performance invisibly. Falling back to Triton is a deliberate
+# (not gfx950, or flydsl not installed) RAISES rather than quietly reverting to
+# the Triton backward — as does an unrecognized value, which would otherwise be a
+# typo that changes the kernel invisibly. Falling back to Triton is a deliberate
 # choice, spelled "triton". What does still fall back, per call, is a SHAPE the
 # kernel is not specialized for (dim 128, bf16, causal, max_attn_len /
 # contextual_seq_len 0, num_targets <= 1); that is logged once per reason. See

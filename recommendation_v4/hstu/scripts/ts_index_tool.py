@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Offline build, verification and housekeeping for the PR 907 window index.
 
 The trainer reads ``ts_indices_<tag>_W<sec>.npy`` and ``ts_offsets_<tag>_W<sec>.npy``

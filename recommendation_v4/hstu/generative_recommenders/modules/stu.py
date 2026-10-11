@@ -18,7 +18,7 @@
 import abc
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from generative_recommenders.common import (
@@ -26,6 +26,7 @@ from generative_recommenders.common import (
     HammerKernel,
     HammerModule,
 )
+from generative_recommenders.ops import glue_fold3
 from generative_recommenders.ops.hstu_attention import delta_hstu_mha
 from generative_recommenders.ops.hstu_compute import (
     hstu_compute_output,
@@ -49,10 +50,18 @@ from generative_recommenders.ops.triton.triton_fp8 import (
 from torch.autograd.profiler import record_function
 
 # Targets-only e4m3 VK save (store instead of recompute); gin default on
-# (yambda_5b.gin item (15)), absent or "0" = recompute in the targets-only
+# (yambda_5b.gin), absent or "0" = recompute in the targets-only
 # backward. Read once at import, after apply_env_bootstrap.
 _SAVE_TARGETS_VK: bool = os.environ.get("DLRM_HSTU_FP8_SAVE_TARGETS_VK", "0") != "0"
 
+# Targets-only final layer: hand the residual proxy back as the candidate rows
+# only, so its gradient is added row-sparsely instead of through a dense
+# zero-filled [L, D] tensor (same values; see the targets-only backward).
+# DLRM_HSTU_FP8_TGT_SPARSE_RESID: gin default on (yambda_5b.gin);
+# absent or "0" = the dense residual proxy. Read once at import.
+_TGT_SPARSE_RESID: bool = (
+    os.environ.get("DLRM_HSTU_FP8_TGT_SPARSE_RESID", "0") != "0"
+)
 
 try:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops")
@@ -256,6 +265,11 @@ class STULayer(STU):
         self._sort_by_length: bool = config.sort_by_length
         self._contextual_seq_len: int = config.contextual_seq_len
         self._stack_layer_index: int = -1
+        # GLUE_FOLD3 PCAST (ops/glue_fold3.py): bf16 shadows of this layer's
+        # parameters, cast by the stack's single fused launch. Set by STUStack
+        # for the duration of one forward call only; None = shipped .to() casts.
+        self._g3_shadow: Optional[Dict[str, torch.Tensor]] = None
+        self._g3_shadow_versions: Optional[Dict[str, int]] = None
 
         self._uvqk_weight: torch.nn.Parameter = torch.nn.Parameter(
             torch.empty(
@@ -356,6 +370,58 @@ class STULayer(STU):
             )
         return self._stack_layer_index in selected_layers
 
+    @torch.jit.unused
+    def _g3_pcast_names(self, targets_only: bool) -> List[str]:
+        """Parameters whose shipped call sites always cast fp32 -> x.dtype."""
+        names = [
+            "_input_norm_weight",
+            "_input_norm_bias",
+            "_output_norm_weight",
+            "_output_norm_bias",
+        ]
+        if targets_only:
+            names.append("_output_weight")
+        return names
+
+    @torch.jit.unused
+    def _g3_fresh(self, names: Tuple[str, ...]) -> bool:
+        """The stack's shadows exist for `names` and no parameter was modified
+        in place since they were cast."""
+        shadow = self._g3_shadow
+        versions = self._g3_shadow_versions
+        if not glue_fold3.PCAST or shadow is None or versions is None:
+            return False
+        for n in names:
+            if n not in shadow or getattr(self, n)._version != versions.get(n, -1):
+                return False
+        return True
+
+    @torch.jit.unused
+    def _g3_pair(
+        self, w_name: str, b_name: str
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """(w.to(bf16), b.to(bf16)) from the stack's fused cast, as ONE autograd
+        node created where the two shipped .to() nodes were. The bias is the
+        node's first input, so AccumulateGrad(bias) runs before
+        AccumulateGrad(weight), as with the shipped ToCopyBackward0 pair."""
+        if not self._g3_fresh((w_name, b_name)):
+            return None
+        shadow = self._g3_shadow
+        assert shadow is not None
+        b_bf16, w_bf16 = glue_fold3.shadow_cast(
+            (shadow[b_name], shadow[w_name]),
+            (getattr(self, b_name), getattr(self, w_name)),
+        )
+        return w_bf16, b_bf16
+
+    @torch.jit.unused
+    def _g3_one(self, name: str) -> Optional[torch.Tensor]:
+        if not self._g3_fresh((name,)):
+            return None
+        shadow = self._g3_shadow
+        assert shadow is not None
+        return glue_fold3.shadow_cast((shadow[name],), (getattr(self, name),))[0]
+
     def update_kv_cache(
         self,
         max_seq_len: int,
@@ -419,7 +485,7 @@ class STULayer(STU):
             and hstu_fp8_fail_closed()
         ):
             raise RuntimeError(
-                "Plan 08 input FP8 requested for an unsupported "
+                "Input FP8 requested for an unsupported "
                 "backend/recompute/prefill contract"
             )
         fp8_output_requested = hstu_fp8_fuse_outln_enabled()
@@ -436,7 +502,7 @@ class STULayer(STU):
             and hstu_fp8_fail_closed()
         ):
             raise RuntimeError(
-                "Plan 08 output FP8 requested for an unsupported "
+                "Output FP8 requested for an unsupported "
                 "backend/group-norm/recompute contract"
             )
         fuse_silu_requested = hstu_fp8_fuse_silu_enabled()
@@ -449,7 +515,7 @@ class STULayer(STU):
         fuse_silu = fuse_silu_requested and fuse_silu
         if fuse_silu_requested and not fuse_silu and hstu_fp8_fail_closed():
             raise RuntimeError(
-                "Plan 08 SiLU fusion requested for an unsupported "
+                "SiLU fusion requested for an unsupported "
                 "backend/group-norm/prefill contract"
             )
         fuse_residual_requested = hstu_fp8_fuse_residual_enabled()
@@ -465,17 +531,27 @@ class STULayer(STU):
             and hstu_fp8_fail_closed()
         ):
             raise RuntimeError(
-                "Plan 08 residual-gradient fusion requested for an unsupported "
+                "Residual-gradient fusion requested for an unsupported "
                 "backend/input/prefill contract"
             )
         with record_function("## stu_preprocess_and_attention ##"):
             allow_save_fp8_uvqk = True
+            g3_in: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
             if not torch.jit.is_scripting():
                 allow_save_fp8_uvqk = self._allow_saved_fp8_uvqk()
+                g3_in = self._g3_pair("_input_norm_weight", "_input_norm_bias")
             preprocess_outputs = hstu_preprocess_and_attention(
                 x=x,
-                norm_weight=self._input_norm_weight.to(x.dtype),
-                norm_bias=self._input_norm_bias.to(x.dtype),
+                norm_weight=(
+                    g3_in[0]
+                    if g3_in is not None
+                    else self._input_norm_weight.to(x.dtype)
+                ),
+                norm_bias=(
+                    g3_in[1]
+                    if g3_in is not None
+                    else self._input_norm_bias.to(x.dtype)
+                ),
                 norm_eps=1e-6,
                 num_heads=self._num_heads,
                 attn_dim=self._attention_dim,
@@ -526,12 +602,23 @@ class STULayer(STU):
         )
 
         with record_function("## stu_compute_output ##"):
+            g3_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+            if not torch.jit.is_scripting():
+                g3_out = self._g3_pair("_output_norm_weight", "_output_norm_bias")
             return hstu_compute_output(
                 attn=attn_output,
                 u=u,
                 x=residual_x,
-                norm_weight=self._output_norm_weight.to(x.dtype),
-                norm_bias=self._output_norm_bias.to(x.dtype),
+                norm_weight=(
+                    g3_out[0]
+                    if g3_out is not None
+                    else self._output_norm_weight.to(x.dtype)
+                ),
+                norm_bias=(
+                    g3_out[1]
+                    if g3_out is not None
+                    else self._output_norm_bias.to(x.dtype)
+                ),
                 norm_eps=1e-6,
                 dropout_ratio=self._output_dropout_ratio,
                 output_weight=(
@@ -595,14 +682,23 @@ class STULayer(STU):
         fuse_residual = hstu_fp8_fuse_residual_enabled()
         with record_function("## stu_targets_only_preprocess_and_attention ##"):
             # Targets-only e4m3 VK save (store instead of recompute in the
-            # targets-only backward); gin item (15), see _SAVE_TARGETS_VK.
+            # targets-only backward); see _SAVE_TARGETS_VK.
             allow_save_fp8_vk = _SAVE_TARGETS_VK
             if allow_save_fp8_vk and not torch.jit.is_scripting():
                 allow_save_fp8_vk = self._allow_saved_fp8_uvqk()
+            g3_in = self._g3_pair("_input_norm_weight", "_input_norm_bias")
             preprocess_outputs = hstu_preprocess_and_attention_targets_only(
                 x=x,
-                norm_weight=self._input_norm_weight.to(x.dtype),
-                norm_bias=self._input_norm_bias.to(x.dtype),
+                norm_weight=(
+                    g3_in[0]
+                    if g3_in is not None
+                    else self._input_norm_weight.to(x.dtype)
+                ),
+                norm_bias=(
+                    g3_in[1]
+                    if g3_in is not None
+                    else self._input_norm_bias.to(x.dtype)
+                ),
                 norm_eps=1e-6,
                 num_heads=self._num_heads,
                 attn_dim=self._attention_dim,
@@ -629,6 +725,7 @@ class STULayer(STU):
                     self._fp8_qkv_scale if fp8_targets_vk else None
                 ),
                 return_residual_proxy=fuse_residual,
+                residual_rows_only=_TGT_SPARSE_RESID,
                 allow_save_fp8_vk=allow_save_fp8_vk,
             )
             if fuse_residual:
@@ -636,17 +733,37 @@ class STULayer(STU):
             else:
                 u, attn_output = preprocess_outputs
                 residual_x = x
-        candidate_x = torch.index_select(residual_x, 0, candidate_rows)
+        if fuse_residual and _TGT_SPARSE_RESID:
+            # The proxy already holds exactly x[candidate_rows]; its gradient
+            # is added row-sparsely inside the preprocess backward.
+            candidate_x = residual_x
+        else:
+            candidate_x = torch.index_select(residual_x, 0, candidate_rows)
         with record_function("## stu_targets_only_compute_output ##"):
+            # Shipped node order: norm weight, norm bias, output weight.
+            g3_out = self._g3_pair("_output_norm_weight", "_output_norm_bias")
+            g3_ow = self._g3_one("_output_weight") if g3_out is not None else None
             output = hstu_compute_output(
                 attn=attn_output,
                 u=u,
                 x=candidate_x,
-                norm_weight=self._output_norm_weight.to(x.dtype),
-                norm_bias=self._output_norm_bias.to(x.dtype),
+                norm_weight=(
+                    g3_out[0]
+                    if g3_out is not None
+                    else self._output_norm_weight.to(x.dtype)
+                ),
+                norm_bias=(
+                    g3_out[1]
+                    if g3_out is not None
+                    else self._output_norm_bias.to(x.dtype)
+                ),
                 norm_eps=1e-6,
                 dropout_ratio=self._output_dropout_ratio,
-                output_weight=self._output_weight.to(x.dtype),
+                output_weight=(
+                    g3_ow
+                    if g3_ow is not None
+                    else self._output_weight.to(x.dtype)
+                ),
                 group_norm=False,
                 num_heads=self._num_heads,
                 linear_dim=self._hidden_dim,
@@ -766,6 +883,16 @@ class STUStack(STU):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if not torch.jit.is_scripting() and glue_fold3.PCAST:
+            return self._g3_forward(
+                x,
+                x_lengths,
+                x_offsets,
+                max_seq_len,
+                num_targets,
+                max_kv_caching_len,
+                kv_caching_lengths,
+            )
         for layer in self._stu_layers:
             x = layer(
                 x=x,
@@ -779,6 +906,75 @@ class STUStack(STU):
         return x
 
     @torch.jit.unused
+    def _g3_forward(
+        self,
+        x: torch.Tensor,
+        x_lengths: torch.Tensor,
+        x_offsets: torch.Tensor,
+        max_seq_len: int,
+        num_targets: torch.Tensor,
+        max_kv_caching_len: int,
+        kv_caching_lengths: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """GLUE_FOLD3 PCAST: the same layer loop as forward(), between the
+        stack-level fused cast and the shadow clear (try/finally, so a layer
+        that raises never leaves shadows behind). Kept out of forward() itself
+        because TorchScript does not compile try blocks."""
+        try:
+            self._g3_begin(
+                x.dtype, targets_only=False, enable=kv_caching_lengths is None
+            )
+            for layer in self._stu_layers:
+                x = layer(
+                    x=x,
+                    x_lengths=x_lengths,
+                    x_offsets=x_offsets,
+                    max_seq_len=max_seq_len,
+                    num_targets=num_targets,
+                    max_kv_caching_len=max_kv_caching_len,
+                    kv_caching_lengths=kv_caching_lengths,
+                )
+            return x
+        finally:
+            self._g3_end()
+
+    @torch.jit.unused
+    def _g3_begin(self, dtype: torch.dtype, targets_only: bool, enable: bool) -> None:
+        """GLUE_FOLD3 PCAST: cast every STU layer's call-site parameters in ONE
+        launch and hand each layer its bf16 shadows for this forward call. Every
+        layer's shadow is (re)assigned here, so a stale one can never survive
+        into a later call; each layer also re-checks the parameter versions."""
+        layers = list(self._stu_layers)
+        shadows = None
+        names_per: List[List[str]] = []
+        if enable and layers and all(isinstance(m, STULayer) for m in layers):
+            groups = []
+            last = len(layers) - 1
+            for i, m in enumerate(layers):
+                names = m._g3_pcast_names(targets_only and i == last)  # pyre-ignore[29]
+                names_per.append(names)
+                groups.append([getattr(m, n) for n in names])
+            shadows = glue_fold3.stack_param_shadows(groups, dtype)
+        for i, m in enumerate(layers):
+            if not isinstance(m, STULayer):
+                continue
+            if shadows is None:
+                m._g3_shadow = None
+                m._g3_shadow_versions = None
+            else:
+                m._g3_shadow = dict(zip(names_per[i], shadows[i]))
+                m._g3_shadow_versions = {
+                    n: getattr(m, n)._version for n in names_per[i]
+                }
+
+    @torch.jit.unused
+    def _g3_end(self) -> None:
+        for m in self._stu_layers:
+            if isinstance(m, STULayer):
+                m._g3_shadow = None
+                m._g3_shadow_versions = None
+
+    @torch.jit.unused
     def forward_targets_only(
         self,
         x: torch.Tensor,
@@ -790,6 +986,28 @@ class STUStack(STU):
         num_layers = len(self._stu_layers)
         if num_layers == 0:
             raise RuntimeError("targets-only requires at least one STU layer")
+        if not glue_fold3.PCAST:
+            return self._forward_targets_only_layers(
+                x, x_lengths, x_offsets, max_seq_len, num_targets
+            )
+        try:
+            self._g3_begin(x.dtype, targets_only=True, enable=True)
+            return self._forward_targets_only_layers(
+                x, x_lengths, x_offsets, max_seq_len, num_targets
+            )
+        finally:
+            self._g3_end()
+
+    @torch.jit.unused
+    def _forward_targets_only_layers(
+        self,
+        x: torch.Tensor,
+        x_lengths: torch.Tensor,
+        x_offsets: torch.Tensor,
+        max_seq_len: int,
+        num_targets: torch.Tensor,
+    ) -> torch.Tensor:
+        num_layers = len(self._stu_layers)
         for layer_index, layer in enumerate(self._stu_layers):
             if layer_index == num_layers - 1:
                 return layer.forward_targets_only(  # pyre-ignore [29]

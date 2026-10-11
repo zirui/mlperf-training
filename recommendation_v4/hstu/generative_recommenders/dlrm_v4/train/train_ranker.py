@@ -62,14 +62,31 @@ def _main_func(
     # and indexes this node's GPUs. The GLOBAL rank is what every downstream
     # consumer wants (data sharding via StreamingWindowSampler, checkpoint I/O,
     # metrics), so derive it once and pass it through as `rank`. Only the CUDA
-    # device must be node-local. Single-node (node_rank=0) → rank == local_rank,
-    # exactly as before.
+    # device must be node-local. Single-node (node_rank=0) → rank == local_rank.
     rank = node_rank * gpus_per_node + local_rank
     device = torch.device(f"cuda:{local_rank}")
     logger.info(
         f"rank: {rank} (node_rank={node_rank} local_rank={local_rank}), "
         f"world_size: {world_size}, device: {device}"
     )
+    # Persistent kernel cache (KCACHE_DIR, default off): the launcher seeded this container's Triton
+    # cache before the trainer started and exported what it seeded (unset =
+    # cache off). Rank 0 reports it in the trainer log.
+    _kcache = os.environ.get("KCACHE_SEEDED", "")
+    if rank == 0 and _kcache:
+        _kc_entries = 0
+        for _kc_field in _kcache.split():
+            if _kc_field.startswith("entries="):
+                try:
+                    _kc_entries = int(_kc_field[len("entries="):])
+                except ValueError:
+                    _kc_entries = 0
+        logger.info(
+            "%s [kcache] seeded %s TRITON_CACHE_DIR=%s",
+            "armed OK:" if _kc_entries > 0 else "NOT armed:",
+            _kcache,
+            os.environ.get("TRITON_CACHE_DIR", "<unset>"),
+        )
     # Phase 1: parse gin early with skip_unknown=True so env-bootstrap
     # bindings take effect BEFORE any module-level @gin.configurable
     # discovers itself. This is required because triton @triton.autotune
@@ -83,6 +100,18 @@ def _main_func(
 
     gin.parse_config_file(gin_file, skip_unknown=True)
     apply_env_bootstrap()
+
+    # TSPEC, dlrm_v4/train/triton_spec.py: the
+    # recorder (TRITON_SPEC_RECORD=<dir>, non-scored record runs) and the
+    # post-RUN_START compile monitor (TRITON_SPEC_MONITOR=1) wrap
+    # JITFunction._do_compile at class level. Installed here, right after the env
+    # bootstrap (so they are gin-bindable like the other TRITON_* knobs) and
+    # before the Phase-2 imports below: no kernel module is imported yet, so
+    # nothing has compiled. Both off = no triton import, no output. Never raises
+    # (a failure logs "[triton-spec] NOT armed" and the run continues).
+    from generative_recommenders.dlrm_v4.train import triton_spec as _tspec
+
+    _tspec.install_from_env(rank=rank, local_rank=local_rank, world_size=world_size)
 
     # Cold-start vs resume, decided from the on-disk checkpoint BEFORE setup so
     # the one-time INIT/RUN markers fire on a genuine cold start only and are NOT
@@ -101,7 +130,17 @@ def _main_func(
     # already-open run, whose markers were emitted by the original process).
     mlperf_cold_start = mlperf_logger is not None and not mlperf_resume
     if mlperf_cold_start:
-        mlperf_logger.event(key=mlperf_logger.constants.CACHE_CLEAR, value=True)
+        # cache_clear reports whether the launcher really flushed the page cache
+        # (CLEAR_CACHES); the checker accepts any value.
+        cache_cleared = os.environ.get("MLPERF_CACHE_CLEARED", "0") == "1"
+        if not cache_cleared:
+            logger.warning(
+                "MLPerf cache_clear=False: the page cache was not flushed before "
+                "this run (launch with CLEAR_CACHES=1); not a compliant timed run"
+            )
+        mlperf_logger.event(
+            key=mlperf_logger.constants.CACHE_CLEAR, value=cache_cleared
+        )
         mlperf_logger.start(key=mlperf_logger.constants.INIT_START)
 
     # Phase 2: heavy imports. Triton kernel modules evaluate their autotune
@@ -124,6 +163,17 @@ def _main_func(
         MetricsLogger,
         get_gpu_peak_flops,
     )
+    # Imported here (not lazily) so the Phase-3 strict gin parse sees the
+    # run_blas_warmup configurable bound in yambda_5b.gin ($BLAS_WARMUP).
+    from generative_recommenders.dlrm_v4.train.blas_warmup import (
+        run_blas_warmup,
+        run_startup_preload,
+    )
+    # FP8 first-use warmup (gin run_fp8_first_use_warmup.enabled = $FP8_WARMUP);
+    # imported here for the same strict-parse reason.
+    from generative_recommenders.dlrm_v4.train.fp8_warmup import (
+        run_fp8_first_use_warmup,
+    )
     # Robust Triton autotune pins (gin apply_env_bootstrap.DLRM_HSTU_FP8_AUTOTUNE_PINS,
     # default on; opt out with DLRM_HSTU_FP8_AUTOTUNE_PINS=0). Seeds the
     # Autotuner caches of the kernel modules imported above before any launch.
@@ -133,8 +183,10 @@ def _main_func(
 
     apply_autotune_pins()
 
-    # Ship6 kernel switches that have no launch-time arming line of their own:
+    # Kernel switches that have no launch-time arming line of their own:
     # report the flags the loaded modules actually use (one line per rank).
+    # wln_bwd_flydsl (DLRM_HSTU_FP8_WLN_BWD_FLYDSL) is the requested switch only; which variants
+    # actually run FlyDSL is in its per-variant "[ln-bwd]" lines at first use.
     from generative_recommenders.modules import stu as _stu
     from generative_recommenders.ops import position as _position
     from generative_recommenders.ops.triton import (
@@ -144,14 +196,37 @@ def _main_func(
     )
 
     logger.info(
-        "armed OK: ship6 kernel switches: wln_bwd_v2=%d fast_sigmoid=%d "
-        "lnmd_bwd_v2=%d save_normed_x=%d save_targets_vk=%d posenc_fast=%d",
+        "armed OK: kernel switches: wln_bwd_v2=%d fast_sigmoid=%d "
+        "lnmd_bwd_v2=%d save_normed_x=%d save_targets_vk=%d posenc_fast=%d "
+        "wln_bwd_flydsl=%d",
         int(_tln._wln_bwd_v2_enabled()),
         int(_tln._wln_bwd_v2_fast_sigmoid()),
         int(_thl._use_lnmd_bwd_v2()),
         int(_thpa._SAVE_BF16_NORMED_X),
         int(_stu._SAVE_TARGETS_VK),
         int(_position._POSENC_FAST),
+        int(_tln._wln_bwd_flydsl_enabled()),
+    )
+    # LayerNorm-family folds (yambda_5b.gin): the flags as the
+    # loaded modules read them. posenc_concat_fold acts only with posenc_fast,
+    # dropout_mscale_fold only with wln_bwd_v2 (each also logs its own ACTIVE
+    # line at first use).
+    from generative_recommenders.ops import input_dropout_fold as _idf
+
+    logger.info(
+        "armed OK: LN-fold switches: wln_fwd_v2=%d lnmd_fwd_v2=%d "
+        "posenc_concat_fold=%d dropout_mscale_fold=%d tgt_sparse_resid=%d",
+        int(_tln._wln_fwd_v2_enabled()),
+        int(os.environ.get("DLRM_HSTU_FP8_LNMD_FWD_V2", "0") != "0"),
+        int(_position._POSENC_CONCAT_FOLD),
+        int(_idf.input_dropout_fold_enabled()),
+        int(_stu._TGT_SPARSE_RESID),
+    )
+    # Weighted-LN backward (v2 kernel) exact pow2 1/D (bitwise; default off in
+    # code, gin turns it on, kill switch DLRM_HSTU_FP8_WLN_BWD_POW2=0): see
+    # ops/triton/triton_layer_norm.py _wln_bwd_pow2_enabled.
+    logger.info(
+        "armed OK: wln_bwd_pow2=%d", int(_tln._wln_bwd_pow2_enabled())
     )
 
     setup(
@@ -160,6 +235,28 @@ def _main_func(
         master_addr=master_addr,
         master_port=master_port,
         device=device,
+    )
+    # TSPEC replay (gin apply_env_bootstrap.
+    # TRITON_SPEC_REPLAY, default "0" = off): compile the recorded Triton
+    # specializations from the current source and load them on this GPU, so the
+    # first call after RUN_START is an in-process cache hit (no kernel launch, no
+    # tensor, no model / optimizer / RNG state). Earliest point that has both
+    # what replay needs: setup() above did torch.cuda.set_device (the kernel
+    # caches are per device) and created the process group, and the Phase-2
+    # imports loaded the kernel modules (rows resolve by module.qualname; a
+    # missing generative_recommenders.* module is imported, which loads no
+    # FlyDSL). Before the BLAS warmup, the FP8 first-use warmup and the
+    # startup preload below, which then find their Triton kernels already
+    # compiled. The node's ranks split the compiles (LPT shard + file barrier,
+    # no collective). Never raises: "armed OK: [triton-spec] replay ..." or
+    # "[triton-spec] NOT armed: ..." on every rank. Not on an MLPerf resume
+    # relaunch (no RUN_START there: the clock is already running).
+    _tspec.replay_from_env(
+        rank=rank,
+        local_rank=local_rank,
+        local_world=gpus_per_node,
+        world_size=world_size,
+        resume=bool(mlperf_resume and mlperf_logger is not None),
     )
     # Phase 3: re-parse to bind the @gin.configurables now that they are
     # registered. The earlier skip_unknown pass already consumed the
@@ -172,6 +269,25 @@ def _main_func(
     # is reproducible run-to-run. Must follow the full parse above so the binding
     # is wired, and precede make_model() below.
     seed_everything(rank=rank)
+
+    # Closed-division learning rate: DENSE_LR / SPARSE_LR unset -> the reference
+    # value for this global batch size, 1e-6 * GBS / 8192 (the midpoint of the
+    # allowed [0.5x, 1.5x] band); the sparse rate must equal the dense rate, so a
+    # single explicit value is applied to both. Resolved before the optimizers
+    # read the env (gin dlr/slr env_float, default -1 = unset).
+    _gbs = world_size * int(os.environ.get("BATCH_SIZE", "1024"))
+    _dlr, _slr = os.environ.get("DENSE_LR", ""), os.environ.get("SPARSE_LR", "")
+    if not _dlr and not _slr:
+        _dlr = _slr = repr(1e-6 * _gbs / 8192)
+    elif not _slr:
+        _slr = _dlr
+    elif not _dlr:
+        _dlr = _slr
+    os.environ["DENSE_LR"], os.environ["SPARSE_LR"] = _dlr, _slr
+    if rank == 0:
+        logger.info(
+            "learning rate: dense=%s sparse=%s (global batch %d)", _dlr, _slr, _gbs
+        )
 
     model, model_configs, embedding_table_configs = make_model()
     model, optimizer = make_optimizer_and_shard(
@@ -205,7 +321,7 @@ def _main_func(
     )
     # Streaming fixed-holdout eval uses the dual fresh/cumulative metric sets:
     # window_* = fresh per-pass full-holdout, lifetime_* = cumulative across
-    # passes (AUC via O(bins) histogram). Other modes keep the legacy single set.
+    # passes (AUC via O(bins) histogram). Other modes use a single set.
     metrics = MetricsLogger(
         multitask_configs=model_configs.multitask_configs,
         batch_size=train_dataloader.batch_size,
@@ -243,7 +359,7 @@ def _main_func(
     # default on; opt out with DLRM_HSTU_FP8_PREBUILD=0). Compilation belongs in
     # the untimed initialization phase: it runs before INIT_STOP/RUN_START
     # below, touches no data, and builds exactly the module the first FP8 step
-    # would otherwise build lazily inside the timed region (~14 s).
+    # would otherwise build lazily inside the timed region.
     if os.environ.get("DLRM_HSTU_FP8_PREBUILD", "0") == "1":
         import time as _time
 
@@ -256,6 +372,73 @@ def _main_func(
             int(_built),
             _time.perf_counter() - _t0,
         )
+        # The onesweep sort extension (no-op unless
+        # DLRM_HSTU_FP8_POSENC_TS_ONESWEEP or DLRM_HSTU_FP8_EC_JOINT_ONESWEEP
+        # is on; logs "armed OK: prebuild ... onesweep_sort_ext=1", or a
+        # "NOT armed ... onesweep_sort_ext=0" warning when the build fails).
+        from generative_recommenders.ops import onesweep_sort as _osort
+
+        _osort.prebuild()
+
+    from generative_recommenders.dlrm_v4.train import dl_prestart as _dlstart_guard
+
+    # MLPerf cold start: from here on no sample may be handed to a worker or
+    # prefetched until RUN_START is logged (dl_prestart.require_run_start guards
+    # the sampler release and the cold prefetch).
+    if mlperf_cold_start and not metrics.mlperf_run_started:
+        _dlstart_guard.expect_run_start()
+
+    # BLAS first-use warmup (gin run_blas_warmup.enabled = $BLAS_WARMUP; on in
+    # yambda_5b.gin, absent binding = off). Library/handle/TunableOp-operator init and kernel code-object
+    # load for every GEMM family of the first forward+backward, on synthetic
+    # tensors at a tiny M, in the untimed initialization phase like the prebuild
+    # above. Touches no module, parameter, optimizer, FP8 cache, pin table or
+    # RNG stream (dlrm_v4/train/blas_warmup.py). Logs "armed OK: [blas-warmup]".
+    # TSPEC globals guard first: the warmups below launch replayed kernels (no-op
+    # without a replay).
+    _tspec.recheck_globals("pre_warmup")
+    run_blas_warmup(device=device)
+
+    # DataLoader pre-start (gin prestart_streaming_loaders.enabled = $DL_PRESTART;
+    # level 2 adds the post-RUN_START cold first-batch prefetch):
+    # build the streaming dataset object and fork the train/eval worker pools in
+    # the untimed initialization phase, with EMPTY sampler windows -- no sample
+    # is read, prefetched or collated before RUN_START (the [dlstart] timeline
+    # line after the first step stamps worker-ready and first-read times rel.
+    # RUN_START as the compliance proof). Initialization only, like the prebuild.
+    from generative_recommenders.dlrm_v4.train import dl_prestart as _dlstart
+
+    if mode == "streaming-train-eval":
+        from generative_recommenders.dlrm_v4.train.utils import (
+            prestart_streaming_loaders,
+        )
+
+        _prestarted = prestart_streaming_loaders(
+            hstu_config=model_configs,
+            embedding_table_configs=embedding_table_configs,
+            rank=rank,
+            world_size=world_size,
+        )
+        # FP8 first-use warmup (gin
+        # run_fp8_first_use_warmup.enabled = $FP8_WARMUP, default 0 = off): the
+        # JIT/compile of the kernels the FP8 switch (and, tier 2, the bf16
+        # calibration steps) would otherwise compile inside the timed region, on
+        # synthetic tensors only (dlrm_v4/train/fp8_warmup.py; every latch and
+        # cache it touches is restored). Only when the pools above are forked
+        # (FlyDSL loads after the fork), and before the startup preload's
+        # gc.freeze below so its garbage is collected first. Never raises.
+        run_fp8_first_use_warmup(
+            device=device,
+            model=inner_model,
+            batch_size=train_dataloader.batch_size,
+            prestarted=bool(_prestarted),
+        )
+        # Startup preload (gin run_startup_preload.enabled = $BLAS_WARMUP):
+        # FlyDSL kernel-module import, the JIT build of the WLN_BWD_FLYDSL FlyDSL
+        # LayerNorm-backward kernels on synthetic zero/one tensors, and one
+        # gc.collect()/freeze(), AFTER every pool above is forked.
+        # Initialization only: no data, no RNG, no training state.
+        run_startup_preload(prestarted=bool(_prestarted))
 
     # Caching-allocator pre-grow (gin apply_env_bootstrap.DLRM_HSTU_FP8_ALLOC_PREGROW,
     # default on; opt out with DLRM_HSTU_FP8_ALLOC_PREGROW=0). Maps the train
@@ -265,6 +448,11 @@ def _main_func(
     from generative_recommenders.dlrm_v4 import alloc_pregrow as _alloc_pregrow
 
     _alloc_pregrow.pregrow_before_run_start()
+
+    # TSPEC globals guard, last check before the clock starts (so it never runs
+    # inside the timed region; mark_run_start below is only a timestamp). No-op
+    # without a replay.
+    _tspec.recheck_globals("run_start")
 
     # MLPerf run markers: open the run exactly once. On a cold start emit
     # submission info + hyperparameters + INIT_STOP/RUN_START and mark the run as
@@ -276,6 +464,13 @@ def _main_func(
         # Submission info + hyperparameters + INIT_STOP/RUN_START, all emitted by
         # the logger (optimizer names/LRs read from gin internally). Seed is the
         # value setup() resolved and exported to $SEED.
+        # Evidence for the cache-flush / clock rules: page-cache residency of the
+        # dataset files right before RUN_START, one line per node (mincore,
+        # reads nothing; sample pages should be zero after the flush).
+        if rank % max(1, torch.cuda.device_count()) == 0 and os.environ.get(
+            "DLRM_DATA_PATH"
+        ):
+            _dlstart_guard.page_cache_snapshot(os.environ["DLRM_DATA_PATH"], rank)
         mlperf_logger.log_run_start(
             global_batch_size=world_size * int(train_dataloader.batch_size),
             seed=int(os.environ.get("SEED", "1")),
@@ -283,7 +478,16 @@ def _main_func(
             micro_batch_size=int(train_dataloader.batch_size),
             config_filename=gin_file,
         )
+        # TSPEC: Triton compiles from here on are "post" RUN_START (recorder
+        # phase, monitor count).
+        _tspec.mark_run_start()
+        # Reference for the [dlstart] startup timeline / compliance check.
+        _dlstart.set_run_start()
         metrics.mlperf_run_started = True
+    else:
+        # Resume or no MLPerf logger: the run is already open (or untimed); the
+        # same TSPEC boundary for the recorder phase and the monitor.
+        _tspec.mark_run_start()
     # Pass the logger to the loop whenever MLPerf logging is enabled, so block /
     # eval / train_loss / run_stop events emit on BOTH a cold start and a resume.
     mlperf_run_active = mlperf_logger is not None and metrics.mlperf_run_started
@@ -327,6 +531,14 @@ def _main_func(
                 device=device,
             )
         elif mode == "streaming-train-eval":
+            # Teardown after RUN_STOP ($DL_TEARDOWN_CLOSE_POOLS, default on;
+            # dlrm_v4/train/pool_close.py): the loop records its persistent
+            # input pools in this list, and they are closed as soon as it
+            # returns (RUN_STOP already logged), on every rank, before the
+            # barrier and destroy_process_group below.
+            from generative_recommenders.dlrm_v4.train import pool_close as _pool_close
+
+            _input_pools = [] if _pool_close.enabled() else None
             streaming_train_eval_loop(
                 rank=rank,
                 model=model,
@@ -342,7 +554,12 @@ def _main_func(
                 # Only pass the logger when run boundaries were emitted, so the
                 # loop never produces orphan block/eval events.
                 mlperf_logger=mlperf_logger if mlperf_run_active else None,
+                teardown_pools=_input_pools,
             )
+            if _input_pools is not None:
+                _pool_close.close_pools(_input_pools, rank=rank, log=logger.warning)
+            elif rank == 0:
+                logger.warning(_pool_close.OFF_LINE)
     except Exception as e:
         logger.info(traceback.format_exc())
         raise Exception(e)
@@ -388,7 +605,7 @@ def main() -> None:
         "train-eval",
         "streaming-train-eval",
     ], f"Unsupported mode: {args.mode}"
-    # Distributed topology (single-node defaults reproduce the legacy behavior):
+    # Distributed topology:
     #   GPUS_PER_NODE  local procs to spawn on THIS node (default: all visible GPUs)
     #   NNODES/NODE_RANK  multi-node fan-out, set by the SLURM launcher
     #   WORLD_SIZE     global rank count = NNODES * GPUS_PER_NODE

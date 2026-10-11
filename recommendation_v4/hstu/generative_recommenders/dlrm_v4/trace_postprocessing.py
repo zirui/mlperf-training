@@ -227,8 +227,8 @@ def serialize_stream_order(
     are assigned in launch order, so on one stream the correlation order is
     the execution order. Some ROCm captures still record adjacent work items
     on one stream out of that order (the earlier launch drawn a few us after
-    the later one started) or overlapping by 5-12 us (the earlier item's end
-    recorded late). Such items nest inside each other or cross, which puts a
+    the later one started) or overlapping (the earlier item's end recorded
+    late). Such items nest inside each other or cross, which puts a
     second row on the stream, and an annotation rebuilt from launch linkage
     then contains a kernel launched outside it.
 
@@ -508,50 +508,35 @@ def _trim_warmup_from_trace(
     ranks at the end of the WARMUP step, so the first recorded step starts
     from an empty GPU queue. With the host-sync-free step the host normally
     runs one step ahead of the GPU; the first step after a drain has no such
-    lead and is not a steady-state step. Recording one step more and not
-    exporting it keeps that
+    lead and is not a steady-state step. Recording one step more and not exporting it keeps that
     rebuild step out of the artifact.
 
     ``lead_in`` (with ``skip_head``). Under the host-sync-free step the GPU is
     still running the dropped head step when the first exported CPU step
-    begins (~110-145 ms at 1/2/4n). Trimming that work by launch leaves the
+    begins. Trimming that work by launch leaves the
     compute stream blank at the top of the export. With ``lead_in`` the head
     step immediately before the export is kept as a labelled lead-in: its CPU
     events and the GPU work it launched stay in the file with
     ``args.lead_in = true`` and ``args.owner_step = N``, and its
     ``ProfilerStep#N`` annotations are renamed ``ProfilerStep#N (lead-in, not
     exported)`` so step counting, ``step_wall`` and the one-step-per-step
-    layout ignore it. ``scripts/stitch_traces.py`` then clips the lead-in to
+    layout ignore it. The stitcher then clips the lead-in to
     one trace start across ranks (:func:`lead_in_trace_bounds`,
     :func:`clip_lead_in`), from which every rank keeps its head-step GPU
     work (whole) and CPU events; a per-rank file keeps the whole head step.
 
     ``keep_head_active``. The last recorded steps of a window carry the
     tracing session's teardown, and what that costs is cross-rank SKEW -- the
-    eight ranks finish flushing at different times, so the tail steps go
-    ragged. One export (``active=6``, exported tail == recorded tail) against
-    another (``active=7``), same arm, 8 ranks:
-
-                 active=6                  active=7
-        step 46  270.66 ms  spread 17.56   270.89 ms  spread 3.10
-        step 56  279.30 ms  spread 25.06   280.82 ms  spread 0.66
-
-    against ~1 ms of spread on the clean steps. Under the host-sync-free step
+    ranks finish flushing at different times, so the tail steps go ragged.
+    Under the host-sync-free step
     the GPU work of the last exported step also finishes while the host is in
     the NEXT step, so at least one recorded step must follow the export.
 
     Boundary and eval steps. A step that ran the streaming window-boundary
     barrier (``c10d::barrier``) is not a steady-state step. Under the
-    host-sync-free step the barrier first drains the run-ahead queue (~200 ms
-    of ``hipStreamSynchronize`` at 1n, steps 46 and 56 of the ship captures;
-    the synced trunk's barrier takes ~0.1 ms), so the step starts from an
-    empty GPU queue. The 1n ship capture's step 56 (first batch of ``ts=24``)
-    additionally holds a ~1.09 s host stall on rank 0 alone, inside
-    ``_HSTUPreprocessAndAttentionFunction`` with no CPU op or runtime call
-    under it, that the other ranks wait out in their input all-to-all. That
-    stall is not the barrier, is absent at the step-46 boundary and in the
-    trunk's step 56, and its cause is not identified. A step without
-    ``## backward N ##`` is an eval step.
+    host-sync-free step the barrier first drains the run-ahead queue
+    (``hipStreamSynchronize``), so the step starts from an empty GPU queue. A
+    step without ``## backward N ##`` is an eval step.
     Both are reported in ``traceCapture`` and logged. With
     ``skip_boundary_steps`` the export window moves past a barrier step when
     enough steps were recorded (it never moves into the last recorded step);
@@ -592,8 +577,7 @@ def _trim_warmup_from_trace(
     # of the GPU (a pipelined / sync-free step), the GPU copy of
     # ``ProfilerStep#N`` ends after CPU ``ProfilerStep#N+1`` has begun, so a
     # range built from the merged CPU+GPU spans leaks the next CPU step into
-    # the export as an extra, unpaired step (pipelined traces: one extra
-    # ProfilerStep per rank -> trace_status=error).
+    # the export as an extra, unpaired step.
     name_to_cpu: Dict[str, tuple] = {}
     for e in events:
         nm = e.get("name", "")
@@ -706,7 +690,7 @@ def _trim_warmup_from_trace(
     # annotation. A time-window test would keep the NEXT step's input-pipeline
     # annotations (copy_batch_to_gpu N+3, start_sparse_data_dist N+2, ...)
     # whenever their GPU work runs inside the window while their CPU span was
-    # trimmed away, leaving orphans with no CPU parent (42 at 1n, 160 at 4n).
+    # trimmed away, leaving orphans with no CPU parent.
     cpu_ann_ts: Dict[Any, float] = {}
     for e in events:
         if e.get("ph") == "X" and e.get("pid") not in gpu_pids and "ts" in e:
@@ -1360,8 +1344,7 @@ def rebuild_gpu_annotation_spans(
     # the compute stream does not already show. The main stream is the one
     # with the most non-communication GPU work time on that rank. Collective
     # kernels are excluded: a collective waiting for a late peer is "busy"
-    # for the whole wait (1n step 56: a 1.09 s all_to_all on the comm stream
-    # of every rank but the late one would otherwise win).
+    # for the whole wait.
     busy: Dict[tuple, list] = defaultdict(lambda: [0, 0])
     for e in events:
         if e.get("ph") == "X" and e.get("cat") in _GPU_KERNEL_CATS:
@@ -1566,8 +1549,7 @@ def lead_in_trace_bounds(
 
     Computed in one pass, not iterated to a fixed point: following items
     that cross ``trace_start_us`` back in time cascades through staggered
-    ranks, walking back through earlier steps without reducing blank time.
-    The one item per stream still running at ``trace_start_us`` is dropped
+    ranks. The one item per stream still running at ``trace_start_us`` is dropped
     whole instead (see :func:`clip_lead_in`). Both values are fixed points
     of a re-stitch: the work that defines them starts at or after
     ``trace_start_us`` and is kept.

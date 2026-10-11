@@ -370,10 +370,8 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
     # so the kernel call site doesn't have to know about TLX at all.
     #
     # IMPORTANT: this loop must apply to BOTH the HIP branch and the CUDA branch
-    # above. It used to live inside the CUDA `else:` block which meant HIP
-    # configs reached `_hstu_attn_fwd[grid](...)` without these defaults and
-    # crashed at dispatch. Keep this hoisted (outside the if/else) when
-    # editing — the HIP configs crash at dispatch without these defaults.
+    # above: configs that reach `_hstu_attn_fwd[grid](...)` without these
+    # defaults crash at dispatch. Keep this hoisted (outside the if/else).
     for config in configs:
         if not config.kwargs.get("USE_TLX", False):
             config.kwargs["USE_TLX"] = False
@@ -1766,9 +1764,9 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
 
 
 def _get_fw_pinned_configs() -> List[triton.Config]:
-    # Pinned forward-attention configs for MI350X gfx950. The full search is a
-    # coin flip between matrix_instr_nonkdim 16 (fast) and 32 (slow); pinning the
-    # known winners makes cold starts deterministic. See _autotune_pinning.
+    # Pinned forward-attention configs for MI350X gfx950. The full search can
+    # pick either matrix_instr_nonkdim 16 or 32; pinning the configs makes cold
+    # starts deterministic. See _autotune_pinning.
     #
     # This is a LIST, one entry per training shape we've tuned (currently just
     # bs=1024). With >1 entry the autotuner still runs a tiny benchmark over only
@@ -1786,7 +1784,7 @@ def _get_fw_pinned_configs() -> List[triton.Config]:
     # that loop, so every pinned entry must set them explicitly.
     if torch.version.hip:
         return [
-            # --- yambda bs=1024, L=2048 winner (from capture log) ---
+            # --- yambda bs=1024, L=2048 ---
             triton.Config(
                 {
                     "BLOCK_M": 128,
@@ -2733,8 +2731,8 @@ def _get_bw_configs() -> List[triton.Config]:
 
 
 def _get_bw_pinned_configs() -> List[triton.Config]:
-    # Pinned backward-attention configs for MI350X gfx950. Pins the fast
-    # matrix_instr_nonkdim=16 winner(s) to avoid the 16-vs-32 autotune lottery.
+    # Pinned backward-attention configs for MI350X gfx950. Pins
+    # matrix_instr_nonkdim=16 so autotuning does not choose between 16 and 32.
     #
     # LIST, one entry per tuned shape (currently just bs=1024). With >1 entry the
     # autotuner benchmarks only these candidates and caches the winner per `key`
@@ -2749,7 +2747,7 @@ def _get_bw_pinned_configs() -> List[triton.Config]:
     # Keep pre_hook=_bwd_pre_hook on every entry (the bwd configs require it).
     if torch.version.hip:
         return [
-            # --- yambda bs=1024, L=2048 winner (from capture log) ---
+            # --- yambda bs=1024, L=2048 ---
             triton.Config(
                 {
                     "BLOCK_M": 32,
@@ -3067,7 +3065,7 @@ def _hstu_attn_delta_bwd(
 ):
     """Backward for one compact suffix query per jagged sequence.
 
-    The Plan 05 specialization is intentionally narrower than the cached
+    This specialization is intentionally narrower than the cached
     inference path: every sequence has exactly one target, contextual/window
     modes are disabled, and target-aware masking makes that target attend all
     history rows plus itself. Each program owns one sequence/head, so dK/dV
@@ -3076,7 +3074,7 @@ def _hstu_attn_delta_bwd(
     MAX_SEQ_LEN is a runtime scalar, not a tl.constexpr, and must stay that way.
     Production derives it per batch as max_uih_len + num_candidates, so making it
     constexpr keys the JIT cache on a value that changes nearly every step: a
-    cold process then pays a fresh ~110 ms compile per batch, and that compile
+    cold process then pays a fresh compile per batch, and that compile
     blocks the launch queue, so it shows up as GPU idle rather than as host time.
     It is only ever used as the 1/MAX_SEQ_LEN scale below -- the same expression
     _hstu_attn_bwd already evaluates from a runtime value -- so nothing here
@@ -3122,8 +3120,8 @@ def _hstu_attn_delta_bwd(
         )
         k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
         v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
-        # Match the former standalone dequantization boundary exactly: scale in
-        # fp32, round to BF16, then consume the rounded value in the backward.
+        # Match a standalone dequantization boundary exactly: scale in fp32,
+        # round to BF16, then consume the rounded value in the backward.
         k_real = (
             (k.to(tl.float32) * K_SCALE).to(DK.dtype.element_ty).to(tl.float32)
         )
@@ -3189,7 +3187,7 @@ def triton_hstu_attention_fwd(
     AUTOTUNE_Z = prev_power_of_2(Z)
     L, H, DimQ = q.shape
     _, _, DimV = v.shape
-    # Plan 08 Phi2 consumes scaled E4M3 Q/K/V but keeps the attention output
+    # This path consumes scaled E4M3 Q/K/V but keeps the attention output
     # in BF16 for the existing output-LN and backward paths.
     output_dtype = (
         torch.bfloat16
@@ -3790,7 +3788,38 @@ def triton_cached_hstu_mha(
 
     has_contextual_seq_len = contextual_seq_len > 0
     has_max_attn_len = max_attn_len > 0
-    _hstu_attn_fwd[grid](
+    # DLRM_HSTU_FP8_DELTA_FWD_BM16 (read per call; code default OFF, the gin
+    # config binds it on): the pinned forward config (BLOCK_M=128, tuned for the full forward)
+    # leaves 127 of 128 query rows masked when each sequence has one delta
+    # query. A 16-row query block (BLOCK_N=32, 2 warps) computes the same
+    # per-row values -- bitwise identical output -- with 8x fewer MFMA rows.
+    # Applies to DeltaSize <= 16 without TMA on ROCm only, bypassing the
+    # autotuner there; DLRM_HSTU_FP8_DELTA_FWD_BM16=0 restores the pinned
+    # config. The kernel is still `_hstu_attn_fwd`.
+    launch = _hstu_attn_fwd
+    extra_cfg = {}
+    if (
+        DeltaSize <= 16
+        and not enable_tma
+        and torch.version.hip is not None
+        and os.environ.get("TRITON_FULL_AUTOTUNE", "0") != "1"
+        and _delta_fwd_bm16_enabled()
+    ):
+        launch = _hstu_attn_fwd.fn
+        extra_cfg = dict(
+            BLOCK_M=16,
+            BLOCK_N=32,
+            matrix_instr_nonkdim=16,
+            waves_per_eu=0,
+            kpack=2,
+            USE_TLX=False,
+            NUM_BUFFERS=1,
+            NUM_MMA_WARPS_PER_GROUP=1,
+            NUM_MMA_GROUPS=1,
+            num_stages=2,
+            num_warps=2,
+        )
+    launch[grid](
         Q=desc_q,
         K=desc_k,
         V=desc_v,
@@ -3832,5 +3861,22 @@ def triton_cached_hstu_mha(
         TMA_DESC_SIZE=TMA_DESC_SIZE,
         FAST_INTERIOR=_fast_interior(),
         FP8_INPUT=fp8_input,
+        **extra_cfg,
     )
     return out
+
+
+_DELTA_FWD_BM16_LOGGED = [False]
+
+
+def _delta_fwd_bm16_enabled() -> bool:
+    on = os.environ.get("DLRM_HSTU_FP8_DELTA_FWD_BM16", "0") == "1"
+    if on and not _DELTA_FWD_BM16_LOGGED[0]:
+        _DELTA_FWD_BM16_LOGGED[0] = True
+        print(
+            "[hstu_delta_fwd] DLRM_HSTU_FP8_DELTA_FWD_BM16=1 armed: delta-query "
+            "forward uses BLOCK_M=16 BLOCK_N=32 num_warps=2 num_stages=2 "
+            "(bypasses the pinned BLOCK_M=128 config; bitwise identical)",
+            flush=True,
+        )
+    return on

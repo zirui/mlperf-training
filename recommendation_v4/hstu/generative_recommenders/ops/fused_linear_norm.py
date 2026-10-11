@@ -1,12 +1,19 @@
-# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # pyre-strict
 """F1: fold a Linear's bias gradient into the norm backward that follows it.
 
-ContextualPreprocessor builds three MLPs, each Sequential(Linear,
-SwishLayerNorm, Linear, LayerNorm). For each pair autograd computes the
-Linear's bias gradient as a standalone aten::sum over the norm's dx. That sum
-re-reads dx from HBM after the norm backward has written it. The fused path
-computes the column sum while dx is still in registers.
+WHAT IS BEING REMOVED. ContextualPreprocessor builds three MLPs, each
+Sequential(Linear, SwishLayerNorm, Linear, LayerNorm) -- six (Linear, Norm)
+pairs per step. For each pair autograd computes the Linear's bias gradient as a
+standalone aten::sum over the norm's dx.
+
+That sum re-reads the entire [N, D] dx from HBM immediately after the norm
+backward has finished writing it. The column sum it wants is available for free
+while dx is still in registers, so the fused path computes it there and the
+reread is deleted outright.
+
+WHAT IT COSTS. The SUM_DX accumulator adds work to the norm backward. No
+register spills at either shipped config; the D=256 swish kernel uses more
+VGPRs (2 -> 1 wave/SIMD).
 
 WHY A Sequential SUBCLASS AND NOT A NEW MODULE. The children, their order, and
 their attribute names are unchanged, so state_dict keys stay exactly
@@ -22,7 +29,8 @@ LayerNorm/SwishLayerNorm and the 3-tuple triton_weighted_layer_norm_bwd -- and
 its six external unpack sites -- are untouched.
 
 NUMERICS. dxsum reduces the fp32 dx still in registers, where aten::sum reduces
-the bf16 dx after it was stored. The two are not bit-identical.
+the bf16 dx after it was stored. This is the MORE accurate of the two, but it
+is not bit-identical: the difference is at the bf16 rounding scale.
 """
 
 import logging
@@ -33,9 +41,12 @@ import triton
 
 from generative_recommenders.common import HammerKernel
 from generative_recommenders.ops.layer_norm import LayerNorm, SwishLayerNorm
+from generative_recommenders.ops.triton import preproc_fp8_snr
 from generative_recommenders.ops.triton.triton_layer_norm import (
     _weighted_layer_norm_fwd,
     compute_BLOCK_D,
+    maybe_weighted_layer_norm_swish_fwd_v2,
+    note_weighted_layer_norm_swish_fwd_old,
     triton_weighted_layer_norm_bwd_dxsum,
     triton_weighted_layer_norm_fwd,
 )
@@ -57,7 +68,7 @@ def _norm_fwd(
     call LayerNormFunction.forward makes. The swish side has no such wrapper --
     SwishLayerNormFunction.forward launches _weighted_layer_norm_fwd inline --
     so that launch is mirrored here argument for argument. Both must stay
-    identical to the shipped forward. F1 changes only the backward.
+    identical to the shipped forward, because F1 is a BACKWARD-only change.
 
     F2 adds the optional `residual`. When it is given the result is
     ``LN(x) + residual`` computed in ONE pass, replacing a separate [M, D]
@@ -71,6 +82,12 @@ def _norm_fwd(
     if not is_swish and residual is None:
         return triton_weighted_layer_norm_fwd(x=x, weight=weight, bias=bias, eps=eps)
 
+    if is_swish and residual is None:
+        # DLRM_HSTU_FP8_WLN_FWD_V2: bitwise-equal persistent kernel for the
+        # D=256 swish site; None means "launch the old kernel below".
+        out = maybe_weighted_layer_norm_swish_fwd_v2(x, weight, bias, eps)
+        if out is not None:
+            return out
     N, D = x.shape
     y = torch.empty_like(x)
     mean = torch.empty((N,), dtype=torch.float32, device=x.device)
@@ -88,6 +105,8 @@ def _norm_fwd(
         COMPUTE_MEAN_AND_RSTD=True, OUTPUT_FP8=False, OUTPUT_BOTH=False,
         ADD_RESIDUAL=residual is not None,
     )
+    if is_swish and residual is None:
+        note_weighted_layer_norm_swish_fwd_old(x, weight, bias)
     return y, mean, rstd
 
 
@@ -122,9 +141,6 @@ class _LinearNormFunction(torch.autograd.Function):
         # autocast DISABLED -- so saving the fp32 Parameter here and meeting it
         # with a bf16 dh in backward is a mismatch ATen refuses outright:
         #     expected mat1 and mat2 to have the same dtype: BFloat16 != float
-        # That is not hypothetical; it killed arm f1_r1. The forward survived
-        # because autocast fixed up addmm for us, so the failure surfaced only
-        # in backward, one full training step later than the cause.
         #
         # Casting HERE rather than in backward is what makes this both legal and
         # numerically identical to the path it replaces: the forward matmul then
@@ -151,10 +167,8 @@ class _LinearNormFunction(torch.autograd.Function):
         # replaces is a plain aten::add, so a mismatch there would type-promote;
         # the kernel cannot, it rounds to Y's dtype before adding. Silently
         # casting would make the fused path disagree with the path it claims to
-        # reproduce, and the disagreement would show up as a convergence
-        # difference nobody had budgeted for. At the only call site both
-        # operands descend from the same autocast region, so this raises only if
-        # that stops being true -- which is exactly when someone should be told.
+        # reproduce. At the only call site both operands descend from the same
+        # autocast region, so this raises only if that stops being true.
         if residual is not None:
             if residual.dtype != h.dtype:
                 raise RuntimeError(
@@ -184,6 +198,18 @@ class _LinearNormFunction(torch.autograd.Function):
         ctx.eps = eps
         ctx.is_swish = is_swish
         ctx.BLOCK_D = compute_BLOCK_D(h)
+        if preproc_fp8_snr.ENABLED:
+            # Default-off FP8 numerics probe. Reads only; when
+            # DLRM_HSTU_FP8_PREPROC_SNR is unset nothing below this test runs.
+            preproc_fp8_snr.on_forward(
+                ctx,
+                0,
+                preproc_fp8_snr.pair_site(is_swish, x_c.shape[1], h.shape[1]),
+                x_c,
+                lin_w_c,
+                lin_b_c,
+                h,
+            )
         return y
 
     @staticmethod
@@ -210,10 +236,31 @@ class _LinearNormFunction(torch.autograd.Function):
         needs = ctx.needs_input_grad
         dx = dh @ lin_w if needs[0] else None
         dlin_w = dh.t() @ x if needs[1] else None
-        # THE POINT OF THE WHOLE EXERCISE: the Linear's bias gradient comes from
+        # The Linear's bias gradient comes from
         # the norm backward's register-resident reduction, so the standalone
         # aten::sum over [N, D] that autograd would have emitted never runs.
         dlin_b = dh_colsum if needs[2] else None
+        if preproc_fp8_snr.ENABLED:
+            preproc_fp8_snr.on_backward(
+                ctx,
+                0,
+                dh,
+                lin_w,
+                x,
+                dx,
+                dlin_w,
+                ln=dict(
+                    h=h,
+                    norm_w=norm_w,
+                    norm_b=norm_b,
+                    mean=mean,
+                    rstd=rstd,
+                    eps=ctx.eps,
+                    block_d=ctx.BLOCK_D,
+                )
+                if ctx.is_swish
+                else None,
+            )
 
         # Grads must come back in the dtype of the INPUT they belong to. dxsum
         # is fp32 by construction and the matmul results follow dh, so under a
@@ -284,10 +331,14 @@ class FusedLinearNormMLP(torch.nn.Sequential):
         return True
 
     def _report_once(self, fused: bool, x: torch.Tensor) -> None:
-        """Log whether this forward actually fused.
+        """Say, from inside the fused path, whether it actually fused.
 
-        The construction log only shows that the flag was set. `_can_fuse`
-        can still decline and run `nn.Sequential`.
+        make_model's "armed OK: fuse_linear_norm ACTIVE" line fires at model
+        CONSTRUCTION -- it proves the gin flag reached the process, and nothing
+        more. _can_fuse is evaluated per forward and bails to nn.Sequential on
+        the non-Triton ladder rungs, so a run can print ACTIVE and still never
+        fuse a single pair. This line is emitted by the code that does the
+        work.
         """
         self._f1_reported = True
         if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
@@ -303,7 +354,7 @@ class FusedLinearNormMLP(torch.nn.Sequential):
             logger.warning(
                 "fuse_linear_norm INERT -- _can_fuse declined (enabled=%s "
                 "cuda=%s dim=%d children=%d); this container ran the shipped "
-                "nn.Sequential path and measures nothing",
+                "nn.Sequential path unfused",
                 self._f1_enabled, x.is_cuda, x.dim(), len(list(self)),
             )
 
@@ -318,8 +369,10 @@ class FusedLinearNormMLP(torch.nn.Sequential):
         not to each intermediate norm -- so it is threaded to the final
         iteration and nowhere else.
 
-        When the fused path declines, the residual is added outside. The value
-        is the same either way.
+        When the fused path declines (`_can_fuse` false, e.g. a non-Triton
+        ladder rung) the residual is added the shipped way, outside. That is a
+        fallback in the mechanism, not in the semantics: the value is identical
+        either way.
         """
         can = self._can_fuse(x)
         if not self._f1_reported:

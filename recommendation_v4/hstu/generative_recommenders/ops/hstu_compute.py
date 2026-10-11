@@ -445,9 +445,14 @@ def hstu_preprocess_and_attention_targets_only(
     fp8_input_scale: Optional[torch.Tensor] = None,
     fp8_qkv_scale: Optional[torch.Tensor] = None,
     return_residual_proxy: bool = False,
+    residual_rows_only: bool = False,
     allow_save_fp8_vk: bool = True,
 ):
-    """Compute compact final-layer U/Q attention while retaining full K/V."""
+    """Compute compact final-layer U/Q attention while retaining full K/V.
+
+    With return_residual_proxy and residual_rows_only, the third output is the
+    candidate rows of x (x[seq_offsets[1:] - 1]) rather than x itself.
+    """
     if not is_fx_tracing():
         torch._assert(kernel == HammerKernel.TRITON, "targets-only requires Triton")
         torch._assert(x.dim() == 2, "x must be 2-D")
@@ -469,6 +474,7 @@ def hstu_preprocess_and_attention_targets_only(
         fp8_input_scale=fp8_input_scale,
         fp8_qkv_scale=fp8_qkv_scale,
         return_residual_proxy=return_residual_proxy,
+        residual_rows_only=residual_rows_only,
         allow_save_fp8_vk=allow_save_fp8_vk,
     )
     if return_residual_proxy:

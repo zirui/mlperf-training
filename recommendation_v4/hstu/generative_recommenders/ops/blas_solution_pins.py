@@ -6,22 +6,25 @@
 
 """Pin known-good hipBLASLt/rocBLAS solutions for the HSTU projection GEMMs.
 
-TunableOp keys on M, the jagged token count, which changes every step, so a
-tuning file from one step does not hit the next. This synthesizes the cache
-line for the current token count and merges it via ``tunable.read_file``.
+TunableOp keys on the full problem descriptor, which includes M, the total
+jagged token count, and M changes every step, so a tuning file collected at one
+step never hits at the next. Everything else in the key is M-independent, so
+rather than tuning per step this synthesizes the cache line for whichever token
+count is current and merges it via ``tunable.read_file``.
 
-A pinned index is specific to the library build in EXPECTED_ENV. On a mismatch
-the pins do not install and the default heuristic runs.
+A pinned index only means anything for the library build it was selected on, so
+the pins refuse to install unless the TunableOp validators match EXPECTED_ENV
+exactly. On any mismatch this is a no-op and the default heuristic runs.
 
 Enable with GR_PIN_BF16_BLAS_SOLUTIONS=1, which also requires
-PYTORCH_TUNABLEOP_ENABLED=1 and PYTORCH_TUNABLEOP_TUNING=0. To enable only some call sites, pass a comma-separated list of the short
-keys in _PINS instead of 1, e.g.
-GR_PIN_BF16_BLAS_SOLUTIONS=uvqk_dgrad,out_dgrad.
+PYTORCH_TUNABLEOP_ENABLED=1 and PYTORCH_TUNABLEOP_TUNING=0. To enable only some
+call sites, pass a comma-separated list of the short keys in _PINS instead of 1,
+e.g. GR_PIN_BF16_BLAS_SOLUTIONS=uvqk_dgrad,out_dgrad.
 
-BF16 is in the name because it is a real limit, not a label. Every key in _PINS
-is a BFloat16 TunableOp signature, so a pin fires only when that call site runs
-in bf16. With the FP8 forward on, FUSE_QKV and FUSE_OUTLN turn the uvqk and
-output projections into torch._scaled_mm calls that no key here can match.
+Every key in _PINS is a BFloat16 TunableOp signature, so a pin fires only when
+that call site runs in bf16. With the FP8 forward on, FUSE_QKV and FUSE_OUTLN
+turn the uvqk and output projections into torch._scaled_mm calls that no key
+here can match; uvqk_fwd and out_fwd then do not fire.
 
 Note on when a pin takes effect: TunableOp fixes an operator's solution the
 first time it resolves a given problem key, so a pin is only honoured if it is
@@ -38,7 +41,7 @@ import torch
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-# The solution indices below were measured on exactly this stack. They are
+# The solution indices below were selected on exactly this stack. They are
 # indices into that build's solution registry and are meaningless elsewhere.
 EXPECTED_ENV: Dict[str, str] = {
     "PT_VERSION": "2.12.0",
@@ -50,8 +53,17 @@ EXPECTED_ENV: Dict[str, str] = {
 
 # (call site, TunableOp op signature, key template on {M}, solution)
 #
-# Gemm_Rocblas_439683 computes the wrong answer for uvqk_dgrad. It is not in
-# this table. Pins are not bit-identical to the heuristic default.
+# Every solution here was selected with PYTORCH_TUNABLEOP_NUMERICAL_CHECK=1e-2_1e-2,
+# i.e. checked against a reference. Gemm_Rocblas_439683 computes the wrong
+# answer for the uvqk_dgrad shape and must not be pinned there.
+#
+# Some entries are not bit-identical to the heuristic default: no alternative
+# solution reproduces the uvqk_dgrad default exactly. Expect differences of one
+# to two bf16 ULPs, which is ordinary reassociation for this dtype.
+#
+# Re-select the solutions whenever EXPECTED_ENV changes.
+#
+# The MLP forward GEMM is deliberately absent and keeps the heuristic pick.
 _PINS: List[Tuple[str, str, str, str]] = [
     ("uvqk_fwd", "GemmAndBiasTunableOp_BFloat16_NN",
      "nn_2048_{M}_512_ld_2048_512_2048", "Gemm_Hipblaslt_437615"),
@@ -65,29 +77,81 @@ _PINS: List[Tuple[str, str, str, str]] = [
      "nt_512_1536_{M}_ld_512_1536_512", "Gemm_Hipblaslt_437445"),
     ("out_dgrad", "GemmTunableOp_BFloat16_TN",
      "tn_1536_{M}_512_ld_512_512_1536", "Gemm_Hipblaslt_441460"),
-    # Last-layer V/K pack is 1024 wide, so this is a separate key.
+    # The targets-only last layer's full-row V/K projection backward
+    # (## hstu_targets_full_vk_backward ##). Its N is the 1024-wide V/K pack
+    # rather than uvqk's 2048, so it is a key of its own. It uses the same
+    # solution as the uvqk wgrad and, like that one, is bit-identical to the
+    # default at production token counts -- both run the same GSU16 split, so
+    # the reduction order does not move. The targets-only forward does not call
+    # install_for_tokens; it does not have to, because it is the last layer and
+    # the ordinary ones ahead of it register the same count. A model with only
+    # targets-only layers would miss this pin silently.
+    #
+    # The solution is tuned for a K=M reduction long enough to amortise its
+    # non-temporal schedule, so it targets production token counts, not small M.
+    #
+    # There is no matching dgrad entry.
     ("targets_vk_wgrad", "GemmTunableOp_BFloat16_NT",
      "nt_1024_512_{M}_ld_1024_512_1024", "Gemm_Hipblaslt_436744"),
-    # Item-embedding MLP dgrad. Reachable only because _item_forward calls
-    # install_for_tokens(all_embeddings.shape[0]) before the MLP.
+    # The item-embedding MLP's second Linear (512 -> 256), DATA-GRADIENT side:
+    # grad_in[M,512] = grad_out[M,256] @ w[256,512]. Not an HSTU projection --
+    # it is in DlrmHSTU._item_embedding_mlp.
+    #
+    # The MLP row count is not the HSTU token count: num_tokens exceeds
+    # all_embeddings.shape[0] by global_batch_size, because preprocess()
+    # appends one token per sample between the MLP and the projection. This
+    # entry is reachable only because modules/dlrm_hstu.py:_item_forward calls
+    # install_for_tokens(all_embeddings.shape[0]) before the MLP. Remove that
+    # call and this entry silently goes inert. A pin being installed does not
+    # mean it is used; the "N pins active" line proves only the former.
+    #
+    # install_for_tokens synthesises the line for whatever count is current,
+    # so a pin fires at every M; a solution is only safe to pin if it is
+    # stable across token counts.
+    #
+    # Unlike Gemm_Rocblas_439683, this rocBLAS solution computes the same
+    # answer as the default up to reassociation: max absolute error is one
+    # bf16 ULP.
     ("mlp_b_dgrad", "GemmTunableOp_BFloat16_NN",
      "nn_512_{M}_256_ld_512_256_512", "Gemm_Rocblas_437980"),
-    # ContextualPreprocessor MLPs. preproc_dgrad_n512 shares its key with
-    # mlp_b_dgrad, so _decide() refuses to activate both.
+    # ---- ContextualPreprocessor MLP GEMMs (fused_linear_norm._LinearNormFunction):
+    # content (Din=512), additional (Din=1024 = 2 x 512) and action (Din=24) MLPs,
+    # each Linear(Din->256), SwishLN(256), Linear(256->512), LN(512). Selected with
+    # a 1e-2 TunableOp numerics check. Bit-identity: preproc_wgrad_n1024 is
+    # bit-identical to the heuristic; the other default entries differ on a small
+    # fraction of elements by <=2 bf16 ULP (fp32 accumulation-order differences).
+    #
+    # Reachability: these GEMMs run at the preprocessor's row count, which is
+    # the item-MLP row count _item_forward already registers; preprocessors.py
+    # also registers it itself so the pins do not depend on that ordering.
+    #
+    # NOTE preproc_dgrad_n512 shares its KEY with mlp_b_dgrad (same dims and layout
+    # in another call site). One key can take only one solution, so _decide() refuses
+    # to activate both.
+    #
+    # additional-MLP L1 dgrad dx[M,1024] = dh[M,256] @ w[256,1024].
     ("preproc_dgrad_n1024", "GemmTunableOp_BFloat16_NN",
      "nn_1024_{M}_256_ld_1024_256_1024", "Gemm_Rocblas_437863"),
+    # content-MLP L1 dgrad dx[M,512] = dh[M,256] @ w[256,512].
     ("preproc_dgrad_n512", "GemmTunableOp_BFloat16_NN",
      "nn_512_{M}_256_ld_512_256_512", "Gemm_Rocblas_437491"),
+    # L2 forward h[M,512] = addmm(b, x[M,256], w[512,256].t()), three calls/step.
     ("preproc_l2_fwd", "GemmAndBiasTunableOp_BFloat16_TN",
      "tn_512_{M}_256_ld_256_256_512", "Gemm_Hipblaslt_440245"),
+    # additional-MLP L1 wgrad dW[256,1024] = dh.t() @ x: bit-identical.
     ("preproc_wgrad_n1024", "GemmTunableOp_BFloat16_NT",
      "nt_1024_256_{M}_ld_1024_256_1024", "Gemm_Hipblaslt_436837"),
+    # The entries below are listed but NOT in the gin default.
+    # L2 wgrad dW[512,256] (3 calls/step), bit-identical.
     ("preproc_l2_wgrad", "GemmTunableOp_BFloat16_NT",
      "nt_256_512_{M}_ld_256_512_256", "Gemm_Hipblaslt_436551"),
+    # content L1 wgrad dW[256,512], bit-identical.
     ("preproc_wgrad_n512", "GemmTunableOp_BFloat16_NT",
      "nt_512_256_{M}_ld_512_256_512", "Gemm_Hipblaslt_437446"),
+    # action L1 fwd addmm [M,24]x[24,256], bit-identical.
     ("preproc_fwd_k24", "GemmAndBiasTunableOp_BFloat16_TN",
      "tn_256_{M}_24_ld_24_24_256", "Gemm_Hipblaslt_441235"),
+    # action L1 wgrad dW[256,24]: NOT bit-identical (differs by up to 1 bf16 ULP).
     ("preproc_wgrad_k24", "GemmTunableOp_BFloat16_NT",
      "nt_24_256_{M}_ld_24_256_24", "Gemm_Hipblaslt_436761"),
 ]
@@ -124,12 +188,14 @@ def _decide() -> bool:
         keys = {k.strip() for k in want.split(",") if k.strip()}
         unknown = keys - {p[0] for p in _PINS}
         if unknown:
+            # A key naming a pin that does not exist is a config error, so
+            # raise rather than silently disabling every pin.
             raise ValueError(
                 f"{ENV_VAR}={want!r} names unknown pin key(s) "
                 f"{', '.join(sorted(unknown))}. Valid keys: "
                 f"{', '.join(p[0] for p in _PINS)}. "
                 "Refusing to run: an unknown key would silently disable ALL "
-                "pins (~4% of step) rather than just the one named."
+                "pins rather than just the one named."
             )
         _active = [p for p in _PINS if p[0] in keys]
     # Two pins on one (signature, key) would race: TunableOp keeps the FIRST line it
@@ -176,7 +242,7 @@ def _decide() -> bool:
     bad = {k: (v, live.get(k)) for k, v in EXPECTED_ENV.items() if live.get(k) != v}
     if bad:
         logger.warning(
-            "BLAS solution pins disabled: solution indices were measured on a "
+            "BLAS solution pins disabled: solution indices were tuned for a "
             "different stack, so applying them here could select a different "
             "kernel. Mismatched: %s. Re-tune and update EXPECTED_ENV to enable.",
             ", ".join(f"{k} expected {e!r} got {g!r}" for k, (e, g) in bad.items()),
@@ -218,12 +284,11 @@ def install_for_tokens(num_tokens: int) -> None:
             f.write("\n".join(lines) + "\n")
         tunable.read_file(_path)
         # GR_PIN_BF16_BLAS_DEBUG=1 reports which token counts were actually
-        # registered. "N/8 pins active" is printed once by _decide() and proves
+        # registered. "N pins active" is printed once by _decide() and proves
         # only that keys were REQUESTED; it says nothing about the M they were
         # synthesised at. A pin whose GEMM runs at an M that never reaches this
-        # function is a silent no-op -- that is exactly how mlp_b_dgrad shipped
-        # "active on 8/8 ranks" while running the default kernel. One line per
-        # distinct count (so ~1-2 per step), which is why it is off by default.
+        # function is a silent no-op. One line per distinct count, which is why
+        # it is off by default.
         if os.environ.get("GR_PIN_BF16_BLAS_DEBUG") == "1":
             logger.info("BLAS pins installed at M=%d for %d key(s): %s",
                         num_tokens, len(_active),

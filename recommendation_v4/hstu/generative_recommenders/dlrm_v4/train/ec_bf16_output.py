@@ -1,20 +1,45 @@
-# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""bf16 EC output: cast the unique rows, then expand.
+"""bf16 EC output: cast the *unique* rows, not the expanded ones.
 
-``construct_jagged_tensors`` receives a unique-row embedding tensor plus
-``reverse_indices`` and gathers one row per token. This patch casts those
-unique rows to bf16 before the gather when the consumer is bf16.
+TorchRec's index dedup hands
+``torchrec.modules.utils.construct_jagged_tensors`` a **unique-row** embedding
+tensor plus ``reverse_indices``, and expands it to one row per token *inside*
+the call::
 
-The forward matches ``gather`` then ``to(bf16)``: gather is a copy, so the
-cast commutes with it. The backward upcasts the incoming gradient to fp32 and
-reduces in fp32.
+    expanded_indices = reverse_indices.unsqueeze(1).expand(-1, embeddings.size(-1))
+    embeddings = torch.gather(embeddings, 0, expanded_indices)
 
-Segments smaller than ``min_rows`` stay in the original dtype. The candidate
-item MLP runs outside autocast, so a bf16 tensor there would not match its
-fp32 weight.
+The unique rows are far fewer than the token rows. Everything downstream of
+the expand on the three big UIH features runs in bf16 anyway
+(``modules/dlrm_hstu.py`` casts ``item_id`` explicitly; autocast casts the
+``cat`` of ``artist_id`` and ``album_id`` at ``_additional_embedding_mlp``), so
+the fp32 rows are produced only to be rounded one op later.
+
+**The forward is bitwise exact.** ``gather`` is a pure copy, so
+``gather(x, i).to(bf16)`` and ``gather(x.to(bf16), i)`` produce identical bit
+patterns, and the same commutation holds for the ``cat`` on the
+additional-feature path.
+
+**The backward keeps fp32 accumulation.** Letting the expand's backward run
+in bf16 would accumulate the duplicates of each unique row in bf16 instead of
+fp32 -- a numerics change. :class:`_CastExpandFp32Bwd` therefore owns both
+halves: the forward casts and gathers in bf16, and the backward **upcasts the
+incoming bf16 gradient to fp32 and runs ``scatter_add_`` in fp32**. The
+accumulator dtype, the accumulator shape and the set of atomic adds are those
+of the unpatched path. That upcast is relocated, not added: the unpatched path
+upcasts the same expanded rows as the ``ToCopyBackward0`` partners of the two
+forward casts this removes.
+
+**Only large key-segments are hoisted.** ``construct_jagged_tensors`` splits the
+expanded tensor by ``length_per_key``, and not every key's consumer is in bf16:
+``DlrmHSTU._item_forward`` runs ``_item_embedding_mlp`` on the candidate-side
+features **outside any autocast**, so handing it bf16 would raise on the fp32
+weight. Segments below ``min_rows`` are therefore re-expanded from the original
+fp32 tensor and substituted back, which is bitwise identical to the unpatched
+path for those keys.
 """
 
 import logging
+import os
 from typing import Dict, List, Optional, Tuple
 
 import gin
@@ -34,14 +59,20 @@ _BWD_CHUNK_ROWS: int = 0
 # A key-segment smaller than this keeps its original dtype (see the docstring).
 _MIN_ROWS: int = 100_000
 
-# Replace the backward's scatter_add_ with the kernel in ec_segment_reduce.
-# Set by enable_segment_reduce(), which make_model calls from the gin param.
+# Replace the backward's ``scatter_add_`` with the sort-then-segment-reduce
+# kernel in ``ec_segment_reduce``.  Default OFF.
+#
+# Set by ``enable_segment_reduce()``, which ``make_model`` calls when the gin
+# param ``make_model.ec_segment_reduce`` is true -- NOT by an import-time read
+# of ``os.environ``, so the setting is recorded in gin's operative config.
 _SEGMENT_REDUCE: bool = False
-# Dump the reverse_indices segment-length distribution. Default off.
+# Diagnostic dump of the real reverse_indices segment-length distribution; both
+# the sort cost and the load balance depend on it.
 _SEG_HIST: bool = False
 _SEG_ARMED_LOGGED: bool = False
-# Log the histogram on a new maximum token count, so the last line is the
-# largest call rather than whichever call happens first.
+# The histogram is a RUNNING MAX on T, not a one-shot: the first call (step 0
+# of window 0) is the smallest in the run, so it logs only on a new maximum and
+# the LAST line printed describes the dominant call.
 _SEG_HIST_MAX_T: int = 0
 
 
@@ -50,7 +81,7 @@ _SEG_HIST_MAX_T: int = 0
 #
 # DlrmHSTU.main_forward merges each (uih, candidate) embedding pair with
 # concat_2D_jagged: a full [T_uih + B, 512] bf16 copy per pair in the forward
-# (3 pairs, ~2.4M rows each at the yambda-5b shape) plus a split_2D_jagged
+# plus a split_2D_jagged
 # (and a zeros() of the left gradient) per pair in the backward. The rows it
 # copies were themselves written one op earlier by this module's gather. A
 # concat of gathered rows is a gather with a permuted index, so the merge can
@@ -66,8 +97,7 @@ _SEG_HIST_MAX_T: int = 0
 #
 # Numerics: forward bitwise identical (the concat is a pure copy and cast;
 # the candidate rows are rounded fp32->bf16 by the gather's up-front cast
-# rather than by the concat's store -- both RNE; a bit-level check confirms
-# raw bits). Backward: the same fp32 addends in fp32 accumulators, summed in
+# rather than by the concat's store -- both RNE). Backward: the same fp32 addends in fp32 accumulators, summed in
 # a different order (per key instead of one pass; candidate-row merged
 # gradients join the segment reduce instead of the fp32 gather backward).
 # A REDUCTION-ORDER change only, on a backward that is already
@@ -78,7 +108,7 @@ _MERGE_LOGGED: bool = False
 # Marker set on a merged expand output. DlrmHSTU.main_forward skips its
 # concat_2D_jagged ONLY for a tensor carrying it, so any call that fell back
 # (pair not in this call, uih key below min_rows, CW-sharded key, VBE, ...)
-# is merged by main_forward exactly as before.
+# is merged by main_forward.
 PREMERGED_ATTR: str = "_dlrmv4_uih_cand_premerged"
 
 
@@ -93,12 +123,24 @@ def enable_ec_merge_uih_candidate(pairs: List[Tuple[str, str]]) -> None:
     )
 
 
-# DLRM_HSTU_FP8_EC_CAT_FUSE (default on; =0 disables): when every key of the
-# registered group is merged in one call with equal row counts, one expand
-# writes the concatenated layout. Its [k*N, W] output viewed as [N, k*W] is
-# the cat. Each key is a column view, tagged with CATFUSED_ATTR so the
-# preprocessor uses that base instead of torch.cat. The backward is one
-# segment reduce over the contiguous gradient.
+# DLRM_HSTU_FP8_EC_CAT_FUSE (default on; =0 disables): the ContextualPreprocessor concatenates the
+# merged artist_id/album_id expands along dim=1 ([N,512]+[N,512] -> [N,1024])
+# and the cat's backward hands each expand a column-slice gradient that the
+# segment reduce then copies contiguous. When every key of the registered group is merged in one call
+# with equal row counts, ONE expand is issued with the per-key indices
+# interleaved row-wise ([idx_a[0], idx_b[0], idx_a[1], ...]); its [k*N, W]
+# output viewed as [N, k*W] IS the cat, byte for byte. Each key's values are
+# column views of it, tagged with CATFUSED_ATTR so the preprocessor can use
+# the base instead of torch.cat. The backward is one segment reduce over the
+# contiguous [k*N, W] gradient (same per-row addends; the keys index disjoint
+# unique rows, and the stable argsort keeps each segment in ascending token
+# order, so the sums are the per-key path's up to the hot-piece atomics).
+# With the grouped EC backward armed
+# (DLRM_HSTU_FP8_EC_GROUP_BWD; off when absent, turned on by the
+# apply_env_bootstrap binding in yambda_5b.gin) the interleaved index is ONE hoisted
+# member of _ECExpandGroup, so its [k*N, W] gradient is segment-reduced in
+# ACCUM mode into the shared fp32 accumulator; with it off it is one
+# _CastExpandFp32Bwd.
 _CAT_GROUP: List[str] = []
 CATFUSED_ATTR: str = "_dlrmv4_catfused"
 _CAT_LOGGED: bool = False
@@ -127,7 +169,27 @@ def _merged_index(
     uih token at flat index i of sample b lands at i + off_c[b];
     candidate token at flat index k of sample b lands at k + off_u[b + 1].
     No host sync: the totals are the host-side length_per_key entries.
+
+    DLRM_HSTU_FP8_EC_MERGED_INDEX_FUSE (default OFF in code; the gin binding
+    turns it on, =0 restores the aten chain below): one Triton kernel
+    (ops/glue_fusion.py) writes the same integers -- a jagged interleave of
+    two index arrays, pure copies. Fail-closed: a raising launch disables it
+    and the chain below runs.
     """
+    from generative_recommenders.ops import glue_fusion as _gf
+
+    if _gf.merged_index_fusable(ri_u, ri_c, len_u, len_c):
+        try:
+            out = _gf.merged_index(ri_u, ri_c, len_u, len_c, n_u, n_c)
+        except Exception as exc:  # fail closed to the aten chain
+            _gf.disable("ec_merged_index", exc)
+        else:
+            _gf.note_armed(
+                "ec_merged_index",
+                "EC merged reverse index in one Triton kernel per merged pair "
+                "(kill switch DLRM_HSTU_FP8_EC_MERGED_INDEX_FUSE=0)",
+            )
+            return out
     dev = ri_u.device
     len_u = len_u.to(torch.int64)
     len_c = len_c.to(torch.int64)
@@ -166,7 +228,7 @@ def _merged_construct(
     pos = {name: i for i, name in enumerate(embedding_names)}
     kept_set = set(kept)
     # A pair merges only when BOTH keys are in this call and the uih key is
-    # hoisted: then today's concat output is bf16 (concat takes values_left's
+    # hoisted: then the concat output is bf16 (concat takes values_left's
     # dtype), which is exactly what the bf16 gather produces.
     merge = {
         u: c
@@ -183,37 +245,116 @@ def _merged_construct(
     def seg(i: int) -> torch.Tensor:
         return reverse_indices[offs[i]:offs[i] + length_per_key[i]]
 
-    fused_vals: Dict[str, torch.Tensor] = {}
+    # EC cat-fuse plan (see _CAT_GROUP). Falls back to the per-key layout (and
+    # the preprocessor to torch.cat) unless every group key merges in this
+    # call with equal merged row counts.
     grp = _CAT_GROUP
+    cat_comb: Optional[torch.Tensor] = None
+    cat_n = 0
     if len(grp) > 1 and all(g in merge for g in grp):
         sizes = [
             length_per_key[pos[g]] + length_per_key[pos[merge[g]]] for g in grp
         ]
         if len(set(sizes)) == 1:
-            idxs = [
-                _merged_index(
+            cat_n = sizes[0]
+            from generative_recommenders.ops import glue_fusion as _gf
+
+            _parts = [
+                (
                     seg(pos[g]), seg(pos[merge[g]]),
                     lengths_tuple[pos[g]], lengths_tuple[pos[merge[g]]],
-                    length_per_key[pos[g]], length_per_key[pos[merge[g]]],
                 )
                 for g in grp
             ]
-            comb = torch.stack(idxs, dim=1).reshape(-1)
-            k = len(grp)
-            big = _CastExpandFp32Bwd.apply(embeddings, comb, out_dtype).view(
-                sizes[0], k * w
+            if all(_gf.merged_index_fusable(*p) for p in _parts):
+                # DLRM_HSTU_FP8_EC_MERGED_INDEX_FUSE: same int64 values,
+                # written straight into the stacked (row-interleaved)
+                # layout: no per-key buffers, no stack.
+                try:
+                    cat_comb = _gf.merged_index_stacked(_parts, cat_n)
+                except Exception as exc:  # fail closed to the stack below
+                    _gf.disable("ec_merged_index", exc)
+                    cat_comb = None
+                else:
+                    _gf.note_armed(
+                        "ec_merged_index",
+                        "EC merged reverse index in one Triton kernel per "
+                        "merged pair (kill switch "
+                        "DLRM_HSTU_FP8_EC_MERGED_INDEX_FUSE=0)",
+                    )
+        if len(set(sizes)) == 1 and cat_comb is None:
+            cat_comb = torch.stack(
+                [
+                    _merged_index(
+                        seg(pos[g]), seg(pos[merge[g]]),
+                        lengths_tuple[pos[g]], lengths_tuple[pos[merge[g]]],
+                        length_per_key[pos[g]], length_per_key[pos[merge[g]]],
+                    )
+                    for g in grp
+                ],
+                dim=1,
+            ).reshape(-1)
+    fused_vals: Dict[str, torch.Tensor] = {}
+
+    def cat_views(flat: torch.Tensor, grouped: bool) -> None:
+        # [k*N, W] interleaved expand output -> [N, k*W] (the cat) -> per-key
+        # column views tagged for ContextualPreprocessor.
+        global _CAT_LOGGED
+        k = len(grp)
+        big = flat.view(cat_n, k * w)
+        for q, g in enumerate(grp):
+            v = big[:, q * w:(q + 1) * w]
+            setattr(v, CATFUSED_ATTR, (big, q, k))
+            fused_vals[g] = v
+        if not _CAT_LOGGED:
+            _CAT_LOGGED = True
+            logger.info(
+                "DLRMV4 armed OK: ec_cat_fuse ACTIVE -- one interleaved "
+                "expand for %s -> [%d, %d]%s", grp, cat_n, k * w,
+                " (one member of the grouped EC backward)" if grouped else "",
             )
-            for q, g in enumerate(grp):
-                v = big[:, q * w:(q + 1) * w]
-                setattr(v, CATFUSED_ATTR, (big, q, k))
-                fused_vals[g] = v
-            global _CAT_LOGGED
-            if not _CAT_LOGGED:
-                _CAT_LOGGED = True
-                logger.info(
-                    "DLRMV4 armed OK: ec_cat_fuse ACTIVE -- one interleaved "
-                    "expand for %s -> [%d, %d]", grp, sizes[0], k * w,
-                )
+
+    values_by: Dict[str, torch.Tensor] = {}
+    if _ec_group_enabled():
+        names, idxs, casts, premerged = [], [], [], []
+        cat_slot = -1
+        for i, name in enumerate(embedding_names):
+            if cat_comb is not None and name in grp:
+                # The whole group is ONE hoisted member (the interleaved
+                # index), placed at the first group key's position.
+                if cat_slot < 0:
+                    cat_slot = len(idxs)
+                    idxs.append(cat_comb)
+                    casts.append(True)
+                continue
+            if name in merge:
+                j = pos[merge[name]]
+                idxs.append(_merged_index(
+                    seg(i), seg(j), lengths_tuple[i], lengths_tuple[j],
+                    length_per_key[i], length_per_key[j],
+                ))
+                casts.append(True)
+                premerged.append(True)
+            else:
+                idxs.append(seg(i))
+                # kept keys keep the EC's own dtype, exactly as below.
+                casts.append(name not in kept_set)
+                premerged.append(False)
+            names.append(name)
+        outs = list(
+            _ECExpandGroup.apply(embeddings, out_dtype, tuple(casts), *idxs)
+        )
+        if cat_slot >= 0:
+            cat_views(outs.pop(cat_slot), grouped=True)
+        for name, values, pm in zip(names, outs, premerged):
+            if pm:
+                setattr(values, PREMERGED_ATTR, True)
+            values_by[name] = values
+    elif cat_comb is not None:
+        cat_views(
+            _CastExpandFp32Bwd.apply(embeddings, cat_comb, out_dtype),
+            grouped=False,
+        )
 
     ret: Dict[str, "JaggedTensor"] = {}
     for i, name in enumerate(embedding_names):
@@ -225,13 +366,19 @@ def _merged_construct(
             jt_lengths = lengths_tuple[i] + lengths_tuple[j]
         elif name in merge:
             j = pos[merge[name]]
-            idx = _merged_index(
-                seg(i), seg(j), lengths_tuple[i], lengths_tuple[j],
-                n, length_per_key[j],
-            )
-            values = _CastExpandFp32Bwd.apply(embeddings, idx, out_dtype)
-            setattr(values, PREMERGED_ATTR, True)
+            if name in values_by:
+                values = values_by[name]
+            else:
+                idx = _merged_index(
+                    seg(i), seg(j), lengths_tuple[i], lengths_tuple[j],
+                    n, length_per_key[j],
+                )
+                values = _CastExpandFp32Bwd.apply(embeddings, idx, out_dtype)
+                setattr(values, PREMERGED_ATTR, True)
             jt_lengths = lengths_tuple[i] + lengths_tuple[j]
+        elif name in values_by:
+            values = values_by[name]
+            jt_lengths = lengths_tuple[i]
         elif name in kept_set:
             # Unchanged: small segments stay in the EC's own dtype.
             values = torch.gather(embeddings, 0, seg(i).unsqueeze(1).expand(-1, w))
@@ -265,14 +412,12 @@ def configure_ec_bf16_output(
 ) -> None:
     """Tuning for the bf16 hoist itself. Called by `enable_bf16_ec_output()`.
 
-    Both were `os.environ` reads at import once; they are gin now so
-    a run's operative config records what it was tuned with.
+    Gin parameters, so a run's operative config records what it was tuned with.
 
     Args:
       bwd_chunk_rows: rows per backward chunk.  The backward needs an fp32 copy
         of the incoming gradient, and chunking bounds that temporary at the cost
-        of several passes.  0 disables chunking, which is the shipped setting --
-        the fp32 copy fits.  MUTUALLY EXCLUSIVE with `ec_segment_reduce`, which
+        of several passes.  0 disables chunking.  MUTUALLY EXCLUSIVE with `ec_segment_reduce`, which
         reads the gradient in place and never materialises the copy chunking
         exists to bound; arming both raises rather than silently picking one.
       min_rows: a key-segment shorter than this keeps its original dtype.  The
@@ -297,24 +442,40 @@ def enable_segment_reduce(
 ) -> None:
     """Arm the sort-then-segment-reduce backward for the hoisted EC expand.
 
-    It sorts token rows so each output row is a contiguous segment, then folds
-    that segment with `tl.sum`. Cold segments store once. Hot pieces still use
-    an atomic add.
+    Replaces `scatter_add_` -- which serialises the token rows into the unique
+    rows through global atomics -- with a sort that
+    makes each output row a contiguous segment one program folds with `tl.sum`,
+    so there is no atomic on the cold path.
 
-    Turn it on with `make_model.ec_segment_reduce = True`. `make_model` checks
-    that `ec_bf16_output` is on; this function does not.
+    Arm it with `make_model.ec_segment_reduce = True` (the gin binds
+    `$EC_SEGMENT_REDUCE`), never by calling this directly: `make_model` is where
+    the `ec_bf16_output` precondition is enforced, and this function does not
+    re-check it.
 
-    Reduction order differs from `scatter_add_`. Both are nondeterministic.
+    NOT bit-identical to `scatter_add_`, and cannot be: atomics accumulate in
+    nondeterministic order, so there are no bits to match.
 
     Args:
-      seg_hist: dump the `reverse_indices` segment-length distribution.
-        Default off.
-      gpu_planner: keep hot-piece planning on the GPU. Default off.
+      seg_hist: dump the real `reverse_indices` segment-length distribution.
+        Diagnostic, default off.  Both the sort cost and the load balance
+        depend on that shape.  Costs a `bincount` plus a
+        `quantile` on each new maximum-size call, so leave it off for timing.
+
+      gpu_planner: keep hot-piece planning on the GPU. Preserves the host
+        planner's piece boundaries and fp32 reduction arithmetic; hot-piece
+        atomic accumulation remains nondeterministic. Default off.
       fixed_size_offsets: construct offsets on the GPU using the unchanged
-        argsort order. Requires valid IDs in [0, num_rows). Default off.
-      split_above, block_s, num_warps, block_w_cap: launch geometry, forwarded
-        to `ec_segment_reduce`. They are bound here because that module imports
-        triton and is loaded lazily, after gin parses.
+        argsort order. Requires the EC caller's valid IDs in [0, num_rows).
+        Independent of gpu_planner; default off.
+
+      split_above, block_s, num_warps, block_w_cap: the kernel's launch
+        geometry, forwarded verbatim to `ec_segment_reduce`.  They live on THIS
+        function rather than on that module's own `configure_segment_reduce`
+        because `ec_segment_reduce` imports triton and so is imported lazily,
+        which puts it past the point where gin parses -- a knob bound there
+        would raise "No configurable matching".  Per-argument notes are in that
+        function's docstring.  8 warps spill the register tile to scratch on
+        gfx950.
     """
     if type(gpu_planner) is not bool or type(fixed_size_offsets) is not bool:
         raise ValueError("gpu_planner and fixed_size_offsets must be booleans")
@@ -367,7 +528,8 @@ def _segment_reduce_backward(
 ) -> tuple:
     """``scatter_add_`` replaced by sort-then-segment-reduce.
 
-    Does not fall back. A request that cannot run raises.
+    Deliberately does NOT fall back, so a broken arming fails loudly instead
+    of silently running the stock path.
     """
     global _SEG_ARMED_LOGGED, _SEG_HIST_MAX_T
     if _BWD_CHUNK_ROWS > 0:
@@ -404,6 +566,43 @@ def _segment_reduce_backward(
     return grad_emb.to(ctx.in_dtype), None, None
 
 
+# EC expand gather v2 (DLRM_HSTU_FP8_EC_GATHER_V2: default OFF in code, the gin
+# binding apply_env_bootstrap.DLRM_HSTU_FP8_EC_GATHER_V2 turns it on, "0" is
+# the kill switch; read once at import): index tensors of at least ec_expand_gather.min_rows()
+# rows go through the multi-row Triton row copy in ec_expand_gather (same
+# bytes as torch.gather; one launch instead of several int32-split
+# vectorized_gather_kernel launches); everything
+# else stays on torch.gather. Imported lazily on first use.
+_EC_GATHER_V2: bool = os.environ.get(
+    "DLRM_HSTU_FP8_EC_GATHER_V2", ""
+).strip().lower() in ("1", "true", "on", "yes")
+
+
+def _expand(src: torch.Tensor, idx: torch.Tensor, w: int) -> torch.Tensor:
+    """``torch.gather(src, 0, idx[:, None].expand(-1, w))`` -- a pure row copy.
+
+    Fail-closed: if the Triton gather raises (compile/launch), it is disabled
+    for the rest of the process with one warning and torch.gather (the same
+    bytes) takes over.
+    """
+    global _EC_GATHER_V2
+    if _EC_GATHER_V2:
+        from generative_recommenders.dlrm_v4.train import ec_expand_gather as _eg
+
+        if idx.numel() >= _eg.min_rows() and _eg.supported(src, idx):
+            try:
+                return _eg.expand_rows(src, idx)
+            except Exception as exc:  # fail closed to torch.gather
+                _EC_GATHER_V2 = False
+                logger.warning(
+                    "DLRMV4 ec gather v2 DISABLED for this process (%s: %s); "
+                    "torch.gather expands every EC key from here on",
+                    type(exc).__name__,
+                    str(exc)[:300],
+                )
+    return torch.gather(src, 0, idx.unsqueeze(1).expand(-1, w))
+
+
 class _CastExpandFp32Bwd(torch.autograd.Function):
     """bf16 expand forward; fp32 ``scatter_add_`` backward.
 
@@ -424,9 +623,8 @@ class _CastExpandFp32Bwd(torch.autograd.Function):
         ctx.in_dtype = embeddings.dtype
         ctx.num_rows = embeddings.size(0)
         ctx.width = embeddings.size(-1)
-        expanded = reverse_indices.unsqueeze(1).expand(-1, embeddings.size(-1))
-        # Cast FIRST -- 69k rows instead of 7.1M -- then expand.
-        return torch.gather(embeddings.to(out_dtype), 0, expanded)
+        # Cast FIRST (the unique rows), then expand.
+        return _expand(embeddings.to(out_dtype), reverse_indices, embeddings.size(-1))
 
     @staticmethod
     # pyre-ignore[14]
@@ -447,6 +645,207 @@ class _CastExpandFp32Bwd(torch.autograd.Function):
             # accumulator, stay fp32.
             grad_emb.scatter_add_(0, idx, grad_out[lo:hi].to(ctx.in_dtype))
         return grad_emb, None, None
+
+
+_EC_GROUP_ENV = "DLRM_HSTU_FP8_EC_GROUP_BWD"
+_EC_GROUP_LOGGED = False
+
+
+def _ec_group_enabled() -> bool:
+    """Grouped EC expand backward (one fp32 accumulator for every key of a call).
+
+    Off when ``DLRM_HSTU_FP8_EC_GROUP_BWD`` is absent (repo convention: the
+    gin binding ``apply_env_bootstrap.DLRM_HSTU_FP8_EC_GROUP_BWD`` turns it on);
+    ``=0`` restores one autograd node per key (the DLRM_HSTU_FP8_ prefix is
+    forwarded into the container by the launcher). Read per call. Only
+    engages with the segment-reduce backward armed and no backward chunking.
+    """
+    v = os.environ.get(_EC_GROUP_ENV, "0").strip().lower()
+    return (
+        v in ("1", "true", "on", "yes")
+        and _SEGMENT_REDUCE
+        and _BWD_CHUNK_ROWS == 0
+    )
+
+
+def _ec_joint_segments(hoisted, U: int):
+    """DLRM_HSTU_FP8_EC_JOINT_SORT (default OFF in code; the gin binding turns
+    it on): both hoisted members' (order, offsets) from ONE stable
+    argsort (ec_offsets.build_segments_joint_valid_ids), or None -> each member
+    sorts on its own. Only on the fixed-size-offsets path
+    (build_segments == build_segments_valid_ids), two hoisted members. The
+    reducer is not involved (segment_reduce_rows takes the supplied order and
+    offsets on the LPT and the two-launch path alike). Fail-closed: a raising
+    call disables it."""
+    if len(hoisted) != 2:
+        return None
+    try:
+        from generative_recommenders.dlrm_v4.train import ec_offsets as eof
+        from generative_recommenders.dlrm_v4.train import ec_segment_reduce as sr
+
+        if not eof._JOINT_SORT or not sr._FIXED_SIZE_OFFSETS:
+            return None
+        ids = [idx.reshape(-1) for idx, _ in hoisted]
+        if not eof.joint_sort_engages(ids, U):
+            return None
+        return eof.build_segments_joint_valid_ids(ids, U)
+    except Exception as exc:  # fail closed: per-member sorts from now on
+        try:
+            from generative_recommenders.dlrm_v4.train import ec_offsets as eof
+
+            eof._JOINT_SORT = False
+        except Exception:
+            pass
+        logger.warning(
+            "DLRMV4 ec joint sort FAILED CLOSED -> per-member argsort for the "
+            "rest of the run (%s: %s)", type(exc).__name__, str(exc)[:300],
+        )
+        return None
+
+
+def _ec_reduce_fused(hoisted, segs, U: int):
+    """DLRM_HSTU_FP8_EC_REDUCE_FUSED (default OFF in code; the gin binding
+    apply_env_bootstrap.DLRM_HSTU_FP8_EC_REDUCE_FUSED turns it on, "0" is the
+    kill switch): the hoisted members' segment reduces as ONE grouped launch
+    (ec_gpu_plan.segment_reduce_grouped: one plan chain, one main launch, no
+    [U, W] zero fill and no member-1 read-modify-write pass), with the values
+    of the per-member EC_REDUCE_LPT calls. Returns (acc or None, segs): None ->
+    the caller runs the per-member calls on the returned segments (built here
+    when the joint sort did not supply them). Engages with 1-2 hoisted
+    members, the GPU planner on and EC_REDUCE_LPT taking the call (the fused
+    path reproduces LPT; the production key is validated offline, any other
+    width / dtype / stride class by a one-time raw-bit self-test). Fail-closed:
+    a raising call disables it for the process with one warning."""
+    if not hoisted or len(hoisted) > 2:
+        return None, segs
+    try:
+        from generative_recommenders.dlrm_v4.train import ec_gpu_plan as gpl
+        from generative_recommenders.dlrm_v4.train import ec_segment_reduce as sr
+
+        if not gpl.fused_enabled() or not sr._GPU_PLANNER:
+            return None, segs
+        if segs is None:
+            segs = [sr.build_segments(idx, U) for idx, _ in hoisted]
+        members = [(g, segs[i][0], segs[i][1]) for i, (_, g) in enumerate(hoisted)]
+        return gpl.segment_reduce_grouped(members, U), segs
+    except Exception as exc:  # fail closed: per-member reduces from now on
+        try:
+            from generative_recommenders.dlrm_v4.train import ec_gpu_plan as gpl
+
+            gpl._FUSED_ENABLED = False
+        except Exception:
+            pass
+        logger.warning(
+            "DLRMV4 ec reduce fused FAILED CLOSED -> per-member segment reduce "
+            "for the rest of the run (%s: %s)", type(exc).__name__, str(exc)[:300],
+        )
+        return None, segs
+
+
+class _ECExpandGroup(torch.autograd.Function):
+    """All per-key expands of ONE EC call as one autograd node.
+
+    forward:  out_k = gather(embeddings.to(out_dtype) if cast_k else embeddings,
+                             0, idx_k)          -- bitwise the per-key forward,
+              with the [U, W] cast done once instead of once per hoisted key.
+    backward: ONE fp32 [U, W] accumulator.  Hoisted keys are segment-reduced
+              into it (the first allocates, later ones use the kernel's ACCUM
+              mode: out[row] += segment sum); kept keys ``scatter_add_`` into
+              it, instead of one zeroed [U, W] grad per kept key summed by
+              autograd.
+    Numerics: same fp32 accumulator dtype; only the fp32 addition ORDER of the
+    per-key contributions changes (hot pieces were already atomic, i.e. the EC
+    grad was already not bit-reproducible).
+    """
+
+    @staticmethod
+    # pyre-ignore[14]
+    def forward(  # type: ignore[override]
+        ctx,
+        embeddings: torch.Tensor,
+        out_dtype: torch.dtype,
+        casts: Tuple[bool, ...],
+        *idxs: torch.Tensor,
+    ):
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(*idxs)
+        ctx.casts = casts
+        ctx.in_dtype = embeddings.dtype
+        ctx.num_rows = embeddings.size(0)
+        ctx.width = embeddings.size(-1)
+        w = embeddings.size(-1)
+        emb_c = embeddings.to(out_dtype) if any(casts) else None
+        outs = []
+        for c, idx in zip(casts, idxs):
+            src = emb_c if c else embeddings
+            outs.append(_expand(src, idx, w))
+        return tuple(outs)
+
+    @staticmethod
+    # pyre-ignore[14]
+    def backward(ctx, *grads):  # type: ignore[override]
+        global _EC_GROUP_LOGGED
+        from generative_recommenders.dlrm_v4.train.ec_segment_reduce import (
+            segment_reduce_rows,
+        )
+
+        idxs = ctx.saved_tensors
+        U, w = ctx.num_rows, ctx.width
+        acc: Optional[torch.Tensor] = None
+        n_seg = n_sc = 0
+        # Hoisted (large) keys first: the first segment reduce allocates the
+        # accumulator, later ones accumulate in-kernel.
+        global _SEG_ARMED_LOGGED, _SEG_HIST_MAX_T
+        hoisted = [
+            (idx, g) for c, idx, g in zip(ctx.casts, idxs, grads)
+            if g is not None and c
+        ]
+        # DLRM_HSTU_FP8_EC_JOINT_SORT: both members' segments from
+        # one stable argsort (None -> each member sorts on its own, below).
+        segs = _ec_joint_segments(hoisted, U)
+        for i, (idx, g) in enumerate(hoisted):
+            # Keep the documented segment-reduce arming line and the seg_hist
+            # diagnostic working on the grouped path.
+            if _SEG_HIST and idx.numel() > _SEG_HIST_MAX_T:
+                _SEG_HIST_MAX_T = idx.numel()
+                _log_seg_histogram(idx, U)
+            if not _SEG_ARMED_LOGGED:
+                _SEG_ARMED_LOGGED = True
+                logger.info(
+                    "DLRMV4 armed OK: ec_segment_reduce backward active "
+                    "(T=%d -> U=%d rows, W=%d, grad dtype=%s, accum fp32 -> %s)",
+                    idx.numel(), U, w, g.dtype, ctx.in_dtype,
+                )
+        # DLRM_HSTU_FP8_EC_REDUCE_FUSED: all hoisted members in one grouped
+        # launch (None -> the per-member calls below, on the same segments).
+        acc, segs = _ec_reduce_fused(hoisted, segs, U)
+        if acc is not None:
+            n_seg = len(hoisted)
+        else:
+            for i, (idx, g) in enumerate(hoisted):
+                order, offsets = segs[i] if segs is not None else (None, None)
+                acc = segment_reduce_rows(
+                    g, idx, U, order=order, offsets=offsets, accumulate_into=acc
+                )
+                n_seg += 1
+        for c, idx, g in zip(ctx.casts, idxs, grads):
+            if g is None or c:
+                continue
+            if acc is None:
+                acc = torch.zeros((U, w), dtype=torch.float32, device=g.device)
+            acc.scatter_add_(
+                0, idx.unsqueeze(1).expand(-1, w), g.to(torch.float32)
+            )
+            n_sc += 1
+        if not _EC_GROUP_LOGGED:
+            _EC_GROUP_LOGGED = True
+            logger.warning(
+                "DLRMV4 armed OK: ec_group_bwd ACTIVE -- one fp32 [%d, %d] "
+                "accumulator for %d segment-reduced + %d scatter keys "
+                "(kill switch %s=0)", U, w, n_seg, n_sc, _EC_GROUP_ENV,
+            )
+        grad_emb = None if acc is None else acc.to(ctx.in_dtype)
+        return (grad_emb, None, None) + (None,) * len(idxs)
 
 
 def _log_once(
@@ -502,7 +901,10 @@ def enable_bf16_ec_output(out_dtype: torch.dtype = torch.bfloat16) -> bool:
         seq_vbe_ctx=None,
         use_gather_select: bool = False,
     ):
-        # Dedup on, gather-select on, no VBE reindex, and an fp32 input.
+        # Engage only on the supported path: dedup on (there is an
+        # expand to hoist above), gather-select on (so the backward being
+        # preserved really is scatter_add_), no VBE reindex (fbgemm's permute
+        # runs after the expand and is out of scope), and an fp32 input.
         if (
             reverse_indices is None
             or not use_gather_select
@@ -560,8 +962,7 @@ def enable_bf16_ec_output(out_dtype: torch.dtype = torch.bfloat16) -> bool:
             return ret
 
         # Re-expand the small segments from the ORIGINAL fp32 tensor so their
-        # consumers see exactly the bits they see today. These are 1024-row
-        # segments; the cost is noise. Only the 1:1 (non-CW) case is handled --
+        # consumers see the unpatched bits. Only the 1:1 (non-CW) case is handled --
         # a key appearing at several indices is concatenated inside the
         # original and is left on the bf16 path.
         seen: Dict[str, List[int]] = {}

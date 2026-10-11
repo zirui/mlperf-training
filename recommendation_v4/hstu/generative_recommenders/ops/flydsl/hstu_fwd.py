@@ -1,4 +1,3 @@
-# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """HSTU jagged-attention FORWARD written in FlyDSL for gfx950.
 
 Two gemms with a pointwise between them, per (batch, head, m-block):
@@ -20,9 +19,10 @@ Decomposition:
   * Q for the owned rows is loaded once into registers (loop-invariant) and is
     the A-operand of the score gemm.  K and V are streamed over n and staged in
     LDS; K is the score gemm's B-operand, V is the out gemm's B-operand.
-    * BOTH K AND V ARE B-OPERANDS, so they are broadcast across m: each fragment
-    is read from LDS once and issued against all MT m-tiles. WAVES=2 keeps
-    MT=2, so one read covers two m-tiles.
+  * BOTH K AND V ARE B-OPERANDS, so they are broadcast across m: each fragment
+    is read from LDS once and issued against all MT m-tiles.  WAVES=2/MT=2
+    therefore halves the workgroup's K/V LDS reads relative to WAVES=4/MT=1
+    without touching BM.
   * The score accumulator is TRANSPOSED -- mfma2(kf, qf) rather than
     mfma2(qf, kf) -- so the fragment it produces already carries n on the
     element axis, which is the layout the out gemm's A-operand needs.  V is read
@@ -38,6 +38,7 @@ mfma2 helper, _shifted_rsrc buffer descriptors and silu chain.
 """
 
 import functools
+import struct
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -55,7 +56,7 @@ from generative_recommenders.ops.flydsl import current_stream_launch
 
 LOG2E = 1.4426950408889634
 
-# Shipping configuration in one place so bench and gate cannot drift.
+# Default configuration in one place so every caller agrees.
 #
 # BN=32 (not 64): halves the K/V/p LDS tiles.
 #
@@ -157,55 +158,191 @@ def compile_hstu_fwd(
     kpad: int = -1,
     lds_dummy: int = 0,
     waves: int = 2,
-    # fp8 MFMA on the qk gemm. q and k are already e4m3. k128 uses
-    # mfma_scale_f32_16x16x128_f8f6f4: the k_lds row is 64 B and the score
-    # gemm issues two ds_read_b128 and one mfma per n-tile. Accumulation stays
-    # f32; only the add order changes.
+    # ---- true fp8 MFMA on the qk gemm -----------------------------------
+    # Same argument as the backward's fp8_mfma (hstu_bwd_dkdv.py): in the FP8
+    # arm q and k are ALREADY e4m3 in memory, and e4m3 -> bf16 is lossless (3
+    # mantissa bits into 7), so the bf16 path widens both operands and runs a
+    # bf16 MFMA over values that are exactly fp8.  Substituting a native fp8
+    # MFMA changes only the f32 accumulation order -- it is numerically free.
+    # What it buys is NOT math rate:
+    #   * k_lds halves, 128 B/row -> 64 B/row of payload;
+    #   * "k128" (mfma_scale_f32_16x16x128_f8f6f4) collapses the score gemm's
+    #     FOUR ds_read_b128 per (n-tile) into TWO, and its four mfma into one.
+    # The K LDS read is this kernel's dominant LDS cost.
     fp8_mfma: str = "",
-    # Feed V as e4m3. Independent of fp8_mfma. The out gemm can stay bf16;
-    # tr16 staging widens e4m3 to bf16 on the way in. The v_lds tile is half
-    # as wide.
+    # Feed V as e4m3 too.  Independent of fp8_mfma: it halves the v_lds tile
+    # and the V global traffic even while the out gemm stays bf16, because the
+    # tr16 staging then widens e4m3 -> bf16 on the way in.
     fp8_v: bool = False,
-    # fp8 MFMA on the out gemm (p @ v). Needs fp8_v. p is computed in f32 and
-    # would be rounded to e4m3. Not implemented.
+    # fp8 MFMA on the out gemm (p @ v).  Needs fp8_v, and unlike qk it is NOT
+    # free: p is computed in f32 and has to be ROUNDED to e4m3.  p's
+    # underflow is benign, so the cost is mantissa, not flush.
+    # "" (default) keeps the bf16 P@V.  "k128" is an FP8 P@V
+    # with a K = 128 retile: a DECLARED PRECISION CHANGE (P f32 -> e4m3),
+    # default off, built on the FWD_PIPE config only (see the
+    # pv=k128 knobs below and the pv=k128 section of emit_body).
     pv: str = "",
-    # Bank-conflict padding, in bytes, of the fp8 k_lds row.
+    # Bank-conflict padding, in BYTES, of the fp8 k_lds row.  Same role KPAD
+    # plays for the bf16 tile; the bf16 value does not carry over because the
+    # row is half as wide.
     k8_pad: int = 16,
-    # Bank-conflict padding, in BYTES, of the fp8 v_lds tr8 block stride.
+    # Bank-conflict padding, in BYTES, of the e4m3 V ring row that pv="k128"
+    # reads with ds_read_b64_tr_b8 (unused when pv is off).
     v8_pad: int = 16,
-    # `epi_fold`: fold the constant silu scales into out_scale.
-    # u = -log2(e) * score_scale * raw, so exp2's argument is u. The remaining
-    # constant factor leaves with out_scale.
+    # ---- silu-epilogue VALU reductions -----------------------------------
+    # Both knobs below delete non-MFMA VALU lane-ops of the silu epilogue,
+    # and neither changes what the MFMAs compute.
+    #
+    # `epi_fold`: the two constant MULs.  Reparametrise the silu on
+    #   u = -log2(e) * score_scale * raw   (ONE mul, was two: score_scale then
+    #   -LOG2E), so exp2's argument IS u; then silu = u*sig carries a constant
+    #   factor -1/log2(e) which, together with inv_max, rides out on the
+    #   epilogue's existing out_scale -- 128 f32 muls per output row instead of
+    #   one per score element.  4 MUL/element -> 2.
     epi_fold: bool = False,
-    # `mask_split`: skip the causal compare on n-tiles that lie entirely
-    # below the diagonal. m0 is a multiple of BN, so that is the first
-    # m0/BN iterations.
+    # `mask_split`: the causal compare.  For an m-block at m0, every n-tile
+    #   with n0+BN <= m0 is strictly below the diagonal, so m >= n holds for
+    #   all of it and the mask is dead.  m0 is a multiple of BN (BM % BN == 0),
+    #   so that is exactly the first m0/BN iterations.  Splitting the n loop
+    #   there drops the n_idx add, the v_cmp and the v_cndmask on every
+    #   n-iteration that is fully below the diagonal.
     mask_split: bool = False,
-    # `epi_pk`: issue the remaining silu mul/add as packed f32. exp2 and rcp
-    # stay scalar. Same operations and the same f32 rounding, two lanes per
-    # issue. Requires epi_fold.
+    # `epi_pk`: the two MULs and the ADD that survive epi_fold, at double rate.
+    #   After epi_fold the remainder per score element is 2 TRANS (v_exp_f32 +
+    #   v_rcp_f32, irreducible for silu), 2 MUL_F32 and 1 ADD_F32.  gfx950 has
+    #   double-rate packed f32 (`llc -mcpu=gfx950` turns an <2 x float>
+    #   fmul/fadd into v_pk_mul_f32/v_pk_add_f32), and the
+    #   accumulator already holds 4 consecutive n per lane, so the pairs are
+    #   free to form.  The transcendentals stay
+    #   scalar; only the surrounding arithmetic packs.  Bit-exact: same
+    #   operations, same order, same f32 rounding, just two lanes per issue.
     epi_pk: bool = False,
+    # ---- K/V prefetch + direct P fragment -----------------------------------
+    # `kv_prefetch` (fp8 q/k + fp8 V only): split stage_kv into load_kv and
+    #   store_kv and carry the NEXT n-iteration's K/V global loads as scf.for
+    #   iter_args, issued right after the RAW barrier so their latency overlaps
+    #   this iteration's compute (also across the mask_split head->tail loop
+    #   boundary).  The last iteration's prefetch (rows from n_end on; zero past
+    #   the sequence end via num_records) is never stored.  Same bytes, same
+    #   LDS layout, same math: bit-identical.
+    kv_prefetch: bool = False,
+    # `p_direct`: build the out-gemm A fragment straight from the bf16 silu
+    #   values this lane computed (n-tile 2t ++ 2t+1, exactly the 8 values the
+    #   p_lds path stores) instead of the p_lds store + read.  The read is a
+    #   same-lane identity LLVM already forwards; this deletes the dead
+    #   ds_write and the p_lds allocation.  Bit-identical.
+    p_direct: bool = False,
+    # ---- causal-mask arithmetic of the masked n-iterations -------------------
+    # 0 = the default masked path: per score
+    #     element an f32 compare + select, after which LLVM unpacks/repacks the
+    #     bf16 P pairs (v_perm/v_lshrrev) to apply the select per half.
+    # 3 = (p_direct only) the silu is converted to bf16 unmasked and the causal
+    #     zeros are applied to the packed bf16 pairs of the P fragment, one
+    #     v_and_b32 per pair.  The per-lane keep-masks come from
+    #     dmn = (l16 - 4*l4 + m_base) - n0 with two packed-int16 ops per
+    #     distinct (16*(nt-mt), pair): half kept iff dmn >= 16*(nt-mt) + e,
+    #     which is exactly m >= n.  Every score element is still computed and
+    #     the predicate is a runtime per-lane value; bf16(+0.0) is 0x0000, so
+    #     p is bit-identical to select-then-convert.
+    #     With pv="k128" the same predicate is applied to the
+    #     packed e4m3 P8 dwords of the masked tail group instead: one v_and_b32
+    #     per 4 keys, the byte keep-mask from two packed-int16 subtracts and
+    #     one v_perm_b32 (sign-replicate selectors) per distinct 16*(nt-mt);
+    #     e4m3(+0.0) is 0x00, so P8 is bit-identical to select-then-convert.
+    mask_arith: int = 0,
+    # ---- pv="k128" (FP8 P@V, K = 128 retile) -------------------------------
+    # DECLARED PRECISION CHANGE (P f32 -> e4m3), default off.
+    # Built on the FWD_PIPE config only (BN=32, BM=128, fp8_mfma="k128",
+    # fp8_v, kv_prefetch, p_direct, mask_split, epi_fold, no epi_pk), with or
+    # without mask_arith=3.  The knobs below take effect only with pv="k128";
+    # with pv="" the build is the bf16-P@V kernel above, unchanged.
+    # `pv_k`: P8 = e4m3(sat(P' * 2**pv_k)) where P' is the epi_fold silu;
+    #   the cvt divides by its operand (2**-pv_k) and out_scale *= 2**-pv_k.
+    # `pv_msat`: MODE.FP16_OVFL=1 for the main loop (saturating fp8 cvt),
+    #   cleared before the bf16 epilogue.
+    pv_k: int = 3,
+    pv_msat: bool = True,
+    # `pv_s`: the static P scale.  0.0 (default) keeps the power-of-two
+    #   scale 2**pv_k above (same symbol and ISA).  s > 0 gives
+    #   P8 = e4m3(sat(P' * s)) for a NON-power-of-two s:
+    #   the silu chain's `rcp(ex + 1.0)` becomes `rcp(fma(ex, c, c))` with
+    #   c = f32(2**pv_k / s), so x * rcp(c * (ex + 1)) = (s / 2**pv_k) * P'
+    #   and the unchanged cvt (which divides by 2**-pv_k) yields
+    #   e4m3(s * P'); out_scale *= f32(1/s) instead of 2**-pv_k.  The fma
+    #   replaces the add (no extra hot-loop instruction; c lives in one SGPR,
+    #   see pv_c).  Why: P' (the epi_fold silu, -log2(e) * silu) peaks over
+    #   negative scores at the silu minimum (score -1.27846, P' = 0.40174),
+    #   where silu is stationary, so P' piles up there.  With s = 8 that pile
+    #   sits at 3.2139, 1.1% below the e4m3 grid point 3.25, and rounds UP
+    #   systematically: a coherent row-sum error on rows whose keys cluster
+    #   in the negative lobe.  Every power-of-two s keeps the same position
+    #   inside the binade; a non-power-of-two s moves it (s = 10.04: 0.84%
+    #   above the grid point 4.0).  Accepted range [4, 32]: s * P' stays far
+    #   below the e4m3 saturation (448) and |P'| >= 2**-12 stays out of the
+    #   flush.  Same declared precision class as pv="k128" (P f32 -> e4m3).
+    pv_s: float = 0.0,
+    # `pv_split`: sched_barrier(0) between phase 3's score+silu and the P@V, so
+    #   the scheduler cannot hoist the 32 tr8 B operands into the silu
+    #   (that hoist pushes VGPR use past the 3-waves/SIMD limit).
+    # `pf_late`: issue phase 3's next-group K/V prefetch after its silu (just
+    #   before the P@V) instead of right after the RAW barrier.
+    pv_split: bool = False,
+    pf_late: bool = False,
+    # `pv_tg`: tail guard -- in the (single, padded) tail group, phases whose
+    #   first key is >= n_end skip score + silu (P8 = 0 via a uniform scf.if);
+    #   their K/V staging still runs (zero rows), so the ring stays finite.
+    #   Only padding work (keys >= seq_len) is skipped.
+    pv_tg: bool = False,
 ):
-    """`kpad` overrides the k_lds row pad. `lds_dummy` reserves extra LDS bytes.
+    """`kpad` overrides the k_lds row pad; `lds_dummy` wastes that many LDS bytes.
 
-    `waves` sets waves per workgroup. With BM fixed, MT = BM/(16*waves) is the
-    number of 16-row m-tiles one wave owns. K and V are B-operands, so a wave
-    reads each fragment once and issues MT mfmas against it. The n loop runs
-    to m0+BM, so a larger BM includes extra tiles past the causal triangle.
+    Raising KPAD from 8 to 16 both fixes a K-read bank conflict AND costs 512
+    B/workgroup, which pushes 3x21.75 KB past the 64 KB the CU has and drops
+    occupancy from 3 workgroups to 2. `lds_dummy` forces the same occupancy
+    drop at an UNCHANGED conflict pattern, so the two effects can be separated.
+
+    `waves` sets waves per workgroup, and with BM fixed it sets MT = BM/(16*waves),
+    the number of 16-row m-tiles ONE wave owns. It is the lever on LDS traffic:
+    K and V are both B-operands, broadcast across m, so a wave that owns MT
+    m-tiles reads each K/V fragment ONCE and issues MT mfmas against it. Halving
+    `waves` therefore halves the workgroup's K/V LDS reads for identical MFMA
+    work, at identical BM -- which is what distinguishes it from raising BM. BM
+    sets the causal waste (the n loop runs to m0+BM, so a coarser BM overshoots
+    the triangle).
     """
     assert dim == 128, "kernel is specialised for D=128"
     assert BM % 64 == 0 and BN % 32 == 0
     # The packed path only implements the epi_fold parametrisation.
     assert not epi_pk or epi_fold, "epi_pk requires epi_fold"
     assert fp8_mfma in ("", "k32", "k128"), fp8_mfma
-    assert pv in ("", "k32", "k128"), pv
-    assert not pv, "the p@v fp8 path is not implemented (see the pv note above)"
+    assert pv in ("", "k128"), f"pv={pv!r}: only '' (bf16 P@V) and 'k128'"
+    PV8 = pv == "k128"
     assert not (pv and not fp8_v), "pv needs an e4m3 V"
+    if PV8:
+        # BM == 128 exactly: the n loop below is m0/128 unmasked groups plus
+        # ONE masked tail group of 128 keys, which covers the diagonal block
+        # only when BM == 128 (BM=256 would drop keys m0+128..m0+255).
+        assert (fp8_mfma == "k128" and kv_prefetch and p_direct and mask_split
+                and epi_fold and not epi_pk and BN == 32 and BM == 128), (
+            "pv=k128 is built on the FWD_PIPE config only")
+    assert PV8 or not (pv_split or pf_late or pv_tg or pv_s), (
+        "pv_split / pf_late / pv_tg / pv_s are pv='k128' knobs")
+    # pv_s: 0 = power-of-two 2**pv_k; otherwise a static scale in [4, 32]
+    # (see the knob comment: saturation and flush edges).
+    pv_s = float(pv_s)
+    assert pv_s == 0.0 or 4.0 <= pv_s <= 32.0, f"pv_s={pv_s!r}"
+    assert not kv_prefetch or (fp8_mfma and fp8_v), (
+        "kv_prefetch is implemented for the fp8 q/k + fp8 V config only")
+    assert mask_arith in (0, 3), mask_arith
+    assert not mask_arith or p_direct, "mask_arith=3 needs p_direct"
     FP8_QK = fp8_mfma
     D = dim
-    # k_lds is row-major [BN][D]. The score gemm's B read for lane l is
-    # k[n = 16*nt + l16][d = 32*ks + 8*l4 .. +7] as a b128. KPAD=16 keeps
-    # KSTRIDE 16-byte aligned and moves consecutive rows off the same banks.
+    # k_lds is row-major [BN][D].  The score gemm's B read for lane l is
+    # k[n = 16*nt + l16][d = 32*ks + 8*l4 .. +7] as a b128 (v8bf).  These K
+    # reads are this kernel's dominant LDS cost, so the row pad sets the K-read
+    # bank pattern.  KSTRIDE must be 8-elem == 16 B aligned or the b128 splits.
+    # pad=16 (KSTRIDE=144, 288 B == 16 mod 32 banks) is the default even though
+    # the +512 B drops 3 wg/CU -> 2 wg (66 KB > 64 KB for three).
     KPAD = 16 if kpad < 0 else kpad
     assert KPAD % 8 == 0, "KSTRIDE must stay 16 B aligned or the b128 read splits"
     KSTRIDE = D + KPAD
@@ -220,7 +357,7 @@ def compile_hstu_fwd(
     # SAME banks: the out-gemm A read (row = l16, all 16 rows at once) is an 8-way
     # conflict on its 2 b64 reads/iter, and the p-store (rows l4*4+e, 4 apart =
     # 256 B = 2 periods) is a 4-way conflict on its 8 scalar writes/iter -- the
-    # exact flaw the k_lds pad fixed.  Padding to 36 elems (72 B) puts rows k=1..4
+    # same flaw the k_lds pad addresses.  Padding to 36 elems (72 B) puts rows k=1..4
     # apart at {72,16,88,32} B mod 128 (none 0), killing both.  PSTRIDE%4==0 keeps
     # the b64 A read 8 B aligned.  +512 B LDS -> 21.0 KB, still 3 wgs/CU (3 waves).
     PPAD = 4
@@ -230,8 +367,7 @@ def compile_hstu_fwd(
     # store v_off = (v_blk*BN + n)*16 + v_in has byte bank =
     # 8*((v_blk*BN+n) mod 8)+{0,4} on gfx950's 64 banks.  BN=32 == 0 mod 8 drops
     # v_blk out entirely: all 8 d-blocks collide on the same banks for each
-    # (n,half) -> 8-way store conflict, only 32 of 64 banks used.  Same flaw KPAD
-    # fixed for k_lds, on the ONE tile never padded.  VROWS = BN+1 (== 1 mod 8)
+    # (n,half) -> 8-way store conflict, only 32 of 64 banks used.  VROWS = BN+1 (== 1 mod 8)
     # makes 8*((v_blk+n) mod 8) spread all 8 blocks over distinct bank groups ->
     # conflict-free store.  Reads (ds_read_tr16, all lanes share dd) are
     # unaffected by block stride.  +256 B LDS; already 2 wg/CU so no cliff.
@@ -245,10 +381,12 @@ def compile_hstu_fwd(
     # [N, 2*H*hidden + 2*H*attn] buffer and hands attention COLUMN SLICES of it,
     # so one token's q sits `rs` elements from the next.  Passing that stride is
     # what lets the kernel read the slice in place; with rs unset the caller is
-    # promising a packed tensor and gets the old math.
+    # promising a packed tensor.
     #
-    # A torch slice view carries the column offset in its data_ptr, which is
-    # what _shifted_rsrc starts from. Packing q/k/v would copy them first.
+    # Packing q/k/v to contiguous would cost three full copies of the
+    # attention input per layer per step.  The column offset needs
+    # no parameter: a torch slice view carries it in its data_ptr, which is what
+    # _shifted_rsrc starts from.
     #
     # OUT is NOT a slice of that buffer -- it is attention's own freshly
     # allocated output -- so it keeps the packed H*D stride and is addressed
@@ -293,17 +431,35 @@ def compile_hstu_fwd(
         None, arch=arch,
         global_sym_name=(f"hstu_fwd_smem_{BM}_{BN}_{KPAD}_{lds_dummy}_w{WAVES}"
                          f"_{FP8_QK or 'bf16'}_{k8_pad}_{int(fp8_v)}"
-                         f"_{int(epi_fold)}{int(mask_split)}{int(epi_pk)}"),
+                         f"_{int(epi_fold)}{int(mask_split)}{int(epi_pk)}"
+                         # Suffix only when a knob is on, so the default
+                         # build keeps its symbol name. The literal "_ws0"
+                         # keeps the FWD_PIPE build's symbol name stable.
+                         + (f"_pf{int(kv_prefetch)}_pd{int(p_direct)}_ws0"
+                            if (kv_prefetch or p_direct) else "")
+                         + (f"_ma{int(mask_arith)}" if mask_arith else "")
+                         + (f"_pv8k{pv_k}_s{int(pv_msat)}_vp{v8_pad}"
+                            f"_x{int(pv_split)}{int(pf_late)}{int(pv_tg)}"
+                            if PV8 else "")
+                         # pv_s in 1e-6 units (the symbol stays [A-Za-z0-9_]);
+                         # absent for pv_s == 0, so the power-of-two build
+                         # keeps its name.
+                         + (f"_ps{int(round(pv_s * 1e6))}" if pv_s else "")),
     )
+    # pv=k128: V is a 4-slot ring of raw e4m3 rows [32 keys][128 + v8_pad B].
+    V8S = D + v8_pad
+    assert not PV8 or V8S % 8 == 0, "tr8 / b64 rows must stay 8 B aligned"
+    V8SLOT = BN * V8S                    # bytes per ring slot
+    NPH = 4                              # BN=32 phases per K=128 group
     # k_lds[BN][D], v_lds[BN][D] (row-major), p_lds[WAVES][BN][16] (per-wave).
     off_k = allocator._align(allocator.ptr, 16)
     allocator.ptr = off_k + (BN * K8STRIDE if FP8_QK else BN * KSTRIDE * 2)
     off_v = allocator._align(allocator.ptr, 16)
-    allocator.ptr = off_v + VLDS_HW * 2
+    allocator.ptr = off_v + (NPH * V8SLOT if PV8 else VLDS_HW * 2)
     off_p = allocator._align(allocator.ptr, 16)
     # One region per (wave, m-tile) == BM/16 regions, so this is independent of
     # how the m-tiles are distributed over waves.
-    allocator.ptr = off_p + (BM // 16) * 16 * PSTRIDE * 2
+    allocator.ptr = off_p + (0 if p_direct else (BM // 16) * 16 * PSTRIDE * 2)
     # Never read or written; it exists only to consume the occupancy headroom.
     allocator.ptr = allocator._align(allocator.ptr + lds_dummy, 16)
 
@@ -375,8 +531,7 @@ def compile_hstu_fwd(
         # (seq_len-1)*RS + D-1, so seq_len*RS over-reaches by RS-D elements --
         # invisible while RS == H*D (the slack lands inside the same tensor) but
         # a fault once RS is a uvqk row stride, because for the final sequence it
-        # runs past the end of the whole buffer.  Cost a memory access fault at
-        # batch 1024 while batch 64 passed on allocator slack.
+        # runs past the end of the whole buffer.
         # seq_len >= 1 here: emit_body runs only under the m0 < seq_len guard.
         def _seq_bytes(eb):
             return (arith.ArithValue(seq_len) - _i32(1)) * _i32(RS * eb) \
@@ -398,8 +553,14 @@ def compile_hstu_fwd(
             k_lds = SmemPtr(base, off_k, T.i32, shape=(BN * K8_DW,)).get()
         else:
             k_lds = SmemPtr(base, off_k, T.bf16, shape=(BN * KSTRIDE,)).get()
-        v_lds = SmemPtr(base, off_v, T.bf16, shape=(VLDS_HW,)).get()
-        p_lds = SmemPtr(base, off_p, T.bf16, shape=((BM // 16) * 16 * PSTRIDE,)).get()
+        if PV8:
+            # Raw e4m3 ring, dword-typed for the b64 staging stores; the tr8
+            # reads address it in bytes through _lds_gep.
+            v_lds = SmemPtr(base, off_v, T.i32, shape=(NPH * V8SLOT // 4,)).get()
+        else:
+            v_lds = SmemPtr(base, off_v, T.bf16, shape=(VLDS_HW,)).get()
+        p_lds = (None if p_direct else
+                 SmemPtr(base, off_p, T.bf16, shape=((BM // 16) * 16 * PSTRIDE,)).get())
 
         lane = tid % _i32(64)
         wave = tid // _i32(64)
@@ -421,6 +582,11 @@ def compile_hstu_fwd(
             score_scale = score_scale * _f32(-LOG2E)
             fold = arith.ArithValue(inv_max) * _f32(-1.0 / LOG2E)
             out_scale = fold if out_scale is None else out_scale * fold
+        if PV8:
+            # P8 carries P' * 2**pv_k (or P' * pv_s); undo it once per output
+            # element.
+            out_scale = out_scale * _f32(1.0 / pv_s if pv_s
+                                         else 2.0 ** (-pv_k))
         V2F = T.vec(2, T.f32)
         # Packed-f32 constants, built once per kernel: a <2xf32> splat of the
         # (uniform) score scale and of 1.0.  LLVM keeps the splat in an SGPR
@@ -432,6 +598,10 @@ def compile_hstu_fwd(
         # This wave owns MT consecutive 16-row m-tiles: m_base + 16*mt.
         m_base = m0 + wave * _i32(16 * MT)
         p_wave = wave * _i32(MT * 16 * PSTRIDE)   # this wave's p_lds region base
+        # mask_arith: m - n = dmn - 16*(nt-mt) - e for score element (mt, nt,
+        # e) of this lane, with dmn = lane_m - n0.  lane_m is loop-invariant.
+        lane_m = (arith.ArithValue(l16) - l4 * _i32(4) + m_base
+                  if mask_arith else None)
 
         def tr_read(lds, row_base, inner):
             """One ds_read_b64_tr_b16 out of a tile in the tr16 layout
@@ -501,8 +671,7 @@ def compile_hstu_fwd(
         # ---- cooperative K/V staging into LDS -------------------------------
         # THREADS threads load BN*D bf16 as vec8: (BN*D/8)/THREADS vecs each.
         # One pass covers ROWS_PER_PASS = THREADS/16 rows, so the row stride
-        # between passes is ROWS_PER_PASS, not a hardcoded 16 -- that only
-        # coincided while THREADS was 256.
+        # between passes is ROWS_PER_PASS.
         KV_VECS = (BN * D) // (THREADS * 8)
         st_col16 = tid % _i32(16)               # 0..15
         st_row0 = tid // _i32(16)               # 0..ROWS_PER_PASS-1
@@ -544,6 +713,40 @@ def compile_hstu_fwd(
                                                 dtype=T.bf16)
                 vector.store(vv, v_lds, [_idx(v_off)], alignment=16)
 
+        # kv_prefetch: stage_kv split in two (fp8 q/k + fp8 V only), so the
+        # global loads of iteration i+1 can be issued during iteration i and
+        # carried as loop iter_args.  Same addresses, same LDS stores.
+        def load_kv(n0):
+            regs = []
+            for r in range_constexpr(KV_VECS):
+                n = st_row0 + _i32(ROWS_PER_PASS * r)
+                g_off = (arith.ArithValue(n0) + n) * _i32(RS) + st_dcol
+                regs.append(buffer_ops.buffer_load(rK, g_off // _i32(4),
+                                                   vec_width=2, dtype=T.i32))
+                regs.append(buffer_ops.buffer_load(rV, g_off // _i32(4),
+                                                   vec_width=2, dtype=T.i32))
+            return regs
+
+        def store_kv(regs):
+            for r in range_constexpr(KV_VECS):
+                n = st_row0 + _i32(ROWS_PER_PASS * r)
+                v_off = (v_blk * _i32(VROWS) + n) * _i32(16) + v_in
+                l_off = arith.ArithValue(n) * _i32(K8_DW) + st_dcol // _i32(4)
+                vector.store(regs[2 * r], k_lds, [_idx(l_off)], alignment=8)
+                vector.store(widen8(regs[2 * r + 1]), v_lds, [_idx(v_off)],
+                             alignment=16)
+
+        # ---- pv=k128: raw e4m3 V into ring slot `ph` (static), no widen ----
+        def store_kv8(regs, ph):
+            for r in range_constexpr(KV_VECS):
+                n = st_row0 + _i32(ROWS_PER_PASS * r)
+                l_off = arith.ArithValue(n) * _i32(K8_DW) + st_dcol // _i32(4)
+                vector.store(regs[2 * r], k_lds, [_idx(l_off)], alignment=8)
+                v8_off = (arith.ArithValue(n) * _i32(V8S // 4)
+                          + st_dcol // _i32(4) + _i32(ph * V8SLOT // 4))
+                vector.store(regs[2 * r + 1], v_lds, [_idx(v8_off)],
+                             alignment=8)
+
         def one_iter(n0, acc, masked=True):
             # Raise wave issue-priority for the whole MFMA-heavy compute region.
             # Workgroups co-reside with INDEPENDENT barriers,
@@ -552,17 +755,54 @@ def compile_hstu_fwd(
             # here (paired with s_setprio(0) before the yield) lets the compute
             # wave win the shared issue slot and keep the single MFMA pipe fed,
             # instead of being interleaved with the neighbour's LDS/global
-            # traffic. An arbitration hint. Semantically a no-op.
+            # traffic.  Purely an arbitration hint -- semantically a no-op, and
+            # a lever neither LLVM's SSA scheduler nor iglp_opt expresses.
             rocdl.s_setprio(1)
+            # mask_arith: dmn once per masked iteration; element (mt, nt, e) is
+            # kept iff dmn >= 16*(nt-mt) + e  (== m_idx >= n_idx, exactly).
+            dmn = (arith.ArithValue(lane_m) - n0
+                  if (masked and mask_arith) else None)
+            pair_mask = None
+            if masked and mask_arith:
+                from flydsl._mlir.dialects import arith as _ma
+                v2i16 = T.vec(2, T.i16)
+                ddc = dmn
+                if not mask_split:
+                    # mask_split bounds |dmn| by BM+15 in the masked loop;
+                    # without it, clamp so the int16 math below cannot wrap.
+                    # The clamp range strictly contains every compare constant
+                    # 16*(nt-mt)+e, so no predicate changes.
+                    ddc = arith.ArithValue(_ma.maxsi(arith.unwrap(ddc),
+                                                     arith.unwrap(_i32(-16 * MT))))
+                    ddc = arith.ArithValue(_ma.minsi(arith.unwrap(ddc),
+                                                     arith.unwrap(_i32(16 * NTILE + 4))))
+                d16 = _ma.trunci(T.i16, arith.unwrap(ddc))
+                dd2 = vector.from_elements(v2i16, [d16, d16])
+                sh15 = arith.constant_vector(15, v2i16)
+                pm_cache = {}
+
+                def pair_mask(off, pp):
+                    """i32 keep-mask of the bf16 pair (e = 2pp, 2pp+1): 0xFFFF
+                    per half iff dmn >= off + e, from ((off+e-1) - dmn) >> 15."""
+                    if (off, pp) not in pm_cache:
+                        cv = vector.from_elements(v2i16, [
+                            arith.unwrap(arith.constant(off + 2 * pp - 1, type=T.i16)),
+                            arith.unwrap(arith.constant(off + 2 * pp, type=T.i16))])
+                        y = _ma.subi(cv, dd2)
+                        pm_cache[(off, pp)] = llvm.BitcastOp(
+                            T.i32, _ma.shrsi(y, sh15)).result
+                    return pm_cache[(off, pp)]
             # ---- score: qk.T[n][m] = (q @ k.T).T  (per wave, its 16 m x BN n) --
             # OPERANDS SWAPPED vs the natural mfma2(qf, kf): kf and qf have
             # IDENTICAL fragment structure (lane l -> 16-index=l16, k=l4*8+32ks),
             # so putting kf in the A slot and qf in the B slot computes the same
             # scores but with the accumulator TRANSPOSED: output row = n-space,
-            # col = m-space. p is still written through LDS and freed, so the
-            # accumulator stays 4 f32 per lane. A lane holds 4 consecutive n
-            # for one m, so the p store is two ds_write_b64 per iteration.
-            # p_lds stays row-major [m][n].
+            # col = m-space.  p is still round-tripped through LDS and freed, so
+            # the accumulator is still 4 f32/lane.  The payoff is the p-STORE:
+            # a lane now holds 4 CONSECUTIVE n (l4*4+0..3) for one m=l16, so the
+            # 8 scalar ds_write_u16/iter collapse to 2 ds_write_b64/iter, while
+            # the a_p read below is byte-identical (p_lds is the same [m][n]
+            # row-major layout, just written transposed).
             # K IS READ ONCE AND ISSUED MT TIMES. The K fragment depends only on
             # (nt, ks), not on m, so hoisting the read above the mt loop is what
             # makes MT>1 cheaper than the equivalent BM increase: the workgroup's
@@ -571,8 +811,9 @@ def compile_hstu_fwd(
             for nt in range_constexpr(NTILE):
                 accs = [zero_acc for _ in range_constexpr(MT)]
                 if FP8_QK == "k128":
-                    # One contiguous 32 B run per lane, read as two b128.
-                    # The bf16 tile uses four b128.
+                    # ONE contiguous 32 B run per lane, read as TWO b128 --
+                    # against FOUR b128 for the bf16 tile: the read
+                    # INSTRUCTION count halves and the bytes quarter.
                     kb = (_i32(16 * nt) + l16) * _i32(K8_DW) + l4 * _i32(8)
                     kf = vector.shuffle(
                         vector.load_op(v4i32, k_lds, [_idx(kb)]),
@@ -603,6 +844,9 @@ def compile_hstu_fwd(
             # [m][n] row-major p_lds puts the 4 e's at contiguous LDS offsets ->
             # ONE ds_write_b64 per nt (2/iter).  The out-gemm a_p read (below)
             # reads p_lds[m=l16][n = 32*t + l4*4 ..] unchanged.
+            # p_direct keeps the bf16 values in registers instead (p_bf).
+            p_bf = [[[None] * 4 for _ in range_constexpr(NTILE)]
+                    for _ in range_constexpr(MT)]
             for mt in range_constexpr(MT):
                 m_idx = m_base + _i32(16 * mt) + l16
                 p_tile = p_wave + _i32(mt * 16 * PSTRIDE)
@@ -665,7 +909,8 @@ def compile_hstu_fwd(
                                     T.f32,
                                     arith.unwrap(arith.ArithValue(ex) + _f32(1.0))))
                                 silu = arith.ArithValue(x * sig) * inv_max
-                        if masked:
+                        # mask_arith=3: applied to the packed bf16 P below.
+                        if masked and not mask_arith:
                             n_idx = (arith.ArithValue(n0) + _i32(16 * nt)
                                      + l4 * _i32(4) + _i32(e))
                             ok = arith.cmpi(arith.CmpIPredicate.sge, arith.unwrap(m_idx),
@@ -675,7 +920,11 @@ def compile_hstu_fwd(
                                 arith.unwrap(_f32(0.0))))
                         poff = (p_tile + l16 * _i32(PSTRIDE) + _i32(16 * nt)
                                 + l4 * _i32(4) + _i32(e))
-                        lds_store_scalar(p_lds, poff, arith.trunc_f(T.bf16, silu))
+                        if p_direct:
+                            p_bf[mt][nt][e] = arith.trunc_f(T.bf16, silu)
+                        else:
+                            lds_store_scalar(p_lds, poff,
+                                             arith.trunc_f(T.bf16, silu))
 
             # p_lds is per-(wave, m-tile) (p_wave + mt separates the regions),
             # so the store->read exchange below is entirely INTRA-wave.  A
@@ -686,8 +935,7 @@ def compile_hstu_fwd(
 
             # ---- out: out[m][d] += p @ v -----------------------------------
             # V's B-fragment is read transposed straight out of the tr16 tile
-            # with ds_read_tr16_b64 (2 b64 tr reads per K=32 step), replacing the
-            # old 64 strided scalar loads/iter.  The tr layout hands each lane
+            # with ds_read_tr16_b64 (2 b64 tr reads per K=32 step).  The tr layout hands each lane
             # group g the n set {4g..4g+3, 4g+16..4g+19}, so p's A-fragment is
             # read in that SAME k-labelling: two contiguous v4bf (n=4l4+e and
             # n=4l4+16+e) concatenated, invariant across the D-tiles.
@@ -695,6 +943,21 @@ def compile_hstu_fwd(
             for mt in range_constexpr(MT):
                 p_tile = p_wave + _i32(mt * 16 * PSTRIDE)
                 for t in range_constexpr(NKSTEP):
+                    if p_direct:
+                        # lo = n-tile 2t (n = 32t + 4*l4 + e), hi = n-tile 2t+1
+                        # (n + 16): exactly the 8 values this lane computed.
+                        a_p[mt][t] = vector.from_elements(
+                            v8bf, [arith.unwrap(x) for x in
+                                   p_bf[mt][2 * t] + p_bf[mt][2 * t + 1]])
+                        if pair_mask is not None:
+                            # dword k of the fragment = bf16 elements 2k, 2k+1
+                            # = (n-tile 2t+k//2, e = 2*(k%2), +1).
+                            km = vector.from_elements(v4i32, [
+                                pair_mask(16 * (2 * t + k // 2 - mt), k % 2)
+                                for k in range(4)])
+                            a_p[mt][t] = vector.bitcast(v8bf, arith.andi(
+                                vector.bitcast(v4i32, a_p[mt][t]), km))
+                        continue
                     base = p_tile + l16 * _i32(PSTRIDE) + _i32(32 * t) + l4 * _i32(4)
                     lo = vector.load_op(v4bf, p_lds, [_idx(base)])
                     hi = vector.load_op(v4bf, p_lds, [_idx(base + _i32(16))])
@@ -716,6 +979,242 @@ def compile_hstu_fwd(
             # that is in its own compute region.
             rocdl.s_setprio(0)
             return new_acc
+
+        # ==== pv=k128: FP8 P@V over 4 BN=32 phases ==========================
+        # Declared precision change (P f32 -> e4m3), default off.  The n loop
+        # is unrolled by 4: one group = 4 BN=32 phases of score + silu, whose P
+        # stays in registers as e4m3, then ONE K=128 P@V
+        # (v_mfma_scale_f32_16x16x128_f8f6f4) per (m-tile, 16-d tile).
+        # A = P8 (registers): lane l, m = l16; byte 8*ph + 4*nt + e <-> key
+        #     32*ph + 16*nt + 4*l4 + e, exactly the silu values this lane made.
+        # B = V8 (LDS ring, tr8): source lane j=l16 of group l4 addresses row
+        #     key(e=j//2) at column 16*dd + 8*(j%2); receiver j gets
+        #     V[key(e)][16*dd + j] as byte e (hstu_bwd_dkdv.py tr8 note), so
+        #     its bytes 0..3 / 4..7 are the n-tile-0 / n-tile-1 keys of the
+        #     lane's group -- the same labelling as A.
+        if PV8:
+            i8_t = ir.IntegerType.get_signless(8)
+            v8i32 = T.vec(8, T.i32)
+            v2i16 = T.vec(2, T.i16)
+            _tr8_op = getattr(rocdl_raw, "ds_read_tr8_b64_", None)
+
+            def _res(x):
+                return x.result if hasattr(x, "result") else x
+
+            def tr8(byte_off):
+                ptr = _lds_gep(v_lds, byte_off, i8_t)
+                if _tr8_op is not None:
+                    return _res(_tr8_op(v2i32, ptr))
+                addr = llvm.PtrToIntOp(T.i32, ptr).result
+                return llvm.inline_asm(
+                    v2i32, [addr], "ds_read_b64_tr_b8 $0, $1", "=v,v,~{memory}",
+                    has_side_effects=True)
+
+            # Per-lane key offset (within a phase) of n-tile nt's 4 keys.
+            key_nt = [_i32(16 * nt) + l4 * _i32(4) for nt in range(NTILE)]
+            # Score K-read row of lane l16 for n-tile nt (A-row i <-> key).
+            k_row = [_i32(16 * nt) + l16 for nt in range(NTILE)]
+            # tr8 source row/column for this lane (see the B note above).
+            t8_e = l16 // _i32(2)
+            t8_hi = t8_e // _i32(4)
+            t8_row = t8_hi * _i32(16) + l4 * _i32(4) + t8_e % _i32(4)
+            t8_base = t8_row * _i32(V8S) + (l16 % _i32(2)) * _i32(8)
+            pv_sc = arith.unwrap(_f32(2.0 ** (-pv_k)))
+            # pv_s: the silu denominator constant c = f32(2**pv_k / pv_s)
+            # (None for the power-of-two scale: den = ex + 1.0 as before).
+            # c is materialised ONCE into an SGPR by an opaque s_mov_b32
+            # (inline asm "=s", outside the n loop), so fma(ex, c, c) selects
+            # VOP3 `v_fma_f32 V, V, S, S`: one VGPR read, no literal, the
+            # power-of-two build's schedule and VGPR count.  A plain constant
+            # c lowers to `v_fmamk_f32 V, V, K, Vc` with c ALSO held in a VGPR
+            # (+4 VGPR).
+            # Same f32 c, same single-rounded fma: bit-identical.  (A whole
+            # inline-asm v_fma is NOT safe: LLVM does not pad gfx950's
+            # TRANS -> VALU forwarding hazard in front of inline asm.)
+            pv_c = None
+            if pv_s:
+                pv_c = llvm.inline_asm(
+                    T.f32, [], "s_mov_b32 $0, 0x%08x" % struct.unpack(
+                        "<I", struct.pack("<f", 2.0 ** pv_k / pv_s))[0],
+                    "=s")
+
+            def pk4_fp8(vals):
+                """4 f32 -> one v2i16 (dword) of 4 e4m3, element order;
+                dst = e4m3(src / 2**-pv_k) (the cvt divides)."""
+                acc8 = llvm.UndefOp(v2i16).result
+                for half in range_constexpr(2):
+                    acc8 = _res(rocdl_raw.cvt_scalef32_pk_fp8_f32(
+                        v2i16, acc8, arith.unwrap(vals[2 * half]),
+                        arith.unwrap(vals[2 * half + 1]), pv_sc, half))
+                return acc8
+
+            # mask_arith=3 on P8: in a masked phase the causal
+            # zeros go onto the packed e4m3 dword of (mt, nt) -- byte e <-> key
+            # n0 + 16*nt + 4*l4 + e -- as ONE v_and_b32, instead of a compare
+            # + select per f32 silu before the cvt.  Byte e is kept iff
+            # dmn >= 16*(nt-mt) + e, dmn = lane_m - n0 (== m_idx >= n_idx, the
+            # same identity as one_iter's pair masks).  Per distinct
+            # off = 16*(nt-mt): y0 = (off-1, off) - dmn and y1 = (off+1, off+2)
+            # - dmn as packed int16, whose four sign bits are the keep bits of
+            # e = 0..3, gathered into whole bytes by one v_perm_b32 with the
+            # sign-replicate selectors 8..11 (byte = 0xFF iff bit 15 / 31 of
+            # S1 / S0).  The tail group has mask_split's bound |dmn| <= BM+15,
+            # so the int16 math cannot wrap.  e4m3(+0.0) is 0x00 and each
+            # byte converts independently, so P8 is bit-identical to
+            # select-then-convert for every input, non-finite included.
+            PV_MA = mask_arith == 3
+            SEL_SIGN4 = 0x0B0A0908  # bytes <- sign(S1.lo), (S1.hi), (S0.lo), (S0.hi)
+
+            def p8_byte_masks(n0):
+                """off -> i32 keep-mask of the P8 dword at this phase's n0."""
+                from flydsl._mlir.dialects import arith as _ma
+                d16 = _ma.trunci(T.i16, arith.unwrap(
+                    arith.ArithValue(lane_m) - n0))
+                dd2 = vector.from_elements(v2i16, [d16, d16])
+                sel = arith.unwrap(_i32(SEL_SIGN4))
+                cache = {}
+
+                def mask(off):
+                    if off not in cache:
+                        ys = []
+                        for c0 in (off - 1, off + 1):
+                            cv = vector.from_elements(v2i16, [
+                                arith.unwrap(arith.constant(c0, type=T.i16)),
+                                arith.unwrap(arith.constant(c0 + 1, type=T.i16))])
+                            ys.append(llvm.BitcastOp(
+                                T.i32, _ma.subi(cv, dd2)).result)
+                        # v_perm_b32 D = perm(S0 = y1 (e2|e3), S1 = y0 (e0|e1))
+                        cache[off] = llvm.call_intrinsic(
+                            T.i32, "llvm.amdgcn.perm", [ys[1], ys[0], sel],
+                            [], [])
+                    return cache[off]
+                return mask
+
+            def one_phase(n0, masked):
+                """Score + silu of one BN=32 phase -> P8 pieces [mt][nt]."""
+                rocdl.s_setprio(1)
+                bmask = p8_byte_masks(n0) if (masked and PV_MA) else None
+                qk = [[None] * NTILE for _ in range_constexpr(MT)]
+                for nt in range_constexpr(NTILE):
+                    kb = arith.ArithValue(k_row[nt]) * _i32(K8_DW) + l4 * _i32(8)
+                    kf = vector.shuffle(
+                        vector.load_op(v4i32, k_lds, [_idx(kb)]),
+                        vector.load_op(v4i32, k_lds,
+                                       [_idx(arith.ArithValue(kb) + _i32(4))]),
+                        [0, 1, 2, 3, 4, 5, 6, 7])
+                    for mt in range_constexpr(MT):
+                        qk[mt][nt] = mfma_qk_k128(kf, qf[mt][0], zero_acc)
+                p8 = [[None] * NTILE for _ in range_constexpr(MT)]
+                for mt in range_constexpr(MT):
+                    m_idx = m_base + _i32(16 * mt) + l16
+                    for nt in range_constexpr(NTILE):
+                        vals = []
+                        for e in range_constexpr(4):
+                            raw = arith.ArithValue(
+                                vector.extract(qk[mt][nt], static_position=[e],
+                                               dynamic_position=[]))
+                            x = raw * score_scale
+                            ex = rocdl.exp2(T.f32, arith.unwrap(x))
+                            if pv_c is not None:
+                                # pv_s: c * (ex + 1) as ONE fma, so P8 =
+                                # e4m3(pv_s * P') through the same cvt.
+                                den = llvm.intr_fma(arith.unwrap(ex), pv_c,
+                                                    pv_c)
+                            else:
+                                den = arith.unwrap(
+                                    arith.ArithValue(ex) + _f32(1.0))
+                            sig = arith.ArithValue(rocdl.rcp(T.f32, den))
+                            silu = x * sig
+                            # mask_arith=3: applied to the packed P8 below.
+                            if masked and not PV_MA:
+                                n_idx = (arith.ArithValue(n0) + key_nt[nt]
+                                         + _i32(e))
+                                ok = arith.cmpi(arith.CmpIPredicate.sge,
+                                                arith.unwrap(m_idx),
+                                                arith.unwrap(n_idx))
+                                silu = arith.ArithValue(arith.select(
+                                    arith.unwrap(ok), arith.unwrap(silu),
+                                    arith.unwrap(_f32(0.0))))
+                            vals.append(silu)
+                        p8[mt][nt] = pk4_fp8(vals)
+                        if bmask is not None:
+                            p8[mt][nt] = arith.andi(p8[mt][nt], llvm.BitcastOp(
+                                v2i16, bmask(16 * (nt - mt))).result)
+                return p8
+
+            def close_phase():
+                emit_sched()
+                rocdl.s_setprio(0)
+
+            def pv_group(acc, p8s):
+                """K=128 P@V of one 4-phase group: 32 tr8 + 16 f8f6f4 / wave."""
+                a8 = []
+                for mt in range_constexpr(MT):
+                    pcs = [p8s[ph][mt][nt] for ph in range(NPH)
+                           for nt in range(NTILE)]
+                    q4 = [vector.shuffle(pcs[2 * i], pcs[2 * i + 1], [0, 1, 2, 3])
+                          for i in range(4)]
+                    h8 = [vector.shuffle(q4[2 * i], q4[2 * i + 1], list(range(8)))
+                          for i in range(2)]
+                    a8.append(vector.bitcast(
+                        v8i32, vector.shuffle(h8[0], h8[1], list(range(16)))))
+                new_acc = [[acc[mt][dd] for dd in range_constexpr(NDSTEP)]
+                           for mt in range_constexpr(MT)]
+                for dd in range_constexpr(NDSTEP):
+                    parts = [tr8(arith.ArithValue(t8_base)
+                                 + _i32(ph * V8SLOT + 16 * dd))
+                             for ph in range(NPH)]
+                    b8 = vector.shuffle(
+                        vector.shuffle(parts[0], parts[1], [0, 1, 2, 3]),
+                        vector.shuffle(parts[2], parts[3], [0, 1, 2, 3]),
+                        list(range(8)))
+                    for mt in range_constexpr(MT):
+                        new_acc[mt][dd] = mfma_qk_k128(a8[mt], b8,
+                                                       new_acc[mt][dd])
+                return new_acc
+
+            def group(n0g, acc, regs, masked, last=False):
+                """4 phases (barrier, stage, barrier, prefetch, score+silu)
+                then one K=128 P@V.  Returns (acc, next phase's K/V regs)."""
+                p8s = []
+                for ph in range_constexpr(NPH):
+                    gpu.barrier()
+                    store_kv8(regs, ph)
+                    gpu.barrier()
+                    n0 = arith.ArithValue(n0g) + _i32(BN * ph)
+                    late = pf_late and ph == NPH - 1
+                    if last and ph == NPH - 1:
+                        regs = []
+                    elif not late:
+                        regs = load_kv(n0 + _i32(BN))
+                    if pv_tg and last and ph > 0:
+                        # uniform branch: this padded phase has no key < n_end
+                        live = arith.cmpi(arith.CmpIPredicate.slt,
+                                          arith.unwrap(n0), arith.unwrap(n_end))
+                        rt = [v2i16] * (MT * NTILE)
+                        br = scf.IfOp(live, results_=rt, has_else=True)
+                        with ir.InsertionPoint(br.then_block):
+                            pp = one_phase(n0, masked)
+                            scf.YieldOp([arith.unwrap(pp[mt][nt]) for mt in range(MT)
+                                         for nt in range(NTILE)])
+                        with ir.InsertionPoint(br.else_block):
+                            z = arith.unwrap(arith.constant_vector(0, v2i16))
+                            scf.YieldOp([z] * (MT * NTILE))
+                        res_ = list(br.results)
+                        p8s.append([[res_[mt * NTILE + nt] for nt in range(NTILE)]
+                                    for mt in range(MT)])
+                    else:
+                        p8s.append(one_phase(n0, masked))
+                    if ph != NPH - 1:
+                        close_phase()
+                if pf_late and not last:
+                    regs = load_kv(arith.ArithValue(n0g) + _i32(BN * NPH))
+                if pv_split:
+                    emit_sched()
+                    rocdl.sched_barrier(0)
+                acc = pv_group(acc, p8s)
+                close_phase()
+                return acc, regs
 
         # ---- n loop ---------------------------------------------------------
         # out[m] sums n <= m, m up to m0+BM-1, so n in [0, min(m0+BM, seq_len)).
@@ -740,26 +1239,72 @@ def compile_hstu_fwd(
                 flat = list(lp.inner_iter_args[:NACC])
                 acc = [flat[mt * NDSTEP:(mt + 1) * NDSTEP] for mt in range(MT)]
                 gpu.barrier()
-                stage_kv(n0)
+                if kv_prefetch:
+                    # K/V of THIS iteration were loaded one iteration earlier.
+                    store_kv(list(lp.inner_iter_args[NACC:]))
+                else:
+                    stage_kv(n0)
                 gpu.barrier()
+                # kv_prefetch: issue the NEXT iteration's loads now; the last
+                # iteration's prefetch (rows >= n_end) is never stored.
+                nxt = load_kv(n0 + _i32(BN)) if kv_prefetch else []
                 acc = one_iter(n0, acc, masked=masked)
-                scf.YieldOp([arith.unwrap(x) for row in acc for x in row])
+                scf.YieldOp([arith.unwrap(x) for row in acc for x in row]
+                            + [arith.unwrap(x) for x in nxt])
             return lp
 
         init = [arith.unwrap(zero_acc) for _ in range(NACC)]
-        if mask_split:
+        if kv_prefetch:
+            init = init + [arith.unwrap(x) for x in load_kv(_i32(0))]
+        if PV8:
+            if pv_msat:
+                # MODE.FP16_OVFL = 1: v_cvt_scalef32_pk_fp8_f32 saturates to
+                # +-448 instead of NaN (backward msat, hstu_bwd_dkdv.py).
+                llvm.InlineAsmOp(
+                    None, [],
+                    "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1\n"
+                    "s_nop 7\ns_nop 7", "", has_side_effects=True)
+            # Head: m0/128 whole groups strictly below the diagonal (BM=128
+            # makes m0/BN a multiple of 4).  Tail: ONE masked group starting
+            # at n0 = m0, padded to 4 phases; padding rows are >= n_end =
+            # seq_len and read back as zero through num_records.
+            n_groups = arith.ArithValue(m0) // _i32(BN * NPH)
+            lp = scf.ForOp(
+                arith.unwrap(arith.index_cast(T.index, arith.unwrap(_i32(0)))),
+                arith.unwrap(arith.index_cast(T.index, arith.unwrap(n_groups))),
+                arith.unwrap(step), init)
+            with ir.InsertionPoint(lp.body):
+                gi = arith.ArithValue(arith.index_cast(T.i32, lp.induction_variable))
+                flat = list(lp.inner_iter_args[:NACC])
+                acc = [flat[mt * NDSTEP:(mt + 1) * NDSTEP] for mt in range(MT)]
+                acc, nxt = group(gi * _i32(BN * NPH), acc,
+                                 list(lp.inner_iter_args[NACC:]), masked=False)
+                scf.YieldOp([arith.unwrap(x) for row in acc for x in row]
+                            + [arith.unwrap(x) for x in nxt])
+            flat = list(lp.results[:NACC])
+            acc = [flat[mt * NDSTEP:(mt + 1) * NDSTEP] for mt in range(MT)]
+            res, _ = group(m0, acc, list(lp.results[NACC:]), masked=True,
+                           last=True)
+            if pv_msat:
+                llvm.InlineAsmOp(
+                    None, [],
+                    "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 0\n"
+                    "s_nop 7\ns_nop 7", "", has_side_effects=True)
+        elif mask_split:
             # n0 + BN <= m0  <=>  it < m0/BN, and m0 is a multiple of BN, so the
             # first m0/BN iterations are strictly below the diagonal: every
             # (m, n) they touch has n <= m0-1 < m0 <= m.  The mask is dead there.
             safe = arith.ArithValue(m0) // _i32(BN)
             head = n_loop(_i32(0), safe, init, masked=False)
-            init = list(head.results[:NACC])
+            # kv_prefetch: the head loop's prefetched K/V carry into the tail.
+            init = list(head.results if kv_prefetch else head.results[:NACC])
             loop = n_loop(safe, n_iters, init, masked=True)
         else:
             loop = n_loop(_i32(0), n_iters, init, masked=True)
 
-        flat_res = list(loop.results[:NACC])
-        res = [flat_res[mt * NDSTEP:(mt + 1) * NDSTEP] for mt in range(MT)]
+        if not PV8:
+            flat_res = list(loop.results[:NACC])
+            res = [flat_res[mt * NDSTEP:(mt + 1) * NDSTEP] for mt in range(MT)]
 
         # ---- epilogue: store out[MT*16 m][128 d] for this wave --------------
         # lane l elem e -> m = m_base + 16*mt + l4*4 + e, d = 16*dd + l16
@@ -851,8 +1396,13 @@ def compile_hstu_fwd(
             allocator.finalize()
         # XCD-pinned dispatch (see emit_body): grid.x = NXCD*heads packs
         # (slot, head), grid.z rounds batch up to a multiple of NXCD.  Padded
-        # slots (batch >= NBATCH) read seq_off as 0 via the max_size resource,
-        # yield seq_len 0, and are dropped by the m0<seq_len guard.
+        # slots (batch >= NBATCH) read seq_off[batch] and [batch + 1] through
+        # the max_size resource, which has NO range check (num_records
+        # 0xFFFFFFFF), so SEQ_OFF must hold 8*cdiv(NBATCH, 8) + 1 entries: the
+        # launcher pads it with the total token count when NBATCH % 8 != 0
+        # (hstu_flydsl_mha._fwd_seq_offsets_i32), which gives every padded
+        # slot seq_len 0, dropped by the m0<seq_len guard.  Without that
+        # padding a padded slot runs on the stale bytes after the tensor.
         fwd_kernel(Q, K, V, OUT, SEQ_OFF, inv_max, qkv_scale, batch).launch(
             grid=(NXCD * heads, m_blocks, (batch + NXCD - 1) // NXCD),
             block=(THREADS, 1, 1), stream=stream,
@@ -868,8 +1418,7 @@ def compile_hstu_fwd(
             # default null stream, which does not order against non-blocking
             # side streams.  Same handle on the default stream; an explicit
             # stream, keyword or 10th positional, still wins.  With
-            # $DLRM_HSTU_FP8_FLYDSL_CURRENT_STREAM=0 no stream is passed: the
-            # previous null-stream launch arguments.
+            # $DLRM_HSTU_FP8_FLYDSL_CURRENT_STREAM=0 no stream is passed.
             import torch
 
             q = args[0] if args else kw["Q"]

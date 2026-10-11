@@ -110,9 +110,29 @@ def use_separated_rng_ln_mul_dropout() -> bool:
 
     Blackwell datacenter GPUs (sm_100-103) and AMD MI350 (gfx950) both prefer the
     separated-RNG path: it batches rows per program and lets the backward reuse the
-    same mask, which is a large win over launching one program per row.
+    same mask, rather than launching one program per row.
     """
     return is_sm100_plus() or is_amd_mi350()
+
+
+def arm_print_all_ranks(msg: str) -> None:
+    """Print a one-time arming or decline line on EVERY rank, tagged ' [rank N]'.
+
+    Used by the LayerNorm-family kernels (D256 v3, D512 dx-sum v3, LN*U*dropout
+    fwd v3 and maskgen, LPT EC reduce) and by the L11 fused out-proj dgrad +
+    LN*U*dropout backward. Multi-process training logs occasionally lose a
+    line, and a missing rank-0 line reads as a false 'not armed'. One tagged
+    copy per rank makes losing every copy negligible and lets arming be
+    checked rank by rank. The text before the tag is unchanged, so marker
+    greps still match. Logging only: no computed value changes, and each
+    caller still prints once per process.
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = str(torch.distributed.get_rank())
+    else:
+        # RANK is not always exported to the spawned trainer processes.
+        rank = os.environ.get("RANK", "0") or "0"
+    print(f"{msg} [rank {rank}]", flush=True)
 
 
 def copy_if_different_ptr(dst: torch.Tensor, src: torch.Tensor) -> None:

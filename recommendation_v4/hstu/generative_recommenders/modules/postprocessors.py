@@ -17,7 +17,7 @@
 # pyre-strict
 
 from abc import abstractmethod
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from generative_recommenders.common import HammerModule, init_mlp_weights_optional_bias
@@ -166,6 +166,36 @@ class TimestampLayerNormPostprocessor(OutputPostprocessor):
         _units_elapsed = _cast_dtype(_units_elapsed, _units_elapsed_type)
         combined_embeddings = torch.cat([combined_embeddings, _units_elapsed], dim=-1)
         return combined_embeddings
+
+    @torch.jit.unused
+    def g4_forward_targets(
+        self,
+        seq_embeddings: torch.Tensor,
+        seq_lengths: torch.Tensor,
+        seq_timestamps: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Targets-only forward with DLRM_HSTU_FP8_GLUE_FOLD4_POST
+        (ops/glue_fusion.py section 5): forward(seq_embeddings,
+        seq_timestamps[complete_cumsum(seq_lengths)[1:] - 1]) where one kernel
+        builds the Linear's bf16 input (the time features, their bf16 cast and
+        the cat); under bf16 autocast the shipped .to(fp32) and autocast's
+        cast back to bf16 are the identity and are skipped. None = not armed
+        or not applicable (the caller runs the shipped ops)."""
+        from generative_recommenders.ops import glue_fusion as _gf
+
+        if not _gf.G4_POST:
+            return None
+        x = _gf.g4_time_concat(
+            seq_embeddings,
+            seq_lengths,
+            seq_timestamps,
+            self._period_units,
+            self._units_per_period,
+            self._time_feature_combiner.weight.dtype,  # pyre-ignore[6]
+        )
+        if x is None:
+            return None
+        return self._layer_norm(self._time_feature_combiner(x))
 
     def forward(
         self,

@@ -34,6 +34,11 @@ def build_offline_ts_indices(
     # Complete caches bypass the build lock, as do training-time index reads.
     if indices_path.exists() and offsets_path.exists():
         return indices_path, offsets_path
+    from generative_recommenders.dlrm_v4.datasets.yambda import (
+        refuse_index_build_in_timed_run,
+    )
+
+    refuse_index_build_in_timed_run(str(indices_path))
 
     # Each rank calls this during dataset initialization. Reuse the positions
     # lock so only one rank builds missing output, avoiding duplicate work and
@@ -102,6 +107,9 @@ def build_offline_ts_indices(
 
 
 if __name__ == "__main__":
+    # The standalone tool IS the offline preparation step the timed-run guard
+    # points to, so it may build.
+    os.environ.setdefault("MLPERF_ALLOW_INDEX_BUILD", "1")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-dir", required=True)
     parser.add_argument("--history-length", type=int, required=True)
