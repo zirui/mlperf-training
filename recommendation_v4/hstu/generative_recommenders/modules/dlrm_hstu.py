@@ -19,6 +19,7 @@
 
 import inspect
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, Final, List, NamedTuple, Optional, Tuple
@@ -57,6 +58,27 @@ from torchrec.modules.embedding_modules import EmbeddingCollection
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+# DLRM_HSTU_FP8_LAZY_FLOPS_STASH: default OFF in code (on only for an explicit
+# 1/true/on/yes); the gin binding apply_env_bootstrap.DLRM_HSTU_FP8_LAZY_FLOPS_STASH
+# turns it on, =0 keeps the eager per-step stash. Read once at import.
+_LAZY_FLOPS_STASH: bool = os.environ.get(
+    "DLRM_HSTU_FP8_LAZY_FLOPS_STASH", ""
+).strip().lower() in ("1", "true", "on", "yes")
+_LAZY_FLOPS_STASH_LOGGED: bool = False
+
+
+def _log_lazy_flops_stash_once() -> None:
+    """The DLRM_HSTU_FP8_LAZY_FLOPS_STASH arming line, once per process, from
+    the forward that took the lazy stash."""
+    global _LAZY_FLOPS_STASH_LOGGED
+    if not _LAZY_FLOPS_STASH_LOGGED:
+        _LAZY_FLOPS_STASH_LOGGED = True
+        logger.info(
+            "DLRMV4 armed OK: lazy flops stash -- main_forward keeps the merged "
+            "per-sample lengths; the jagged FLOPs/sample kernels run only when "
+            "MetricsLogger reads them (kill switch DLRM_HSTU_FP8_LAZY_FLOPS_STASH=0)"
+        )
+
 # (tensor, _version, sum) for the batch's num_candidates, seeded by
 # fx_length_stats so fx_total_targets needs no second device-to-host sync. The
 # strong reference is deliberate (one int per row): it keeps the `is` test
@@ -86,7 +108,7 @@ def fx_total_targets(num_candidates: torch.Tensor) -> int:
     dependent ``int(Proxy.sum().item())`` (which raises during tracing).
 
     Returns the value fx_length_stats already read for this exact tensor (same
-    object, same ``_version``) when there is one; otherwise syncs as before.
+    object, same ``_version``) when there is one; otherwise syncs.
     """
     cached, version, value = _total_targets_memo
     if cached is num_candidates and version == num_candidates._version:
@@ -245,19 +267,23 @@ class DlrmHSTU(HammerModule):
         # last layer and yields tflops_real/gpu, hfu and `exec`.
         self._last_jagged_flops_per_sample: Optional[torch.Tensor] = None
         self._last_executed_flops_per_sample: Optional[torch.Tensor] = None
+        # DLRM_HSTU_FP8_LAZY_FLOPS_STASH (default OFF in code = the eager stash
+        # below; the gin binding turns it on): main_forward keeps only the
+        # merged per-sample lengths and
+        # the targets-only flag; jagged_flops_per_sample() runs the ~33 0-d
+        # kernels when MetricsLogger actually reads them (never, at
+        # METRIC_LOG_FREQ=0). Same ops on the same tensor -> same values.
+        self._flops_stash_pending: Optional[Tuple[torch.Tensor, bool]] = None
         set_static_max_seq_lens([self._hstu_configs.max_seq_len])
 
         if not is_dense:
             # use_gather_select picks how the index-dedup path expands unique rows
             # back to one row per token in TorchRec's construct_jagged_tensors:
-            # torch.gather (True) instead of torch.index_select (False). The
-            # forwards cost the same; the backwards do not. index_select's backward
-            # is index_add_ -> ATen indexFuncLargeIndex, which torch 2.12 regressed
-            # 2.4x, while gather's backward is scatter_add_, which it did not touch.
-            # At this model's shape (69k unique rows, 512 dim, 7.1M tokens) the
-            # backward is 45.8 ms vs 12.9 ms on torch 2.12. Both accumulate with
-            # atomics in nondeterministic order and score identically against a
-            # float64 reference, so this is a pure kernel-selection change.
+            # torch.gather (True) instead of torch.index_select (False).
+            # index_select's backward is index_add_ -> ATen indexFuncLargeIndex,
+            # while gather's backward is scatter_add_. Both accumulate with
+            # atomics in nondeterministic order, so this is a pure
+            # kernel-selection change.
             ec_kwargs = {}
             if use_gather_select:
                 if "use_gather_select" not in inspect.signature(
@@ -391,11 +417,23 @@ class DlrmHSTU(HammerModule):
             return_full_embeddings=False,
             listwise=False,
         )
-        # Keep the transducer in bf16 when training is bf16. Its default dtype
-        # is fp32, which casts the bf16 embedding up and the surrounding
-        # autocast casts it back. Scoped to the transducer: the multitask
-        # module runs outside that autocast. `transducer_bf16_dtype` is
-        # separate from `bf16_training`.
+        # HammerModule._training_dtype defaults to fp32, so the transducer's
+        # entry cast would upcast the bf16 embedding _user_forward hands it
+        # back to fp32 -- and the autocast right below would then cast it to
+        # bf16 again. That round trip is four full-size [tokens, 512] copies
+        # per step (two forward, two in the backward), and it is the identity:
+        # bf16 -> fp32 is exact and fp32 -> bf16 of an already-bf16 value is
+        # exact, so dropping it is bit-for-bit equal.
+        #
+        # Scoped to the transducer on purpose. _multitask_module also gates an
+        # autocast on _training_dtype, but it runs OUTSIDE the _user_forward
+        # autocast, so flipping it there would be a real behaviour change; it
+        # is not under this subtree and stays fp32.
+        #
+        # Gated separately from bf16_training so it can be rolled back on its
+        # own: `make_model.transducer_bf16_dtype = False` in the gin restores
+        # the fp32 round trip without giving up bf16 training. Default False
+        # here and True in the gin, the same way use_gather_select is carried.
         if (not self._is_inference) and bf16_training and transducer_bf16_dtype:
             self._hstu_transducer.set_training_dtype(torch.bfloat16)
 
@@ -598,7 +636,14 @@ class DlrmHSTU(HammerModule):
         rather than the env flag: the gate declines per batch at eval, or when
         a batch is not exactly one target per sequence.
         """
-        s = (uih_seq_lengths + num_candidates).float()
+        return self._jagged_flops_from_merged_lengths(
+            uih_seq_lengths + num_candidates, targets_only
+        )
+
+    def _jagged_flops_from_merged_lengths(
+        self, merged_lengths: torch.Tensor, targets_only: bool
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        s = merged_lengths.float()
         cfg = self._hstu_configs
         # Same per-layer expression as the dense estimate, with mean(s_i) and
         # mean(s_i²) substituted for S and S²; sharing it keeps the two in step.
@@ -629,6 +674,23 @@ class DlrmHSTU(HammerModule):
             executed = executed + head
         return ragged, executed
 
+    @torch.jit.unused
+    def jagged_flops_per_sample(
+        self,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """(jagged, executed) FLOPs/sample of the last forward batch."""
+        pending = self._flops_stash_pending
+        if pending is not None:
+            self._flops_stash_pending = None
+            (
+                self._last_jagged_flops_per_sample,
+                self._last_executed_flops_per_sample,
+            ) = self._jagged_flops_from_merged_lengths(pending[0], pending[1])
+        return (
+            self._last_jagged_flops_per_sample,
+            self._last_executed_flops_per_sample,
+        )
+
     def _construct_payload(
         self,
         payload_features: Dict[str, torch.Tensor],
@@ -636,12 +698,28 @@ class DlrmHSTU(HammerModule):
     ) -> Dict[str, torch.Tensor]:
         if len(self._hstu_configs.contextual_feature_to_max_length) > 0:
             contextual_offsets: List[torch.Tensor] = []
-            for x in self._hstu_configs.contextual_feature_to_max_length.keys():
-                contextual_offsets.append(
-                    torch.ops.fbgemm.asynchronous_complete_cumsum(
-                        seq_embeddings[x].lengths
+            _ctx_lengths: List[torch.Tensor] = [
+                seq_embeddings[x].lengths
+                for x in self._hstu_configs.contextual_feature_to_max_length.keys()
+            ]
+            _batched = False
+            if not torch.jit.is_scripting() and not is_fx_tracing():
+                # DLRM_HSTU_FP8_CONTEXTUAL_FUSE: one stack + one row-wise scan
+                # instead of a (fill + scan) pair per feature; same integers.
+                from generative_recommenders.ops import glue_fusion as _gf
+
+                if _gf.complete_cumsum_many_fusable(_ctx_lengths):
+                    try:
+                        contextual_offsets = _gf.complete_cumsum_many(_ctx_lengths)
+                        _batched = True
+                    except Exception as exc:  # fail closed to fbgemm below
+                        _gf.disable("contextual", exc)
+                        contextual_offsets = []
+            if not _batched:
+                for _l in _ctx_lengths:
+                    contextual_offsets.append(
+                        torch.ops.fbgemm.asynchronous_complete_cumsum(_l)
                     )
-                )
         else:
             # Dummy, offsets are unused
             contextual_offsets = torch.empty((0, 0))
@@ -679,6 +757,43 @@ class DlrmHSTU(HammerModule):
             },
         }
 
+    @torch.jit.unused
+    def _uih_ts_concat_fold(
+        self,
+        max_seq_len: int,
+        payload_features: Dict[str, torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """DLRM_HSTU_FP8_CONCAT_FOLD[_UIH_TS]: _user_forward's timestamp
+        concat_2D_jagged (uih action times, then the candidate query time, per
+        sample) in one 1-D kernel, or None for the shipped op (switch off, not
+        the TRITON kernel, unexpected dtype/layout, or a launch failure)."""
+        if self.hammer_kernel() != HammerKernel.TRITON:
+            return None
+        from generative_recommenders.ops import glue_fusion as _gf
+
+        left = payload_features[self._hstu_configs.uih_action_time_feature_name]
+        right = payload_features[
+            self._hstu_configs.candidates_querytime_feature_name
+        ]
+        offsets_left = payload_features["uih_offsets"]
+        offsets_right = payload_features["candidate_offsets"]
+        if not _gf.uih_ts_concat_fusable(left, right, offsets_left, offsets_right):
+            return None
+        try:
+            out = _gf.jagged_concat_1d(
+                left, right, offsets_left, offsets_right, max_seq_len
+            )
+        except Exception as exc:  # fail closed to the shipped concat
+            _gf.disable("concat_fold_uih_ts", exc)
+            return None
+        _gf.note_armed_rank0(
+            "concat_fold uih_ts",
+            "user_forward timestamp concat_2D_jagged as one 1-D jagged concat "
+            "kernel, _jagged_concat_1d_kernel (kill switch "
+            "DLRM_HSTU_FP8_CONCAT_FOLD=0 or DLRM_HSTU_FP8_CONCAT_FOLD_UIH_TS=0)",
+        )
+        return out
+
     def _user_forward(
         self,
         max_uih_len: int,
@@ -692,20 +807,30 @@ class DlrmHSTU(HammerModule):
         source_lengths = seq_embeddings[
             self._hstu_configs.uih_post_id_feature_name
         ].lengths
-        source_timestamps = concat_2D_jagged(
-            max_seq_len=max_uih_len + max_candidates,
-            max_len_left=max_uih_len,
-            offsets_left=payload_features["uih_offsets"],
-            values_left=payload_features[
-                self._hstu_configs.uih_action_time_feature_name
-            ].unsqueeze(-1),
-            max_len_right=max_candidates,
-            offsets_right=payload_features["candidate_offsets"],
-            values_right=payload_features[
-                self._hstu_configs.candidates_querytime_feature_name
-            ].unsqueeze(-1),
-            kernel=self.hammer_kernel(),
-        ).squeeze(-1)
+        source_timestamps_fold: Optional[torch.Tensor] = None
+        if not torch.jit.is_scripting() and not is_fx_tracing():
+            # DLRM_HSTU_FP8_CONCAT_FOLD (ops/glue_fusion.py section 4): the
+            # same 1-D int64 jagged concat in one kernel (bitwise).
+            source_timestamps_fold = self._uih_ts_concat_fold(
+                max_uih_len + max_candidates, payload_features
+            )
+        if source_timestamps_fold is not None:
+            source_timestamps = source_timestamps_fold
+        else:
+            source_timestamps = concat_2D_jagged(
+                max_seq_len=max_uih_len + max_candidates,
+                max_len_left=max_uih_len,
+                offsets_left=payload_features["uih_offsets"],
+                values_left=payload_features[
+                    self._hstu_configs.uih_action_time_feature_name
+                ].unsqueeze(-1),
+                max_len_right=max_candidates,
+                offsets_right=payload_features["candidate_offsets"],
+                values_right=payload_features[
+                    self._hstu_configs.candidates_querytime_feature_name
+                ].unsqueeze(-1),
+                kernel=self.hammer_kernel(),
+            ).squeeze(-1)
         if total_targets is None:
             total_targets = fx_total_targets(num_candidates)
         if total_uih_len is None:
@@ -779,17 +904,10 @@ class DlrmHSTU(HammerModule):
         )
         # The item MLP's row count is NOT the HSTU token count, so the install
         # in the HSTU forward (ops/hstu_compute.py) cannot cover this MLP's
-        # GEMMs. Measured on 8 ranks x 5 steps of a profiled 200-step run:
-        # num_tokens - all_embeddings.shape[0] == 8192 at every single point,
-        # which is exactly global_batch_size -- preprocess() appends one token
-        # per sample between here and the projection. A pin keyed on the HSTU
-        # count therefore scores 0/40 lookups against the key this MLP actually
-        # presents, and TunableOp silently runs the heuristic.
-        #
-        # That was not a hypothesis: the mlp_b_dgrad pin shipped "active on 8/8
-        # ranks" and the traced arm still ran the DEFAULT kernel
-        # (Cijk_..._MT256x256x32_...), byte-identical to the control, 1.5395 vs
-        # 1.5875 ms. Installed is not the same as used.
+        # GEMMs: num_tokens - all_embeddings.shape[0] == global_batch_size,
+        # because preprocess() appends one token per sample between here and
+        # the projection. A pin keyed on the HSTU count therefore never matches
+        # the key this MLP presents, and TunableOp silently runs the heuristic.
         #
         # Registering at this count is what makes the MLP pins reachable at all.
         # It also writes cache lines for the six HSTU pins at this M; those keys
@@ -881,12 +999,23 @@ class DlrmHSTU(HammerModule):
                     values_right = candidates_features[candidate_feature_name].values()
                 payload_features[uih_feature_name] = values_left
                 payload_features[candidate_feature_name] = values_right
-        payload_features["uih_offsets"] = torch.ops.fbgemm.asynchronous_complete_cumsum(
-            uih_seq_lengths
-        )
-        payload_features["candidate_offsets"] = (
-            torch.ops.fbgemm.asynchronous_complete_cumsum(num_candidates)
-        )
+        # DLRM_HSTU_FP8_GLUE_FOLD4_OFFS (ops/glue_fusion.py section 5): both
+        # complete cumsums in one integer kernel. None = the shipped ops.
+        _g4_offs = None
+        if not torch.jit.is_scripting() and not is_fx_tracing():
+            from generative_recommenders.ops import glue_fusion as _gf4
+
+            _g4_offs = _gf4.g4_offsets(uih_seq_lengths, num_candidates, preproc=False)
+        if _g4_offs is not None:
+            payload_features["uih_offsets"] = _g4_offs[0]
+            payload_features["candidate_offsets"] = _g4_offs[1]
+        else:
+            payload_features["uih_offsets"] = (
+                torch.ops.fbgemm.asynchronous_complete_cumsum(uih_seq_lengths)
+            )
+            payload_features["candidate_offsets"] = (
+                torch.ops.fbgemm.asynchronous_complete_cumsum(num_candidates)
+            )
 
         seq_embeddings = {
             k: SequenceEmbedding(
@@ -980,7 +1109,17 @@ class DlrmHSTU(HammerModule):
         # stash but the trainer only consumes it on train batches. Stashed
         # after the transducer ran so it can be priced against the path that
         # was actually taken, not the one the env flag asked for.
-        if not torch.jit.is_scripting():
+        if not torch.jit.is_scripting() and _LAZY_FLOPS_STASH:
+            # The add is kept eager so the stash owns a fresh tensor and never
+            # aliases batch buffers a pipeline might recycle.
+            self._flops_stash_pending = (
+                uih_seq_lengths + num_candidates,
+                bool(self._hstu_transducer._last_targets_only),
+            )
+            self._last_jagged_flops_per_sample = None
+            self._last_executed_flops_per_sample = None
+            _log_lazy_flops_stash_once()
+        elif not torch.jit.is_scripting():
             (
                 self._last_jagged_flops_per_sample,
                 self._last_executed_flops_per_sample,

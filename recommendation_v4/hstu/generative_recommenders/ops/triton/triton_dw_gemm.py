@@ -8,8 +8,24 @@
 
 """Weight-gradient GEMM ``dW = X^T @ dY`` for a token-sized reduction.
 
-Training does not call this module. ``HSTU_DW_GEMM`` selects ``aten`` (the
-default), ``bmm``, or ``triton`` for a direct call.
+Every linear in the HSTU stack computes its weight gradient as ``X^T @ dY``, where X is
+``[tokens, in_features]`` and dY is ``[tokens, out_features]``. Because the sequences are
+jagged and flattened, ``tokens`` is in the millions while the output is only weight-sized
+(256x512 up to 512x2048). That is a reduction, not a square GEMM: it streams two large
+operands into a small accumulator, so what matters is HBM traffic and how the reduction
+over K is split.
+
+``dw_gemm`` selects an implementation with ``HSTU_DW_GEMM``:
+
+* ``aten`` (default): ``torch.mm``.
+* ``bmm``: ``chunked_bmm`` reshapes the reduction into a batch of medium-K GEMMs and
+  reduces the partials in fp32.
+* ``triton``: a split-K Triton kernel with an fp32 atomic combine.
+
+All three paths are numerically equivalent to the bf16 precision of the output.
+
+The training call sites (``triton_addmm.py`` and ``triton_hstu_linear.py``) use plain
+``torch.mm``; this module is reachable only by calling ``dw_gemm`` directly.
 """
 
 import os
@@ -29,8 +45,9 @@ from generative_recommenders.common import backend_allow_tf32, triton_autotune
 # tiles alone already fill the machine and the vendor kernel is fine.
 MIN_REDUCTION: int = 65536
 
-# chunked_bmm is not used for narrow outputs: the batched GEMM's per-chunk
-# output is too small to amortise its launch.
+# On narrow outputs ([512,K]x[K,256] and the 24-wide action MLP) the batched GEMM's
+# per-chunk output becomes too small to amortise its own launch, so chunked_bmm is used
+# only for N >= MIN_BMM_N.
 MIN_BMM_N: int = 512
 
 # Enough chunks to expose parallelism without shrinking each GEMM's own K too far.
@@ -47,9 +64,8 @@ def chunked_bmm(
 ) -> torch.Tensor:
     """``x.t() @ dy`` as a batch of medium-K GEMMs with an fp32 reduction.
 
-    Rather than asking the library for one GEMM with K in the millions -- the shape torch
-    2.12's hipBLASLt prices badly -- this asks for ``chunks`` GEMMs with K a few hundred
-    thousand, which its heuristics handle well, and reduces the partials afterwards.
+    Rather than asking the library for one GEMM with K in the millions, this asks for
+    ``chunks`` GEMMs with K a few hundred thousand and reduces the partials afterwards.
     """
     k, m = x.shape
     n = dy.shape[1]
@@ -161,8 +177,7 @@ def _dw_gemm_split_k(
     have to size the workspace before autotuning has chosen it.
 
     The autotune key above is deliberately ``["M", "N"]`` and *not* K: K is the token
-    count and differs on every step (1990209, 2229337, 2284350, 2365056 and 2376002 all
-    appear inside a single 4-step window), so keying on it would re-tune continuously and
+    count and differs on every step, so keying on it would re-tune continuously and
     never amortise. M and N select the tile; K only sets the trip count.
     """
     pid = tl.program_id(axis=0)

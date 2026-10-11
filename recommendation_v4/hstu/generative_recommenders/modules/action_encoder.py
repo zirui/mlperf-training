@@ -19,8 +19,9 @@
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from generative_recommenders.common import HammerModule
+from generative_recommenders.common import HammerKernel, HammerModule
 from generative_recommenders.ops.jagged_tensors import concat_2D_jagged
+from torch.fx._symbolic_trace import is_fx_tracing
 
 
 class ActionEncoder(HammerModule):
@@ -78,8 +79,66 @@ class ActionEncoder(HammerModule):
         target_offsets: torch.Tensor,
         seq_embeddings: torch.Tensor,
         seq_payloads: Dict[str, torch.Tensor],
+        bf16_consumer: bool = False,
     ) -> torch.Tensor:
+        """bf16_consumer: the caller's only use of the result is a consumer
+        that casts it to bf16 under autocast (ContextualPreprocessor's action
+        MLP). The fused path (DLRM_HSTU_FP8_ACTION_ENC_FUSE, ops/glue_fusion.py)
+        then emits the bf16 rows directly -- the same RNE rounding of the same
+        fp32 products the consumer's cast would apply -- and receives the bf16
+        gradient the consumer then returns. The fused path arms ONLY in that
+        case (bf16 consumer under bf16 autocast, the production path); an fp32
+        result is always produced by the unfused chain below."""
         seq_actions = seq_payloads[self._action_feature_name]
+        total_targets_f: int = seq_embeddings.size(0) - seq_actions.size(0)
+        if (
+            not torch.jit.is_scripting()
+            and bf16_consumer
+            and not is_fx_tracing()
+            and len(self._watchtime_to_action_thresholds_and_weights) == 0
+            and self.hammer_kernel() == HammerKernel.TRITON
+        ):
+            from generative_recommenders.ops import glue_fusion as _gf
+
+            dev = seq_actions.device.type
+            out_bf16 = torch.is_autocast_enabled(dev) and (
+                torch.get_autocast_dtype(dev) == torch.bfloat16
+            )
+            if _gf.action_encode_fusable(
+                seq_actions,
+                self._combined_action_weights,
+                self._action_embedding_table,
+                self._target_action_embedding_table,
+                uih_offsets,
+                target_offsets,
+                out_bf16,
+            ):
+                # table.unsqueeze(0) before the tile, as in the unfused graph:
+                # keeps the AccumulateGrad (DDP grad-ready / bucket) order.
+                table3 = self._action_embedding_table.unsqueeze(0)
+                # Still an autograd input: RepeatBackward0 runs as in the unfused graph.
+                right = self._target_action_embedding_table.tile(total_targets_f, 1)
+                try:
+                    out = _gf.action_encode_concat(
+                        seq_actions,
+                        self._combined_action_weights,
+                        table3,
+                        right,
+                        uih_offsets,
+                        target_offsets,
+                        max_uih_len + max_targets,
+                        True,
+                    )
+                except Exception as exc:  # fall back to the unfused chain
+                    _gf.disable("action_enc", exc)
+                else:
+                    _gf.note_armed(
+                        "action_enc",
+                        "one-pass action encoder fwd+bwd, bf16 rows "
+                        f"[{tuple(out.shape)}] (kill switch "
+                        "DLRM_HSTU_FP8_ACTION_ENC_FUSE=0)",
+                    )
+                    return out
         if len(self._watchtime_to_action_thresholds_and_weights) > 0:
             watchtimes = seq_payloads[self._watchtime_feature_name]
             for threshold, weight in self._watchtime_to_action_thresholds_and_weights:

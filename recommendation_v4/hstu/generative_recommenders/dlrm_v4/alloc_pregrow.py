@@ -1,11 +1,10 @@
-# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Caching-allocator pre-grow before RUN_START, and a growth report.
 
-Why: with ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` (launch_slurm.sh)
+Why: with ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``
 every growth of a stream's expandable segment calls hipMemCreate/hipMemMap/
 hipMemSetAccess, and on ROCm hipMemMap waits for the device to drain. Under the
 host-sync-free step the host runs about one step ahead, so a growth stall costs
-120-270 ms of host time on the rank that grows (seen under
+host time on the rank that grows (e.g. under
 ``## start_sparse_data_dist ## > ## dedup_ec_indices ## >
 fbgemm::jagged_unique_indices > aten::empty > hipMemMap``). That rank then
 reaches its next KJT splits all-to-all late, and every peer's comm kernel spins
@@ -23,7 +22,7 @@ streams do not exist yet at that point, so this module creates them (same
 priority torchrec uses), grows their pools, and the train pipeline adopts them
 in its constructor (``adopt_streams``). The eval pipeline keeps its own streams.
 
-Env (forwarded by launch_slurm.sh through the DLRM_HSTU_FP8_ prefix; the gin
+Env (forwarded by the launcher through the DLRM_HSTU_FP8_ prefix; the gin
 default is bound by apply_env_bootstrap.DLRM_HSTU_FP8_ALLOC_PREGROW):
   DLRM_HSTU_FP8_ALLOC_PREGROW=spec  comma list of <pool>=<GiB>, pool in
                                     {memcpy, data_dist, main} (+ "_small" for the
@@ -37,6 +36,7 @@ default is bound by apply_env_bootstrap.DLRM_HSTU_FP8_ALLOC_PREGROW):
 
 import logging
 import os
+import sys
 import time
 from typing import Any, Dict, List, Optional
 
@@ -52,6 +52,11 @@ _PIPE_STREAM_PRIORITY = -1
 _KEYS = ("memcpy", "data_dist", "main", "memcpy_small", "data_dist_small",
          "main_small", "eval_memcpy", "eval_data_dist", "eval_memcpy_small",
          "eval_data_dist_small", "margin")
+
+# Converge pass: map free memory above the margin that appeared DURING the grow
+# only if it exceeds this (mem_get_info noise and code objects stay below it).
+_CONVERGE_SLACK = 1 << 30
+_CONVERGE_PASSES = 2
 
 _pregrown = False
 # Pre-grown (memcpy, data_dist) stream pairs, handed out in pipeline build
@@ -106,9 +111,19 @@ def _parse_spec(spec: str) -> Dict[str, float]:
     return out
 
 
+def _default_pool(seg: Dict[str, Any]) -> bool:
+    # Private MemPools (e.g. DLRM_HSTU_FP8_TM_NONEXP's token-major pool) report
+    # their own segment_pool_id: count them separately, never as a stream pool.
+    return tuple(seg.get("segment_pool_id", (0, 0)) or (0, 0)) == (0, 0)
+
+
 def _per_stream_reserved(names: Dict[int, str]) -> Dict[str, float]:
     tot: Dict[str, float] = {}
     for seg in torch.cuda.memory_snapshot():
+        if not _default_pool(seg):
+            key = "private_pool/" + str(seg.get("segment_type", "?"))
+            tot[key] = tot.get(key, 0.0) + seg["total_size"] / _GIB
+            continue
         key = names.get(int(seg.get("stream", 0)), "s%x" % int(seg.get("stream", 0)))
         key += "/" + str(seg.get("segment_type", "?"))
         tot[key] = tot.get(key, 0.0) + seg["total_size"] / _GIB
@@ -120,8 +135,29 @@ def _pool_free_bytes(stream_id: int) -> int:
     for seg in torch.cuda.memory_snapshot():
         if int(seg.get("stream", 0)) != stream_id or seg.get("segment_type") != "large":
             continue
+        if not _default_pool(seg):
+            # A private pool's cached blocks are not this stream pool's free bytes.
+            continue
         n += sum(b["size"] for b in seg.get("blocks", []) if b.get("state") == "inactive")
     return n
+
+
+def _tail_free_bytes(stream_id: int) -> int:
+    """Size of the free block at the mapped end of the stream's expandable large
+    segment (0 if the last block is in use). Asking for this + X bytes makes the
+    segment absorb that block and map X more (see the "rest" comment below)."""
+    best_addr, tail = -1, 0
+    for seg in torch.cuda.memory_snapshot():
+        if int(seg.get("stream", 0)) != stream_id or seg.get("segment_type") != "large":
+            continue
+        if not seg.get("is_expandable", True):
+            continue
+        blocks = seg.get("blocks", [])
+        addr = int(seg.get("address", 0))
+        if blocks and addr > best_addr:
+            best_addr = addr
+            tail = int(blocks[-1]["size"]) if blocks[-1].get("state") == "inactive" else 0
+    return tail
 
 
 def _pool_stream(key: str) -> str:
@@ -160,7 +196,9 @@ def pregrow_before_run_start() -> None:
     # Never leave less than `margin` GiB unmapped: the eval pipeline's own
     # streams, RCCL lazy peer buffers and non-torch device allocations
     # (hipBLASLt/Triton workspaces) still need room.
-    budget = free - want.get("margin", 56.0) * _GIB
+    margin = want.get("margin", 56.0) * _GIB
+    budget = free - margin
+    oom = False
     # Fixed-size pools first; a "rest" pool (inf) takes what is left.
     for name, gib in sorted(want.items(), key=lambda kv: kv[1] == float("inf")):
         if name == "margin" or gib <= 0:
@@ -205,11 +243,95 @@ def pregrow_before_run_start() -> None:
                         "DLRMV4 alloc pregrow: rank=%d %s request %.2f GiB OOM; "
                         "pool left as is", _rank(), name, req / _GIB
                     )
+                    oom = True
                     break
         budget -= grow
     torch.cuda.synchronize()
-    after = _per_stream_reserved(names)
     free2, _ = torch.cuda.mem_get_info()
+    # Converge: device memory held OUTSIDE the caching allocator (e.g. left by
+    # the FP8 first-use warmup) can come back while the pass above runs, after
+    # the first pass already sized the "rest" pool. Map what came back into the
+    # "rest" pool, so the pool is the size a run without that memory gets. No-op
+    # when the first pass ends within 1 GiB of the margin.
+    rest = [n for n, g in want.items() if g == float("inf")]
+    # Gated on the FP8 first-use warmup having run on this rank, so FP8_WARMUP=0
+    # (and the gin binding absent) skips the converge pass. sys.modules: never
+    # imports the warmup.
+    _fw = sys.modules.get("generative_recommenders.dlrm_v4.train.fp8_warmup")
+    warmup_ran = bool(getattr(_fw, "WARMUP_RAN", False))
+    if rest and not rest[0].endswith("_small") and not oom and warmup_ran:
+        st = streams[_pool_stream(rest[0])]
+        for _ in range(_CONVERGE_PASSES):
+            extra = int(free2 - margin)
+            if extra <= _CONVERGE_SLACK:
+                break
+            req = _tail_free_bytes(int(st.cuda_stream)) + extra
+            res0 = torch.cuda.memory_reserved()
+            retries0 = int(torch.cuda.memory_stats().get("num_alloc_retries", 0))
+            with torch.cuda.stream(st):
+                try:
+                    t = torch.empty(req, dtype=torch.uint8, device="cuda")
+                    del t
+                except torch.cuda.OutOfMemoryError:
+                    logger.warning(
+                        "DLRMV4 alloc pregrow: rank=%d converge request %.2f GiB OOM",
+                        _rank(), req / _GIB,
+                    )
+                    break
+            torch.cuda.synchronize()
+            free3, _ = torch.cuda.mem_get_info()
+            grown = torch.cuda.memory_reserved() - res0
+            retried = int(torch.cuda.memory_stats().get("num_alloc_retries", 0)) > retries0
+            logger.info(
+                "DLRMV4 alloc pregrow converge: rank=%d %s pool %+.2f GiB (free %.1f GiB "
+                "after the previous pass, %.1f GiB above the margin) -> free %.1f GiB",
+                _rank(), rest[0], grown / _GIB, free2 / _GIB,
+                (free2 - margin) / _GIB, free3 / _GIB,
+            )
+            free2 = free3
+            if retried:
+                # The allocator's OOM retry path releases every cached free block
+                # (all pre-grown pools) before retrying; the pools are no longer
+                # what the first pass mapped.
+                logger.error(
+                    "DLRMV4 alloc pregrow: rank=%d converge request hit the allocator "
+                    "retry path (cached pools flushed); pre-grow incomplete", _rank()
+                )
+                break
+            if grown < extra // 2:
+                break  # served from an existing cached block (nothing mapped): stop
+    # DLRM_HSTU_FP8_TM_NONEXP (default off): map the token-major FP8 operand pool
+    # (plain, non-expandable segments) AFTER the pools above, i.e. out of the
+    # margin: the main pool keeps its full "rest" and its peak demand drops by
+    # the token-major tensors moved into this pool. Inert unless the knob is on.
+    # Placed after the converge pass, which sizes "rest" from the free memory
+    # above the margin; the prewarm then takes its blocks from the margin.
+    try:
+        from generative_recommenders.ops.triton import fp8_tm_alloc
+
+        blocks_env = os.environ.get("DLRM_HSTU_FP8_TM_NONEXP_BLOCKS", "")
+        if (
+            not blocks_env
+            and fp8_tm_alloc.active()
+            and fp8_tm_alloc.pooled_all_tiled()
+        ):
+            # DLRM_HSTU_FP8_TM_NONEXP_TILED=0 and every pooled operand is step-tiled
+            # (ordinary allocator): nothing to prewarm, the margin stays unmapped; a
+            # row-major operand after a latch maps the pool on demand (logged there).
+            # An explicit DLRM_HSTU_FP8_TM_NONEXP_BLOCKS still prewarms.
+            print(
+                "[hstu-fp8-tm] prewarm skipped: every pooled operand is step-tiled",
+                flush=True,
+            )
+        else:
+            # Unset: 5 blocks (three xT + one dout_t + one spare), or 2 when the LN xT
+            # stays out of the pool (DLRM_HSTU_FP8_TM_NONEXP_XT=0).
+            if fp8_tm_alloc.prewarm(int(blocks_env or fp8_tm_alloc.default_blocks())):
+                torch.cuda.synchronize()
+                free2, _ = torch.cuda.mem_get_info()
+    except Exception as error:  # pragma: no cover - defensive
+        logger.warning("DLRMV4 alloc pregrow: tm_nonexp prewarm skipped: %s", error)
+    after = _per_stream_reserved(names)
     logger.info(
         "armed OK: alloc pregrow before run_start: rank=%d %.1fs spec=%s "
         "free %.1f->%.1f GiB of %.1f; per-stream reserved GiB before=%s after=%s",

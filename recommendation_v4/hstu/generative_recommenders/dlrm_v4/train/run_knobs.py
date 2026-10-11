@@ -29,9 +29,8 @@ run log is checked for, are unit-testable on a CPU host without torch.
   * MLPerf train_loss off: MLPERF_TRAIN_LOSS_LOG_FREQ <= 0 (gin default 0)
     emits no train_loss event and runs no loss all_reduce. MLPerf 6.1 does not
     require train_loss; every required MLLOG event is unaffected.
-  * eval pool workers: EVAL_NUM_WORKERS sets num_workers of the
-    persistent eval DataLoader pool only; < 0 inherits the train pools'
-    NUM_WORKERS.
+  * eval pool workers: EVAL_NUM_WORKERS sets num_workers of the persistent
+    eval DataLoader pool only; < 0 inherits the train pools' NUM_WORKERS.
 """
 
 from typing import Dict, Optional
@@ -69,7 +68,7 @@ def resolve_mlperf_loss_every(
     """MLPerf train_loss cadence. <= 0 (the gin default 0) means OFF: no
     train_loss event and no cross-rank loss all_reduce. MLPerf Training 6.1 does
     not require train_loss (no compliance-checker rule), so the submission
-    logging profile turns it off; throughput/ladder runs set an explicit N > 0
+    logging profile turns it off; throughput runs can set an explicit N > 0
     (e.g. 1 or 20) to get per-step MLLOG timestamps. Independent of the metric
     cadence."""
     if mlperf_train_loss_log_frequency and mlperf_train_loss_log_frequency > 0:
@@ -110,7 +109,7 @@ def resolve_eval_dataloader_kwargs(eval_num_workers: Optional[int]) -> Dict[str,
     """Extra kwargs for the persistent eval pool's make_persistent_streaming_dataloader.
 
     None or < 0 -> {} (the pool inherits the gin num_workers binding, i.e. the
-    train pools' NUM_WORKERS, byte-identical to before). >= 0 -> num_workers.
+    train pools' NUM_WORKERS). >= 0 -> num_workers.
     """
     if eval_num_workers is None:
         return {}

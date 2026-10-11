@@ -225,8 +225,9 @@ echo "DATADIR:       ${DATADIR}"
 
 for _experiment_index in $(seq 1 "${NEXP}"); do
     echo "Beginning trial ${_experiment_index} of ${NEXP}"
+    _cache_cleared=0
     if [[ "${CLEAR_CACHES}" == 1 ]]; then
-        bash -c "echo -n 'Clearing cache on ' && hostname && sync && sudo /sbin/sysctl vm.drop_caches=3" || true
+        bash -c "echo -n 'Clearing cache on ' && hostname && sync && sudo /sbin/sysctl vm.drop_caches=3" && _cache_cleared=1
     fi
 
     export SEED=$((ROOT_SEED + _experiment_index - 1))
@@ -238,6 +239,7 @@ for _experiment_index in $(seq 1 "${NEXP}"); do
     ${DOCKER} exec \
         "${_all_env[@]}" \
         --env=SEED="${SEED}" \
+        --env=MLPERF_CACHE_CLEARED="${_cache_cleared}" \
         -e MASTER_ADDR="${MASTER_ADDR}" \
         -e MASTER_PORT="${MASTER_PORT}" \
         -e NODE_RANK="${NODE_RANK}" \

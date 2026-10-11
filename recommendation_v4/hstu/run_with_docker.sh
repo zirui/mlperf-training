@@ -84,11 +84,13 @@ docker exec "${_cont_name}" true
 for _experiment_index in $(seq 1 "${NEXP}"); do
   (
     echo "Beginning trial ${_experiment_index} of ${NEXP}"
+    _cache_cleared=0
     if [[ $CLEAR_CACHES == 1 ]]; then
       bash -c "echo -n 'Clearing cache on ' && hostname && sync && sudo /sbin/sysctl vm.drop_caches=3"
+      _cache_cleared=1
     fi
     # Use existing SEED if set; otherwise use a new RANDOM value
-    _run_config_env=("${_base_config_env[@]}" --env=SEED="${SEED:-$RANDOM}")
+    _run_config_env=("${_base_config_env[@]}" --env=SEED="${SEED:-$RANDOM}" --env=MLPERF_CACHE_CLEARED="${_cache_cleared}")
     docker exec "${_run_config_env[@]}" "${_cont_name}" bash /workspace/code/run_and_time.sh
   ) | grep --line-buffered -v "connected peer ranks" | tee "${_logfile_base}_${_experiment_index}.log"
 

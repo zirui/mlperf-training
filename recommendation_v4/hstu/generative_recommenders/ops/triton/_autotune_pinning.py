@@ -1,8 +1,13 @@
-# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Triton autotune pinning helper.
 
-Kernels that call `pinned_or_full` use the listed config. Set
-`TRITON_FULL_AUTOTUNE=1` to search the full config list instead.
+A handful of Triton kernels in this directory have two stable autotune
+equilibria on MI350X gfx950 at the yambda shape, and autotuner measurement
+noise decides between them per cold start. The pinned config list makes
+every cold start pick the same config deterministically.
+
+Set `TRITON_FULL_AUTOTUNE=1` to bypass the pin and re-enable the full
+autotune search (useful when validating a new shape, GPU, or Triton version
+before re-capturing winners).
 """
 
 import os

@@ -27,17 +27,30 @@ from generative_recommenders.modules.postprocessors import (
     L2NormPostprocessor,
     OutputPostprocessor,
 )
-from generative_recommenders.modules.preprocessors import InputPreprocessor
+from generative_recommenders.modules.preprocessors import (
+    CONTEXTUAL_FOLD_KEY,
+    ContextualPreprocessor,
+    InputPreprocessor,
+)
 from generative_recommenders.modules.stu import STU
+from generative_recommenders.ops.input_dropout_fold import (
+    input_dropout,
+    input_dropout_fold_enabled,
+)
 from generative_recommenders.ops.jagged_tensors import split_2D_jagged
+from torch.fx._symbolic_trace import is_fx_tracing
 from torch.profiler import record_function
 
 logger: logging.Logger = logging.getLogger(__name__)
+_CONCAT_FOLD_LOGGED: bool = False
+_POSENC_DROPOUT_FUSE_LOGGED: bool = False
 torch.fx.wrap("len")
 _HSTU_LAST_LAYER_TARGETS_ONLY: bool = (
     os.environ.get("TRITON_HSTU_LAST_LAYER_TARGETS_ONLY", "0") == "1"
 )
-# Whether eval takes the targets-only path too. Independent of training.
+# Whether eval takes the targets-only path too. Separately switchable because
+# eval numerics feed the convergence metric, so eval can be switched without
+# changing training.
 _HSTU_TARGETS_ONLY_EVAL: bool = (
     os.environ.get("TRITON_HSTU_TARGETS_ONLY_EVAL", "1") == "1"
 )
@@ -138,6 +151,20 @@ class HSTUTransducer(HammerModule):
     ]:
         seq_payloads = default_seq_payload(seq_payloads)
 
+        if not torch.jit.is_scripting():
+            if self._contextual_concat_fold_enabled():
+                return self._preprocess_concat_fold(
+                    max_uih_len=max_uih_len,
+                    max_targets=max_targets,
+                    total_uih_len=total_uih_len,
+                    total_targets=total_targets,
+                    seq_lengths=seq_lengths,
+                    seq_timestamps=seq_timestamps,
+                    seq_embeddings=seq_embeddings,
+                    num_targets=num_targets,
+                    seq_payloads=seq_payloads,
+                )
+
         with record_function("hstu_input_preprocessor"):
             (
                 output_max_seq_len,
@@ -174,11 +201,160 @@ class HSTUTransducer(HammerModule):
                     ),
                 )
 
-        output_seq_embeddings = torch.nn.functional.dropout(
+        # Same as F.dropout; when armed, its backward is folded into the
+        # layer-0 input-LayerNorm dx epilogue (DLRM_HSTU_FP8_DROPOUT_MSCALE_FOLD,
+        # see ops/input_dropout_fold.py).
+        if torch.jit.is_scripting():
+            output_seq_embeddings = torch.nn.functional.dropout(
+                output_seq_embeddings,
+                p=self._input_dropout_ratio,
+                training=self.training,
+            )
+        else:
+            output_seq_embeddings = input_dropout(
+                output_seq_embeddings,
+                p=self._input_dropout_ratio,
+                training=self.training,
+            )
+
+        return (
+            output_max_seq_len,
+            output_total_uih_len,
+            output_total_targets,
+            output_seq_lengths,
+            output_seq_offsets,
+            output_seq_timestamps,
             output_seq_embeddings,
-            p=self._input_dropout_ratio,
-            training=self.training,
+            output_num_targets,
+            output_seq_payloads,
         )
+
+    @torch.jit.unused
+    def _contextual_concat_fold_enabled(self) -> bool:
+        """DLRM_HSTU_FP8_POSENC_CONCAT_FOLD: the preprocessor's contextual concat
+        output has exactly one consumer (the positional encoder, right below),
+        so when that encoder runs the Triton fast path it can read the two
+        pieces directly."""
+        pe = self._positional_encoder
+        pre = self._input_preprocessor
+        return (
+            pe is not None
+            and isinstance(pre, ContextualPreprocessor)
+            and pre._max_contextual_seq_len > 0
+            and not is_fx_tracing()
+            and pe.concat_fold_enabled()
+        )
+
+    @torch.jit.unused
+    def _preprocess_concat_fold(
+        self,
+        max_uih_len: int,
+        max_targets: int,
+        total_uih_len: int,
+        total_targets: int,
+        seq_lengths: torch.Tensor,
+        seq_timestamps: torch.Tensor,
+        seq_embeddings: torch.Tensor,
+        num_targets: torch.Tensor,
+        seq_payloads: Dict[str, torch.Tensor],
+    ) -> Tuple[
+        int,
+        int,
+        int,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Dict[str, torch.Tensor],
+    ]:
+        """_preprocess with concat_2D_jagged folded into the position kernel.
+        Same outputs (bitwise) as the unfolded path."""
+        global _CONCAT_FOLD_LOGGED, _POSENC_DROPOUT_FUSE_LOGGED
+        if not _CONCAT_FOLD_LOGGED:
+            _CONCAT_FOLD_LOGGED = True
+            logger.info(
+                "armed OK: posenc concat fold ACTIVE -- contextual concat_2D_jagged "
+                "folded into the position kernel, split into its backward "
+                "(DLRM_HSTU_FP8_POSENC_CONCAT_FOLD)"
+            )
+        with record_function("hstu_input_preprocessor"):
+            (
+                output_max_seq_len,
+                output_total_uih_len,
+                output_total_targets,
+                output_seq_lengths,
+                output_seq_offsets,
+                output_seq_timestamps,
+                output_uih_embeddings,
+                output_num_targets,
+                output_seq_payloads,
+            ) = self._input_preprocessor(
+                max_uih_len=max_uih_len,
+                max_targets=max_targets,
+                total_uih_len=total_uih_len,
+                total_targets=total_targets,
+                seq_lengths=seq_lengths,
+                seq_timestamps=seq_timestamps,
+                seq_embeddings=seq_embeddings,
+                num_targets=num_targets,
+                seq_payloads=seq_payloads,
+                fold_contextual_concat=True,
+            )
+        output_seq_payloads = dict(output_seq_payloads)
+        contextual_embeddings = output_seq_payloads.pop(CONTEXTUAL_FOLD_KEY)
+        pe = self._positional_encoder
+        assert pe is not None
+        # DLRM_HSTU_FP8_POSENC_DROPOUT_FUSE: the input dropout below computed
+        # inside the position kernel (exact replica of aten's Philox stream;
+        # same output, mask, generator state and mask/scale handoff).
+        fuse_dropout = pe.concat_dropout_fuse_supported(
+            contextual_embeddings,
+            output_uih_embeddings,
+            self._input_dropout_ratio,
+            self.training,
+        )
+        with record_function("hstu_positional_encoder"):
+            if fuse_dropout:
+                if not _POSENC_DROPOUT_FUSE_LOGGED:
+                    _POSENC_DROPOUT_FUSE_LOGGED = True
+                    logger.info(
+                        "armed OK: posenc+input-dropout fusion ACTIVE (exact aten "
+                        "Philox replica, DLRM_HSTU_FP8_POSENC_DROPOUT_FUSE)"
+                    )
+                output_seq_embeddings = pe.forward_concat_dropout(
+                    max_seq_len=output_max_seq_len,
+                    seq_lengths=output_seq_lengths,
+                    seq_offsets=output_seq_offsets,
+                    seq_timestamps=output_seq_timestamps,
+                    values_left=contextual_embeddings,
+                    values_right=output_uih_embeddings,
+                    num_targets=(
+                        None if self._listwise_training else output_num_targets
+                    ),
+                    dropout_p=self._input_dropout_ratio,
+                    attach_dropout_handoff=input_dropout_fold_enabled(),
+                )
+            else:
+                output_seq_embeddings = pe.forward_concat(
+                    max_seq_len=output_max_seq_len,
+                    seq_lengths=output_seq_lengths,
+                    seq_offsets=output_seq_offsets,
+                    seq_timestamps=output_seq_timestamps,
+                    values_left=contextual_embeddings,
+                    values_right=output_uih_embeddings,
+                    num_targets=(
+                        None if self._listwise_training else output_num_targets
+                    ),
+                )
+
+        if not fuse_dropout:
+            # DLRM_HSTU_FP8_DROPOUT_MSCALE_FOLD: same as F.dropout (see _preprocess).
+            output_seq_embeddings = input_dropout(
+                output_seq_embeddings,
+                p=self._input_dropout_ratio,
+                training=self.training,
+            )
 
         return (
             output_max_seq_len,
@@ -218,8 +394,7 @@ class HSTUTransducer(HammerModule):
 
         The knob defaults off, so reaching here means it was explicitly turned
         on. A config that cannot satisfy it is then a mistake worth raising on:
-        a silent fallback would read as "the optimization simply didn't help",
-        and nobody re-checks a knob that appears to be working. A batch that is
+        a silent fallback would hide that the knob is not in effect. A batch that is
         not exactly one target per sequence is not a mistake, so that only falls
         back, logged once per distinct reason so a rare shape cannot hide.
 
@@ -301,6 +476,17 @@ class HSTUTransducer(HammerModule):
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         with record_function("hstu_output_postprocessor"):
             if targets_only:
+                if not torch.jit.is_scripting() and not is_fx_tracing():
+                    # DLRM_HSTU_FP8_GLUE_FOLD4_POST (ops/glue_fusion.py
+                    # section 5): candidate timestamps, time features, bf16
+                    # cast and cat in one kernel. None = the shipped ops.
+                    _g4_post = getattr(
+                        self._output_postprocessor, "g4_forward_targets", None
+                    )
+                    if _g4_post is not None:
+                        _g4_out = _g4_post(seq_embeddings, seq_lengths, seq_timestamps)
+                        if _g4_out is not None:
+                            return None, _g4_out
                 seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
                     seq_lengths
                 )

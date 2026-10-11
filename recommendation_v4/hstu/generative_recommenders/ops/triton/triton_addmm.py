@@ -1681,16 +1681,12 @@ _COLSUM_MIN_ROWS = 65536
 def triton_colsum(x: torch.Tensor) -> torch.Tensor:
     """sum(x, dim=0) for a tall row-major [M, N] matrix: the Linear bias grad.
 
-    aten::sum(dim=0) over a tall [M, N] matrix splits into several
-    32-bit-indexable sub-reductions. This two-stage split-M column sum uses
-    fp32 partials [S, N], then an fp32 reduction over S, then one rounding to
-    x.dtype.
+    Two-stage split-M column sum: fp32 partials [S, N], then an fp32
+    reduction over S, then one rounding to x.dtype. Same math as aten (fp32
+    accumulate, one final rounding to the input dtype); only the fp32
+    summation order differs.
 
-    Same math as aten (fp32 accumulate, one final rounding to the input
-    dtype); only the fp32 summation order differs.
-
-    Gin default ON (yambda_5b.gin item (16)); absent or
-    DLRM_HSTU_FP8_COLSUM=0 restores the aten torch.sum path.
+    Gated by DLRM_HSTU_FP8_COLSUM; unset or 0 uses torch.sum.
     """
     M, N = x.shape
     BLOCK_M, BLOCK_N, SPLITS_PER_CU = 32, 256, 2
@@ -1762,8 +1758,7 @@ def maybe_triton_addmm_fwd(
     w: torch.Tensor,
     y: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    # triton addmm is slower than torch (cublas) on AMD/Blackwell.
-    # Default to pytorch addmm on AMD/Blackwell for now.
+    # Use torch addmm on AMD/Blackwell.
     if y is None:
         return torch.mm(x, w)
     if is_sm100_plus() or torch.version.hip is not None:

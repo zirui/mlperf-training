@@ -18,8 +18,7 @@
 
 The public helpers in this module consume activations that were already
 quantized by a producer epilogue. They intentionally do not provide a
-boundary-cast convenience path: Plan 01 proved that such a path is slower than
-BF16 at the production shapes.
+boundary-cast convenience path.
 """
 
 from __future__ import annotations
@@ -106,6 +105,80 @@ _HSTU_FP8_SCALE_MODE: str = os.environ.get(
 _HSTU_FP8_TELEMETRY_INTERVAL: int = max(
     0, int(os.environ.get("DLRM_HSTU_FP8_TELEMETRY_INTERVAL", "0"))
 )
+# K=512 FP8 forward projection GEMM (ops/hip/k512_fp8_gemm.py) for the e4m3-out
+# V/Q/K (N=1536) and targets V/K (N=1024) projections in scaled_mm_fp8_out_preq,
+# instead of hipBLASLt. Default off (yambda_5b.gin turns it on). Differs only
+# in fp32 summation order: bit-identical to hipBLASLt's data-parallel tiles,
+# while hipBLASLt's stream-K tail tiles add split-K partials in another order;
+# anything it does not cover stays on hipBLASLt.
+_HSTU_FP8_FWD_K512: bool = os.environ.get("DLRM_HSTU_FP8_FWD_K512", "0") == "1"
+# K=1536 FP8 output-projection forward GEMM with the fused bf16 residual
+# (ops/hip/k1536_fp8_addmm.py) in scaled_addmm_fp8_preq's residual-fused branch,
+# instead of the hipBLASLt extension call. Default off (yambda_5b.gin turns it
+# on). Differs only in fp32 summation order, as K512; anything it does not
+# cover stays on hipBLASLt.
+_HSTU_FP8_FWD_K1536: bool = os.environ.get("DLRM_HSTU_FP8_FWD_K1536", "0") == "1"
+# U-slice forward GEMM (QKV-fused path: e4m3 normed_x [M,512] x e4m3 W_u
+# [512,512] + bf16 bias -> bf16) always on hipBLASLt's data-parallel grid.
+# torch._scaled_mm hands hipBLASLt torch's process-wide 76 MiB workspace, and
+# with that much room the stream-K selection can pick a persistent 255/256-
+# workgroup grid, whose time is GPU- and placement-dependent. The choice is a
+# deterministic function of M and the workspace size (the persistent grid's
+# partial tiles need >= 63.75 MiB), so the call sites that pass
+# data_parallel=True go through hipblaslt_scaled_mm_bias.cpp -- the same
+# hipBLASLt call torch makes, with a private DLRM_HSTU_FP8_FWD_U_DP_WS_MIB
+# workspace. Same kernel, data-parallel grid, identical output bytes. Other
+# GEMMs keep torch's workspace. Default off.
+_HSTU_FP8_FWD_U_DP: bool = os.environ.get("DLRM_HSTU_FP8_FWD_U_DP", "0") == "1"
+_HSTU_FP8_FWD_U_DP_WS_MIB: int = int(
+    os.environ.get("DLRM_HSTU_FP8_FWD_U_DP_WS_MIB", "32")
+)
+if _HSTU_FP8_FWD_U_DP and _HSTU_FP8_FWD_U_DP_WS_MIB <= 0:
+    raise ValueError(
+        "DLRM_HSTU_FP8_FWD_U_DP_WS_MIB must be a positive number of MiB, got "
+        f"{_HSTU_FP8_FWD_U_DP_WS_MIB}"
+    )
+_HSTU_FP8_FWD_U_DP_WS_BYTES: int = max(0, _HSTU_FP8_FWD_U_DP_WS_MIB) << 20
+# Partial-tile buffer of the 255-workgroup persistent grid at the 256x256 macro
+# tile (255 x 256 x 256 x 4 B). A workspace at least this large leaves the
+# persistent grid selectable again.
+_U_DP_PERSISTENT_PARTIALS_BYTES: int = 255 * 256 * 256 * 4
+
+
+def _env_on(name: str) -> bool:
+    """Default-on kill switch: off only for an explicit 0/false/off/no."""
+    value = os.environ.get(name, "").strip().lower()
+    return value not in ("0", "false", "off", "no")
+
+
+def _env_true(name: str) -> bool:
+    """Default-off gate: on only for an explicit 1/true/on/yes (gin binding)."""
+    value = os.environ.get(name, "").strip().lower()
+    return value in ("1", "true", "on", "yes")
+
+
+# Fused weight-shadow refresh. Default OFF in code;
+# the gin binding apply_env_bootstrap.DLRM_HSTU_FP8_WSHADOW_FUSED turns it on
+# (BATCH is a refinement, default on once FUSED is on). The aten
+# chain below (_pack_weight_layout + calibrated_scale + quantize_with_scale)
+# takes ~10 launches per (weight, layout);
+# triton_fp8_wshadow.refresh_shadows produces the same bytes (same
+# amax, same scale formula -- including aten's multiply-by-(float)(1/448.0)
+# for the CPU-scalar division -- same IEEE division, clamp and software
+# RNE e4m3 cast) in two launches. With BATCH on, the first stale shadow of a
+# step also refreshes every other stale shadow seen before on the same device,
+# dtype and stream; each still re-validates its weight version when used.
+# Fail-closed: if the fused path raises (Triton compile/launch), it is disabled
+# for the rest of the process with one warning and the aten chain below takes
+# over (bitwise by construction); no other lowering is ever substituted.
+# Kill switches:
+#   DLRM_HSTU_FP8_WSHADOW_FUSED=0  restores the aten chain verbatim
+#   DLRM_HSTU_FP8_WSHADOW_BATCH=0  keeps the fused kernels, one shadow per call
+# Arming line (rank log, first fused refresh): "DLRMV4 armed OK: fp8 wshadow
+# fused (batch=1|0)"; then, with BATCH on, one "DLRMV4 fp8 wshadow batch: N
+# weight shadows refreshed in one call" at the first multi-shadow batch.
+_HSTU_FP8_WSHADOW_FUSED: bool = _env_true("DLRM_HSTU_FP8_WSHADOW_FUSED")
+_HSTU_FP8_WSHADOW_BATCH: bool = _env_on("DLRM_HSTU_FP8_WSHADOW_BATCH")
 
 
 @dataclass
@@ -116,6 +189,9 @@ class _WeightCacheEntry:
     shape: torch.Size
     quantized_column_major: torch.Tensor
     scale: torch.Tensor
+    # Batch-refresh bookkeeping (fused path); None on entries it must not touch.
+    layout: Optional[Tuple[Tuple[int, int], ...]] = None
+    stream_id: Optional[int] = None
 
 
 @dataclass
@@ -131,6 +207,11 @@ _weight_cache: Dict[Tuple[object, ...], _WeightCacheEntry] = {}
 _packed_weight_cache: Dict[Tuple[object, ...], _PackedWeightCacheEntry] = {}
 _cache_hits: int = 0
 _cache_misses: int = 0
+# Shadows refreshed by the fused path as members of another call's batch.
+_wshadow_batched: int = 0
+_wshadow_armed_logged: bool = False
+_wshadow_batch_logged: bool = False
+_wshadow_module_ref: Optional[object] = None
 _fp8_one_by_device: Dict[int, torch.Tensor] = {}
 _scale_value_cache: Dict[Tuple[object, ...], float] = {}
 _inverse_scale_cache: Dict[
@@ -145,6 +226,32 @@ _capability_sites: set[str] = set()
 _resolved_logged: bool = False
 _capability_contracts: Dict[str, dict[str, object]] = {}
 _residual_workspaces: Dict[int, torch.Tensor] = {}
+_u_dp_workspaces: Dict[int, torch.Tensor] = {}
+_u_dp_logged: set[Tuple[str, str]] = set()
+
+
+def _u_dp_print(message: str) -> None:
+    print(f"[hstu-fp8-fwd] {message}", flush=True)
+
+
+if _HSTU_FP8_FWD_U_DP:
+    # Startup record of what this process requested (the ARMED line follows on
+    # the first engaged call per device).
+    _u_dp_print(
+        f"requested: u_dp=1 workspace={_HSTU_FP8_FWD_U_DP_WS_MIB} MiB"
+        + (
+            " -> INERT without DLRM_HSTU_FP8_FUSE_QKV=1 (the U slice exists "
+            "only on the QKV-fused forward)"
+            if not _HSTU_FP8_FUSE_QKV
+            else ""
+        )
+        + (
+            " -> WARNING workspace >= 63.75 MiB, the persistent grid stays "
+            "selectable"
+            if _HSTU_FP8_FWD_U_DP_WS_BYTES >= _U_DP_PERSISTENT_PARTIALS_BYTES
+            else ""
+        )
+    )
 
 
 def hstu_fp8_gemm_enabled() -> bool:
@@ -172,7 +279,7 @@ def hstu_fp8_attention_enabled() -> bool:
 
 
 def refuse_fp8_with_flydsl_attention_forward() -> None:
-    """No-op. Kept so old call sites and tests still import a named gate.
+    """No-op gate, kept for import compatibility.
 
     ``DLRM_HSTU_FP8_FWD=1`` plus ``HSTU_ATTN_FWD=flydsl`` (the gin default)
     selects the FlyDSL e4m3 attention forward (fused-silu epilogue included).
@@ -529,7 +636,7 @@ def calibrate_scale_buffer(
 
     if _HSTU_FP8_SCALE_MODE != "frozen":
         raise RuntimeError(
-            f"unsupported Plan 08 FP8 scale mode: {_HSTU_FP8_SCALE_MODE}"
+            f"unsupported FP8 scale mode: {_HSTU_FP8_SCALE_MODE}"
         )
     scale_margin = _HSTU_FP8_ASCALE_MARGIN if margin is None else margin
     amax = (
@@ -663,6 +770,40 @@ def _pack_weight_layout(weight: torch.Tensor, layout: _WeightLayout) -> torch.Te
     return packed
 
 
+# DEFAULT OFF: the weight-shadow refresh below as two
+# Triton kernels (fp8_helpers_fused.shadow_refresh) instead of the ~9-kernel
+# torch chain; byte-identical shadow and scale (see that module's contract).
+_SHADOW_FUSED: bool = os.environ.get("DLRM_HSTU_FP8_SHADOW_FUSED", "0") == "1"
+_shadow_fused_logged: set = set()
+
+
+def _shadow_fused_ok(weight: torch.Tensor, layout: _WeightLayout) -> bool:
+    return (
+        weight.is_cuda
+        and weight.dim() == 2
+        and weight.dtype in (torch.float32, torch.bfloat16)
+        and 1 <= len(layout) <= 4
+        and _FP8_E4M3 is torch.float8_e4m3fn
+    )
+
+
+def _shadow_refresh_fused(
+    weight: torch.Tensor, layout: _WeightLayout
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    from generative_recommenders.ops.triton import fp8_helpers_fused
+
+    key = (str(weight.device), tuple(weight.shape), weight.dtype, layout)
+    if key not in _shadow_fused_logged:
+        _shadow_fused_logged.add(key)
+        print(
+            f"[hstu-fp8] ARMED shadow_fused on {weight.device}: "
+            f"w={tuple(weight.shape)}:{weight.dtype} layout={layout} "
+            "(2 kernels: tile |w| max + scale/transpose/e4m3; bitwise)",
+            flush=True,
+        )
+    return fp8_helpers_fused.shadow_refresh(weight.detach(), layout)
+
+
 def _get_weight_shadow(
     weight: torch.Tensor,
     layout: Optional[_WeightLayout] = None,
@@ -688,14 +829,25 @@ def _get_weight_shadow(
         return entry.quantized_column_major, entry.scale
 
     _cache_misses += 1
-    with record_function("## hstu_fp8_weight_shadow_refresh ##"):
-        packed_weight = _pack_weight_layout(weight, normalized_layout)
-        scale = calibrated_scale(packed_weight, margin=1.0)
-        quantized = quantize_with_scale(
-            packed_weight,
-            scale,
-            column_major=True,
+    if _HSTU_FP8_WSHADOW_FUSED and _wshadow_fused_ok(weight):
+        fused = _refresh_weight_shadows_fused(
+            weight, normalized_layout, key, version
         )
+        if fused is not None:
+            return fused
+    with record_function("## hstu_fp8_weight_shadow_refresh ##"):
+        # Precedence: the batched WSHADOW_FUSED path above takes every call it
+        # accepts; SHADOW_FUSED only refreshes the shadows it declines or after it disabled itself.
+        if _SHADOW_FUSED and _shadow_fused_ok(weight, normalized_layout):
+            quantized, scale = _shadow_refresh_fused(weight, normalized_layout)
+        else:
+            packed_weight = _pack_weight_layout(weight, normalized_layout)
+            scale = calibrated_scale(packed_weight, margin=1.0)
+            quantized = quantize_with_scale(
+                packed_weight,
+                scale,
+                column_major=True,
+            )
     _weight_cache[key] = _WeightCacheEntry(
         ref=weakref.ref(weight),
         version=version,
@@ -705,6 +857,115 @@ def _get_weight_shadow(
         scale=scale,
     )
     return quantized, scale
+
+
+def _wshadow_module():
+    global _wshadow_module_ref
+    if _wshadow_module_ref is None:
+        from generative_recommenders.ops.triton import triton_fp8_wshadow
+
+        _wshadow_module_ref = triton_fp8_wshadow
+    return _wshadow_module_ref
+
+
+def _wshadow_fused_ok(weight: torch.Tensor) -> bool:
+    if not weight.is_cuda or torch.compiler.is_compiling():
+        return False
+    return _wshadow_module().fused_shadow_supported(weight)
+
+
+def _refresh_weight_shadows_fused(
+    weight: torch.Tensor,
+    layout: _WeightLayout,
+    key: Tuple[object, ...],
+    version: int,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Fused refresh of `weight`'s shadow, plus (BATCH) every other stale one.
+
+    A batch member is an existing cache entry whose weight is alive, on the
+    same device/dtype, was last refreshed on the current stream, still has the
+    geometry of its key, and whose version or data_ptr moved. Its new shadow
+    is computed from the weight's bits *now*, exactly as its own call would;
+    if the weight changes again before that call, the version check there
+    misses and refreshes it once more.
+
+    Returns None (and disables the fused path for the process) if the fused
+    kernels raise; the caller then runs the aten chain. Nothing is cached
+    before refresh_shadows returns, so a failed batch leaves no partial state.
+    """
+    global _wshadow_batched, _wshadow_armed_logged, _wshadow_batch_logged
+    global _HSTU_FP8_WSHADOW_FUSED
+    module = _wshadow_module()
+    stream_id = torch.cuda.current_stream(weight.device).stream_id
+    jobs = [(weight, layout, key, version)]
+    if _HSTU_FP8_WSHADOW_BATCH:
+        for other_key, entry in _weight_cache.items():
+            if other_key == key or entry.layout is None:
+                continue
+            if entry.stream_id != stream_id:
+                continue
+            other = entry.ref()
+            if (
+                other is None
+                or other.device != weight.device
+                or other.dtype != weight.dtype
+                or tuple(other.shape) != other_key[2]
+                or tuple(other.stride()) != other_key[3]
+                or not module.fused_shadow_supported(other)
+            ):
+                continue
+            other_version = _weight_version(other)
+            if (
+                entry.version == other_version
+                and entry.data_ptr == other.data_ptr()
+                and entry.shape == other.shape
+            ):
+                continue
+            jobs.append((other, entry.layout, other_key, other_version))
+    try:
+        with record_function("## hstu_fp8_weight_shadow_refresh ##"):
+            results = module.refresh_shadows(
+                [job[0] for job in jobs], [job[1] for job in jobs], margin=1.0
+            )
+    except Exception as exc:  # fail closed to the aten chain, never another lowering
+        _HSTU_FP8_WSHADOW_FUSED = False
+        logger.warning(
+            "DLRMV4 fp8 wshadow fused DISABLED for this process (%s: %s); "
+            "the aten chain (bitwise reference) refreshes every shadow from "
+            "here on",
+            type(exc).__name__,
+            str(exc)[:300],
+        )
+        return None
+    for (w, w_layout, w_key, w_version), (quantized, scale) in zip(jobs, results):
+        _weight_cache[w_key] = _WeightCacheEntry(
+            ref=weakref.ref(w),
+            version=w_version,
+            data_ptr=w.data_ptr(),
+            shape=w.shape,
+            quantized_column_major=quantized,
+            scale=scale,
+            layout=w_layout,
+            stream_id=stream_id,
+        )
+    _wshadow_batched += len(jobs) - 1
+    if not _wshadow_armed_logged:
+        _wshadow_armed_logged = True
+        logger.info(
+            "DLRMV4 armed OK: fp8 wshadow fused (batch=%d) -- weight shadows "
+            "refreshed by 2 Triton launches per refresh call (amax partials + "
+            "scale/transpose/e4m3), bitwise the aten chain (kill switches "
+            "DLRM_HSTU_FP8_WSHADOW_FUSED=0, DLRM_HSTU_FP8_WSHADOW_BATCH=0)",
+            int(_HSTU_FP8_WSHADOW_BATCH),
+        )
+    if not _wshadow_batch_logged and len(jobs) > 1:
+        _wshadow_batch_logged = True
+        logger.info(
+            "DLRMV4 fp8 wshadow batch: %d weight shadows refreshed in one "
+            "call (2 launches per 8 source weights)",
+            len(jobs),
+        )
+    return results[0]
 
 
 def packed_weight_for_layout(
@@ -737,7 +998,7 @@ def packed_weight_for_layout(
 
 
 def clear_fp8_weight_cache() -> None:
-    global _cache_hits, _cache_misses
+    global _cache_hits, _cache_misses, _wshadow_batched
     _weight_cache.clear()
     _packed_weight_cache.clear()
     _fp8_one_by_device.clear()
@@ -752,6 +1013,7 @@ def clear_fp8_weight_cache() -> None:
     _capability_contracts.clear()
     _cache_hits = 0
     _cache_misses = 0
+    _wshadow_batched = 0
 
 
 def fp8_weight_cache_stats() -> dict[str, int]:
@@ -768,6 +1030,7 @@ def fp8_weight_cache_stats() -> dict[str, int]:
         "packed_entries": len(_packed_weight_cache),
         "hits": _cache_hits,
         "misses": _cache_misses,
+        "batched": _wshadow_batched,
     }
 
 
@@ -953,9 +1216,8 @@ def record_fp8_capability(site: str) -> None:
     """Note that a fused production site ran, once per site per rank.
 
     The capability FILE is what a certification run collects, and it is still
-    written only when asked for. The LOG LINE is for every other run: until it
-    existed, a production FP8 run left no record that it was FP8, so a BF16 rate
-    reported under an FP8 label was indistinguishable from the real thing.
+    written only when asked for. The LOG LINE is for every other run, so the
+    log records that a fused FP8 site actually ran.
     """
 
     if site in _capability_sites:
@@ -1056,21 +1318,18 @@ def _scaled_mm_call(a: torch.Tensor, b: torch.Tensor, kwargs: Dict):
     The first FP8 GEMM at a new shape makes hipBLASLt's analytical heuristic
     print "Warning: Latency not found for MI_M=16, MI_N=16, MI_K=128,
     mi_input_type=BFloat8Float8_fnuz. Returning latency value of 32 (really
-    slow)." about 170 times, through an unbuffered std::cerr that issues one
-    write(2) per `<<` token (the torn "16ITER35PROBE" fragments in the log show
-    it). No environment variable gates it in hipBLASLt 1.2 / ROCm 7.2.
-    Standalone, those writes cost ~0.2 ms. In the trainer, eight ranks share a
-    single stderr pipe into launch_slurm.sh's sed|tee, and the same query costs
-    8 ms of on-CPU time (median of 1703 calls, zero context switches). M is the
-    jagged token count and changes every step, so every step pays it several
-    times on the main thread while the GPU queue is shallow.
+    slow)." many times, through an unbuffered std::cerr that issues one
+    write(2) per `<<` token. No environment variable gates it in hipBLASLt
+    1.2 / ROCm 7.2. With several ranks sharing one stderr pipe these writes
+    block the main thread. M is the jagged token count and changes every step,
+    so new shapes keep appearing.
 
     Only the chatter changes. The GEMM, the heuristic and the kernel it picks
     are untouched, so the output is bit-identical. Redirection applies only to
     a shape key not seen recently (repeat shapes hit hipBLASLt's cache and
     print nothing). A failed quiet call is re-issued with stderr attached so
     any real diagnostic still reaches the log. DLRM_HSTU_FP8_QUIET_HEURISTIC=0
-    restores the old behaviour.
+    disables the redirection.
     """
     if not _HSTU_FP8_QUIET_HEURISTIC or torch.compiler.is_compiling():
         return torch._scaled_mm(a, b, **kwargs)
@@ -1094,8 +1353,7 @@ def _scaled_mm_stderr_silenced(a: torch.Tensor, b: torch.Tensor, kwargs: Dict):
     global _devnull_fd
     # fd 2 is process-wide. The lock stops two threads from interleaving their
     # save/restore, which could otherwise leave fd 2 pointing at /dev/null.
-    # Anything another thread writes to stderr inside this window (~1 ms) is
-    # lost, which is the accepted cost.
+    # Anything another thread writes to stderr inside this window is lost.
     with _quiet_lock:
         if _devnull_fd is None:
             _devnull_fd = os.open(os.devnull, os.O_WRONLY)
@@ -1150,11 +1408,74 @@ def prebuild_extensions() -> bool:
     not paid inside the timed region on the first FP8 step. Same module, same
     build flags and the same lru_cache entry the lazy path returns, so the
     compiled code is identical. Returns True if something was built/loaded.
+
+    Also builds the FP8 uvqk/vk token-major wgrad extension when (and only
+    when) DLRM_HSTU_FP8_BWD_UVQK=1 with DLRM_HSTU_FP8_BWD_UVQK_WGRAD=fp8t is
+    requested (bwd_fp8.prebuild_uvqk_extension; a no-op otherwise), the
+    U-forward data-parallel extension when DLRM_HSTU_FP8_FWD_U_DP=1, the
+    K=512 forward GEMM library when DLRM_HSTU_FP8_FWD_K512=1
+    (ops/hip/k512_fp8_gemm.prebuild), the K=1536 out-projection forward
+    GEMM library when DLRM_HSTU_FP8_FWD_K1536=1 (ops/hip/k1536_fp8_addmm.prebuild),
+    and the L11 fused out-proj dgrad + LN*U*dropout backward library with its
+    synthetic-data self-check when DLRM_HSTU_FP8_BWD_OUTPROJ_LNMD_FUSED=1
+    (triton_hstu_linear.prebuild_l11; a no-op otherwise).
     """
+    built = False
     if _HSTU_FP8_FUSE_RESIDUAL:
         _residual_fused_extension()
-        return True
-    return False
+        built = True
+    if _HSTU_FP8_FWD_U_DP and _HSTU_FP8_FUSE_QKV:
+        # Raises if it cannot build/load: an armed run must not silently keep
+        # the persistent-grid path. Only the QKV-fused FP8 forward calls it,
+        # so a run with that forward off never builds it.
+        _u_dp_extension()
+        _u_dp_print(
+            "prebuild: u_dp extension (dlrm_hstu_fp8_scaled_mm_bias) built/loaded"
+        )
+        built = True
+    from generative_recommenders.ops.triton import bwd_fp8
+
+    if bwd_fp8.prebuild_uvqk_extension():
+        built = True
+    # DLRM_HSTU_FP8_BWD_WGRAD_CK_W3=1 (default off) with the NN-mode FP8 out-proj
+    # wgrad: the custom W3 kernel library (wgrad_ck_w3.py); a no-op otherwise.
+    from generative_recommenders.ops.triton import triton_hstu_linear
+
+    if triton_hstu_linear.prebuild_wgrad_ck_w3():
+        built = True
+    if _HSTU_FP8_FWD_K512:
+        # DLRM_HSTU_FP8_FWD_K512: hipcc build of both N, plus one launch on
+        # synthetic zeros (k512_fp8_gemm.prebuild). A build/self-check failure
+        # is latched there, so the forward then declines to hipBLASLt;
+        # fail-closed raises here. A device fault always raises.
+        from generative_recommenders.ops.hip import k512_fp8_gemm
+
+        try:
+            if k512_fp8_gemm.prebuild():
+                built = True
+        except k512_fp8_gemm.PrebuildError:
+            if _HSTU_FP8_FAIL_CLOSED:
+                raise
+    if _HSTU_FP8_FWD_K1536 and _HSTU_FP8_FUSE_RESIDUAL:
+        # DLRM_HSTU_FP8_FWD_K1536: hipcc build plus one launch on synthetic
+        # zeros (k1536_fp8_addmm.prebuild); latched on failure, as for K512.
+        from generative_recommenders.ops.hip import k1536_fp8_addmm
+
+        try:
+            if k1536_fp8_addmm.prebuild():
+                built = True
+        except k1536_fp8_addmm.PrebuildError:
+            if _HSTU_FP8_FAIL_CLOSED:
+                raise
+    # Fused out-proj dgrad + LN*U*dropout backward: hipcc
+    # build + load + synthetic self-check; a no-op unless
+    # DLRM_HSTU_FP8_BWD_OUTPROJ_LNMD_FUSED=1. Last, after every other build:
+    # its self-check launches the FP8 dgrad GEMM and the LN*U*dropout backward
+    # kernels on private synthetic tensors (before run_blas_warmup and the
+    # first training step; no model, data, RNG or FP8 scale state).
+    if triton_hstu_linear.prebuild_l11():
+        built = True
+    return built
 
 
 def _residual_workspace(device: torch.device) -> torch.Tensor:
@@ -1172,6 +1493,166 @@ def _residual_workspace(device: torch.device) -> torch.Tensor:
     return workspace
 
 
+@functools.lru_cache(maxsize=1)
+def _u_dp_extension():
+    source = Path(__file__).with_name("hipblaslt_scaled_mm_bias.cpp")
+    build_directory = Path("/tmp/dlrm_hstu_fp8_scaled_mm_bias")
+    build_directory.mkdir(parents=True, exist_ok=True)
+    try:
+        from torch.utils.cpp_extension import load
+
+        return load(
+            name="dlrm_hstu_fp8_scaled_mm_bias",
+            sources=[str(source)],
+            extra_include_paths=["/opt/rocm/include"],
+            extra_cflags=["-O3"],
+            extra_ldflags=[
+                "-L/opt/rocm/lib",
+                "-lhipblaslt",
+                "-lamdhip64",
+            ],
+            build_directory=str(build_directory),
+            verbose=False,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "requested FP8 U-forward data-parallel hipBLASLt path "
+            "(DLRM_HSTU_FP8_FWD_U_DP=1) is unavailable"
+        ) from error
+
+
+def _u_dp_workspace(device: torch.device) -> torch.Tensor:
+    # One per device. Calls are ordered on the stream that issues them; at the
+    # data-parallel grid hipBLASLt needs no partials, so the buffer is only the
+    # size the heuristic and the call are told about.
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    workspace = _u_dp_workspaces.get(device_index)
+    if workspace is None:
+        workspace = torch.empty(
+            _HSTU_FP8_FWD_U_DP_WS_BYTES,
+            dtype=torch.uint8,
+            device=device,
+        )
+        _u_dp_workspaces[device_index] = workspace
+    return workspace
+
+
+def _u_dp_ineligible_reason(
+    activation_fp8: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    residual: Optional[torch.Tensor],
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> Optional[str]:
+    if residual is not None:
+        return "residual epilogue"
+    if bias is None or bias.dim() != 1:
+        return "no 1-D bias"
+    if out_dtype != torch.bfloat16 or bias.dtype != torch.bfloat16:
+        return "output/bias not bf16"
+    if not bias.is_contiguous():
+        return "bias not contiguous"
+    if not activation_fp8.is_contiguous():
+        return "activation not contiguous"
+    if (
+        weight_fp8.dtype != fp8_e4m3_dtype()
+        or weight_fp8.stride() != (1, weight_fp8.shape[0])
+    ):
+        return "weight shadow not column-major e4m3"
+    for scale in (scale_a, scale_b):
+        if (
+            scale.dtype != torch.float32
+            or scale.numel() != 1
+            or scale.device != activation_fp8.device
+        ):
+            return "scales not single-element fp32 on the activation device"
+    if bias.device != activation_fp8.device:
+        return "bias on another device"
+    if torch.compiler.is_compiling():
+        return "inside torch.compile"
+    return None
+
+
+def _call_stderr_silenced(fn):
+    """_scaled_mm_stderr_silenced for an arbitrary hipBLASLt call."""
+    global _devnull_fd
+    with _quiet_lock:
+        if _devnull_fd is None:
+            _devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        saved = os.dup(2)
+        try:
+            os.dup2(_devnull_fd, 2)
+            try:
+                return fn()
+            finally:
+                os.dup2(saved, 2)
+        finally:
+            os.close(saved)
+
+
+def _u_dp_scaled_mm_bias(
+    activation_fp8: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    bias: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+) -> torch.Tensor:
+    extension = _u_dp_extension()
+    device = activation_fp8.device
+    workspace = _u_dp_workspace(device)
+
+    def call() -> torch.Tensor:
+        return extension.scaled_mm_bias(
+            activation_fp8, weight_fp8, bias, scale_a, scale_b, workspace
+        )
+
+    if not _HSTU_FP8_QUIET_HEURISTIC or torch.compiler.is_compiling():
+        output = call()
+    else:
+        # Same new-shape-only stderr silencing as _scaled_mm_call (hipBLASLt's
+        # heuristic chatter on a new problem); its own key space.
+        key = (
+            "u_dp",
+            device.index,
+            tuple(activation_fp8.shape),
+            tuple(weight_fp8.shape),
+            workspace.numel(),
+        )
+        if key in _quiet_seen:
+            _quiet_seen.move_to_end(key)
+            output = call()
+        else:
+            try:
+                output = _call_stderr_silenced(call)
+            except Exception:
+                # Re-issue with stderr attached so the real diagnostic reaches
+                # the log; a second failure propagates (no fallback to
+                # torch._scaled_mm).
+                output = call()
+            else:
+                _quiet_seen[key] = None
+                if len(_quiet_seen) > _QUIET_SEEN_MAX:
+                    _quiet_seen.popitem(last=False)
+    if ("armed", str(device)) not in _u_dp_logged:
+        # After the first call returned: the line means the extension ran.
+        _u_dp_logged.add(("armed", str(device)))
+        _u_dp_print(
+            f"ARMED u_dp on {device}: hipblaslt_scaled_mm_bias (workspace "
+            f"{workspace.numel() >> 20} MiB, heuristic top-1 -> data-parallel "
+            f"grid), M={activation_fp8.shape[0]} N={weight_fp8.shape[1]} "
+            f"K={activation_fp8.shape[1]}"
+        )
+    return output
+
+
 def scaled_addmm_fp8_preq(
     activation_fp8: torch.Tensor,
     scale_a: torch.Tensor,
@@ -1180,8 +1661,14 @@ def scaled_addmm_fp8_preq(
     *,
     out_dtype: torch.dtype = torch.bfloat16,
     weight_layout: Optional[_WeightLayout] = None,
+    data_parallel: bool = False,
 ) -> torch.Tensor:
-    """FP8 GEMM consuming an activation emitted by a producer epilogue."""
+    """FP8 GEMM consuming an activation emitted by a producer epilogue.
+
+    ``data_parallel=True`` marks a call site that may use the data-parallel
+    hipBLASLt path (DLRM_HSTU_FP8_FWD_U_DP=1; 1-D bf16 bias, bf16 output). It is
+    a no-op while that knob is off or the call does not qualify.
+    """
 
     normalized_layout = _normalize_layout(weight, weight_layout)
     output_columns = sum(end - start for start, end in normalized_layout)
@@ -1242,6 +1729,12 @@ def scaled_addmm_fp8_preq(
                 "requested FP8 residual fusion requires contiguous E4M3 "
                 "activation, column-major E4M3 weight, and contiguous BF16 residual"
             )
+        if _HSTU_FP8_FWD_K1536:
+            output = _k1536_res_or_none(
+                activation_fp8, weight_fp8, residual, scale_a, scale_b
+            )
+            if output is not None:
+                return output
         return _residual_fused_extension().scaled_addmm(
             activation_fp8,
             weight_fp8,
@@ -1251,6 +1744,21 @@ def scaled_addmm_fp8_preq(
             _residual_workspace(activation_fp8.device),
             _HSTU_FP8_FUSE_RESIDUAL_ALGORITHM,
         )
+    if data_parallel and _HSTU_FP8_FWD_U_DP:
+        reason = _u_dp_ineligible_reason(
+            activation_fp8, weight_fp8, bias, residual, scale_a, scale_b, out_dtype
+        )
+        if reason is None:
+            assert bias is not None
+            return _u_dp_scaled_mm_bias(
+                activation_fp8, weight_fp8, bias, scale_a, scale_b
+            )
+        if (reason, str(activation_fp8.device)) not in _u_dp_logged:
+            _u_dp_logged.add((reason, str(activation_fp8.device)))
+            _u_dp_print(
+                f"u_dp NOT engaged on {activation_fp8.device}: {reason} -> "
+                "torch._scaled_mm"
+            )
     output = _scaled_mm(
         activation_fp8,
         weight_fp8,
@@ -1260,6 +1768,141 @@ def scaled_addmm_fp8_preq(
         bias=bias,
     )
     return output if residual is None else output + residual
+
+
+def _k1536_res_or_none(
+    activation_fp8: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    residual: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """DLRM_HSTU_FP8_FWD_K1536=1: the K=1536 out-projection GEMM + residual in
+    place of the residual-fused hipBLASLt extension call, on exactly the
+    operands that call receives, or None (the caller then runs hipBLASLt).
+
+    weight_fp8 is the _get_weight_shadow view [K, N] with stride (1, K), i.e. an
+    [N, K] row-major e4m3 buffer seen transposed, so weight_fp8.t() is the
+    kernel's W. The extension computes D = (scale_b * scale_a) * (A x W) + C in
+    fp32 with alpha = beta = 1 (scale_a = activation scale, scale_b = weight
+    scale); the kernel's product is commutative-exact. Declines are logged once
+    per reason kind; an unavailable library raises under
+    DLRM_HSTU_FP8_FAIL_CLOSED=1 and is declined otherwise.
+    """
+
+    from generative_recommenders.ops.hip import k1536_fp8_addmm as k1536
+
+    reason: Optional[Tuple[str, str]] = None
+    if torch.compiler.is_compiling():
+        reason = ("compile", "torch.compile tracing (ctypes launch)")
+    elif (
+        weight_fp8.dim() != 2
+        or tuple(weight_fp8.shape) != (k1536.K, k1536.N)
+        or weight_fp8.stride() != (1, k1536.K)
+    ):
+        reason = (
+            "weight",
+            f"weight_fp8 {tuple(weight_fp8.shape)} stride {weight_fp8.stride()} "
+            f"(needs the [{k1536.N}, {k1536.K}] row-major shadow seen transposed)",
+        )
+    else:
+        reason = k1536.ineligible_reason(
+            activation_fp8, weight_fp8.t(), residual, scale_a, scale_b
+        )
+    if reason is not None:
+        k1536.log_decline_once(reason[0], reason[1])
+        return None
+    try:
+        kernel = k1536.kernel()
+    except Exception as error:
+        if _HSTU_FP8_FAIL_CLOSED:
+            raise RuntimeError(
+                "DLRM_HSTU_FP8_FWD_K1536=1 but the K=1536 FP8 GEMM is unavailable"
+            ) from error
+        k1536.log_decline_once("library", str(error))
+        return None
+    k1536.log_armed_once(kernel, activation_fp8.shape[0])
+    return k1536.launch(
+        kernel, activation_fp8, weight_fp8.t(), residual, scale_a, scale_b
+    )
+
+
+def _k512_fwd_or_none(
+    activation_fp8: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    scale_result: Optional[torch.Tensor],
+    output_scale_mode: str,
+) -> Optional[torch.Tensor]:
+    """DLRM_HSTU_FP8_FWD_K512=1: the K=512 forward GEMM in place of the
+    hipBLASLt call below, on exactly the operands that call receives, or None
+    (the caller then runs hipBLASLt).
+
+    weight_fp8 is the _get_weight_shadow view: [K, N] with stride (1, K), i.e.
+    an [N, K] row-major e4m3 buffer seen transposed, so weight_fp8.t() is the
+    kernel's B. Covered: input_scale backend mode (no scale_result), no fast
+    accumulation, K=512, N in (1024, 1536), contiguous e4m3 activation, bf16
+    bias. Anything else is declined with one log line per reason kind; an
+    unavailable library raises under DLRM_HSTU_FP8_FAIL_CLOSED=1 and is
+    declined otherwise.
+    """
+
+    from generative_recommenders.ops.hip import k512_fp8_gemm as k512
+
+    k_dim = activation_fp8.shape[-1]
+    n_dim = weight_fp8.shape[-1]
+    if k_dim != k512.K or n_dim not in k512.SUPPORTED_N:
+        k512.log_decline_once(
+            f"shape:{k_dim}x{n_dim}",
+            f"K={k_dim} N={n_dim} (the kernel covers K={k512.K}, N in "
+            f"{k512.SUPPORTED_N})",
+        )
+        return None
+    reason: Optional[Tuple[str, str]] = None
+    if output_scale_mode != "input_scale" or scale_result is not None:
+        reason = (
+            "mode",
+            f"output_scale_mode={output_scale_mode} scale_result="
+            f"{'set' if scale_result is not None else 'None'} (needs "
+            "input_scale and no scale_result)",
+        )
+    elif _HSTU_FP8_FAST_ACCUM:
+        reason = (
+            "fastacc",
+            "DLRM_HSTU_FP8_GEMM_FASTACC=1 (parity is defined against "
+            "use_fast_accum=False)",
+        )
+    elif torch.compiler.is_compiling():
+        reason = ("compile", "torch.compile tracing (ctypes launch)")
+    elif weight_fp8.dim() != 2 or weight_fp8.stride() != (1, k512.K):
+        reason = (
+            "weight",
+            f"weight_fp8 {tuple(weight_fp8.shape)} stride {weight_fp8.stride()} "
+            f"(needs the [N, {k512.K}] row-major shadow, stride (1, {k512.K}))",
+        )
+    else:
+        reason = k512.ineligible_reason(
+            activation_fp8, weight_fp8.t(), bias, scale_a, scale_b
+        )
+    if reason is not None:
+        k512.log_decline_once(f"N{n_dim}:{reason[0]}", f"N={n_dim} {reason[1]}")
+        return None
+    assert bias is not None
+    try:
+        kernel = k512.kernel(n_dim)
+    except Exception as error:
+        if _HSTU_FP8_FAIL_CLOSED:
+            raise RuntimeError(
+                "DLRM_HSTU_FP8_FWD_K512=1 but the K=512 FP8 GEMM is unavailable"
+            ) from error
+        k512.log_decline_once(f"N{n_dim}:library", f"N={n_dim} {error}")
+        return None
+    k512.log_armed_once(kernel, activation_fp8.shape[0])
+    return k512.launch(
+        kernel, activation_fp8, weight_fp8.t(), bias, scale_a, scale_b
+    )
 
 
 def scaled_mm_fp8_out_preq(
@@ -1360,15 +2003,27 @@ def scaled_mm_fp8_out_preq(
                 None if host_scale_values is None else host_scale_values[1]
             ),
         )
-    output = _scaled_mm(
-        activation_fp8,
-        weight_fp8,
-        effective_scale_a,
-        scale_b,
-        out_dtype=fp8_e4m3_dtype(),
-        bias=effective_bias,
-        scale_result=scale_result,
-    )
+    output = None
+    if _HSTU_FP8_FWD_K512:
+        output = _k512_fwd_or_none(
+            activation_fp8,
+            weight_fp8,
+            effective_scale_a,
+            scale_b,
+            effective_bias,
+            scale_result,
+            output_scale_mode,
+        )
+    if output is None:
+        output = _scaled_mm(
+            activation_fp8,
+            weight_fp8,
+            effective_scale_a,
+            scale_b,
+            out_dtype=fp8_e4m3_dtype(),
+            bias=effective_bias,
+            scale_result=scale_result,
+        )
     if output_scale is not None:
         maybe_record_fp8_telemetry(
             f"qkv_output:{id(weight)}:{tuple(weight.shape)}:{normalized_layout}",

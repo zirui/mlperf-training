@@ -303,8 +303,7 @@ def _on_trace_ready_fn(
     """Create the on_trace_ready callback that exports a chrome trace to disk.
 
     Filename follows ``trace_step{step}_rank{rank}.json`` so multi-rank
-    captures don't collide and ``scripts/stitch_traces.py`` can merge them
-    by step number.
+    captures don't collide and can be merged by step number.
 
     The ``{step}`` label:
 
@@ -555,8 +554,7 @@ class Profiler:
 
         * the FIRST recorded step. ``align_ranks`` drains the device and
           barriers before it, so it starts with an empty launch queue and no
-          host lead; at 1n it ran ~5% faster than the steps after it.
-          ``skip_head >= 1`` keeps it out of the export.
+          host lead. ``skip_head >= 1`` keeps it out of the export.
         * the LAST recorded step. Its GPU work finishes after the host has
           entered the next step, and the session teardown lands there. At
           least one recorded step past the export keeps both out
@@ -661,11 +659,13 @@ class Profiler:
 
         Why. Arming Kineto is per-process and unsynchronized, so the first
         RECORDED step otherwise absorbs the cost of turning the profiler on,
-        which real training never pays.
+        which real training never pays, drawn as exposed collective time that
+        does not exist untraced.
 
-        The barrier relocates that skew into the WARMUP step, which is never
-        exported. The first recorded step is a boundary step, not a training
-        step. Steps 2..N are untouched.
+        What it costs. The barrier does not delete the skew, it relocates it
+        into the WARMUP step, which is never exported -- so the first RECORDED
+        step comes out slightly optimistic. The first recorded step is a
+        boundary step, not a training step. Steps 2..N are untouched.
 
         This is deliberately NOT done per step. A barrier on every step would
         serialize the pipeline's run-ahead and change the thing being measured;
@@ -681,16 +681,13 @@ class Profiler:
         previous window's export (``key_averages``, ``export_chrome_trace``)
         leaves large cyclic garbage (FunctionEvent parent/child links) that
         only a full collection frees. Left to CPython's schedule, that
-        collection lands in a RECORDED step of the next window on one rank at
-        a time: the step-52-56 ship captures showed a ~1.0-1.1 s single-rank
-        host stall in the second window only (best explanation, not proven).
-        Collecting here moves it into the unexported WARMUP step, ahead of the
+        collection can land in a RECORDED step of the next window on one rank
+        at a time. Collecting here moves it into the unexported WARMUP step, ahead of the
         drain/barrier that absorbs it. No ``gc.freeze()`` after it: startup
         already froze the setup-time objects (``_collect_and_freeze_gc``,
         DLRM_HSTU_FP8_GC_FREEZE), and re-freezing per window would move
         whatever is alive mid-training into the permanent generation, where
-        cycles among those objects are never collected again (the leak seen
-        when re-freezing per data window). Traced runs only.
+        cycles among those objects are never collected again. Traced runs only.
         """
         n = getattr(self._profiler, "step_num", 0)
         try:
@@ -733,9 +730,7 @@ class _NoOpSummaryWriter:
     """Drop-in stand-in for SummaryWriter used when TensorBoard is disabled
     (empty ``tensorboard_log_path``). All scalar writes become no-ops so the
     metrics path (compute + text-log + ``.metrics.jsonl`` sinks) runs unchanged
-    and never crashes on TB file I/O. The shared ``/apps`` tfevents writer was a
-    crash source under transient filer ``Errno 121`` (Remote I/O) errors, and
-    nothing we consume reads TensorBoard — eval-window AUCs come from the JSONL
+    and never crashes on TB file I/O. Eval-window AUCs come from the JSONL
     sink and the text log."""
 
     def add_scalar(self, *args, **kwargs) -> None:
@@ -813,9 +808,9 @@ class MetricsLogger:
         self.task_names: List[str] = all_classification_tasks + all_regression_tasks
 
         # Eval metric semantics:
-        #   eval_cumulative=False (default, legacy / static / non-streaming eval):
+        #   eval_cumulative=False (default, static / non-streaming eval):
         #     a single eval set with the configured window_size, including a
-        #     lifetime AUC. Unchanged behavior.
+        #     lifetime AUC.
         #   eval_cumulative=True (streaming fixed-holdout eval): a FRESH eval set
         #     (window_size=UNBOUNDED, reset each pass -> per-pass full-holdout
         #     "window_*") PLUS a CUMULATIVE set ("eval_cum", never reset ->
@@ -827,8 +822,8 @@ class MetricsLogger:
         #     O(num_bins) score histogram (additive all-reduce, no unbounded
         #     buffer, memory independent of #samples/#windows).
         #   "capped": LifetimeAUCMetricComputation - AUC over a trailing buffer of
-        #     `lifetime_auc_window` samples/rank (the legacy approach; per-rank
-        #     buffer all-gathered at compute).
+        #     `lifetime_auc_window` samples/rank (per-rank buffer all-gathered
+        #     at compute).
         self._eval_cumulative: bool = eval_cumulative
         self._cumulative_auc_bins: int = int(cumulative_auc_bins)
         self._train_lifetime_auc_mode: str = str(train_lifetime_auc_mode)
@@ -907,6 +902,19 @@ class MetricsLogger:
         # is on (checked per call; falls back to the device .item() otherwise).
         _hsf.install_gauc_patch()
         _hsf.install_kjt_lpk_patch()
+        # Sequence-embedding comm permutes (yambda_5b.gin);
+        # each install() is a no-op unless its switch is on (absent = off).
+        # Row-wise unbucketize backward as an inverse gather (row-wise
+        # sequence sharding, i.e. NODES>=2). Switch DLRM_HSTU_FP8_UNBUCKETIZE_GATHER.
+        from generative_recommenders.dlrm_v4 import unbucketize_gather as _ubg
+
+        _ubg.install()
+        # Sequence a2a fwd/bwd permutes as a row-index gather in the wire
+        # dtype (bitwise identical; switch DLRM_HSTU_FP8_SEQ_A2A_ROWPERM).
+        # Keeps the '## All2All_Seq_{fwd,bwd}_permute ##' trace labels.
+        from generative_recommenders.dlrm_v4 import seq_a2a_rowperm as _sarp
+
+        _sarp.install()
         self._pending_train_loss: Optional[Any] = None
         # MLPerf `samples_count` progress unit: global trained samples, persisted
         # alongside global_step so a resumed run continues the count.
@@ -929,7 +937,7 @@ class MetricsLogger:
         else:
             # TB disabled: use a no-op writer so the existing call sites (and the
             # `assert self.tb_logger is not None` in compute_and_log) keep working
-            # while no tfevents are written to the fragile shared filer.
+            # while no tfevents are written.
             self.tb_logger = _NoOpSummaryWriter()
 
         # Throughput / time-to-target tracking. Counters are train-only; eval
@@ -1280,7 +1288,7 @@ class MetricsLogger:
             self.tb_logger.add_scalar(
                 "perf/train_step_time_ms", step_ms, global_step=step
             )
-            # Inclusive (old-semantics) per-step wall time and the eval/ckpt
+            # Inclusive per-step wall time and the eval/ckpt
             # breakdown that was excluded from step_ms above.
             self.tb_logger.add_scalar(
                 "perf/train_wall_step_time_ms", wall_step_ms, global_step=step
@@ -1325,10 +1333,17 @@ class MetricsLogger:
                 m = self._model_ref
                 if m is not None:
                     inner = m.module if hasattr(m, "module") else m
-                    jagged_t = getattr(inner, "_last_jagged_flops_per_sample", None)
-                    executed_t = getattr(
-                        inner, "_last_executed_flops_per_sample", None
-                    )
+                    _getter = getattr(inner, "jagged_flops_per_sample", None)
+                    if callable(_getter):
+                        # Lazy stash (DLRM_HSTU_FP8_LAZY_FLOPS_STASH).
+                        jagged_t, executed_t = _getter()
+                    else:
+                        jagged_t = getattr(
+                            inner, "_last_jagged_flops_per_sample", None
+                        )
+                        executed_t = getattr(
+                            inner, "_last_executed_flops_per_sample", None
+                        )
                 if jagged_t is not None:
                     if executed_t is None:
                         executed_t = jagged_t
@@ -1711,7 +1726,7 @@ def get_dataset(
                 # Anchor-eligibility floor: a LISTEN event qualifies once the
                 # user has >= min_history prior events. Decoupled from
                 # history_length (gather cap) since jagged attention handles
-                # short UIH. None = legacy (require a full history_length).
+                # short UIH. None = require a full history_length.
                 # Override via `get_dataset.min_history = N` / $MIN_HISTORY.
                 "min_history": min_history,
                 # UIH construction: "interleaved" (per-pool L//3 cap) or
@@ -1733,7 +1748,7 @@ def get_dataset(
                 "streaming_shuffle_fraction": streaming_shuffle_fraction,
                 "streaming_shuffle_seed": streaming_shuffle_seed,
                 # User-level train:eval holdout for the streaming path. 1.0 =
-                # no holdout (legacy). <1.0 holds out (1 - tsp) of users as a
+                # no holdout. <1.0 holds out (1 - tsp) of users as a
                 # fixed eval set; those users are never trained.
                 "train_split_percentage": train_split_percentage,
                 "split_salt": split_salt,

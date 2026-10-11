@@ -1,0 +1,921 @@
+# pyre-strict
+"""BLAS first-use warmup before RUN_START ($BLAS_WARMUP; gin yambda_5b.gin).
+
+WHY. The first train step pays a one-time, per-process cost the first time
+each GEMM *family* is used: hipBLASLt handle creation, the TunableOp operator
+object for each (op, dtype, layout) template (its constructor enumerates every
+hipBLASLt solution for that type), the results-file load, and the Tensile code
+objects of the kernels it picks (e.g. torch.addmm in ops/fused_linear_norm.py,
+torch.baddbmm in modules/preprocessors.py and the first torch._scaled_mm). None
+of that depends on the data or on M. This module pays it during initialization by
+running each family the first forward AND backward use once, on synthetic
+tensors, before INIT_STOP/RUN_START. MLPerf training rules allow library
+initialization / JIT on synthetic inputs before RUN_START (model init time,
+training_rules L545-549).
+
+WHAT IT DOES NOT TOUCH. No module, parameter, buffer, optimizer, FP8 scale or
+weight cache (ops/triton/triton_fp8.py _weight_cache/_scale_value_cache/...,
+_residual_workspaces), FP8 calibration counter (bwd_fp8 _sites), Triton
+autotune table, or BLAS pin table (ops/blas_solution_pins.py
+_seen/_state/_active). One intentional, state-equivalent exception: the "fp8
+output-scale-mode probe" case runs triton_fp8._fp8_output_scale_mode(), which
+caches the per-device mode string in _fp8_output_scale_mode_by_device and adds
+its probe key to _quiet_seen -- the identical, data-free values the first
+fp8_supported() call of step 1 would cache. A second, only under
+DLRM_HSTU_FP8_BWD_OUT_WGRAD=1 (default off): the FP8 out-proj wgrad NN case
+creates ops/hipblaslt_fp8_nn's per-device handle and workspace (the objects
+its first armed call would create) and caches one heuristic result keyed by
+M=16 (valid for exactly that problem, so it cannot shadow a real batch's
+algorithm). A third, only under DLRM_HSTU_FP8_FWD_U_DP=1 (default off): the
+U-slice data-parallel case creates hipblaslt_scaled_mm_bias's per-device
+hipBLASLt handle (the object its first armed call would create); it keeps no
+algorithm cache and gets a private workspace. Every operand is a fresh
+tensor built from torch.full/torch.ones (no RNG draw: the CPU and CUDA default
+generators are checked before/after and restored if anything moved). FP8 calls
+go straight to torch._scaled_mm with private scale tensors, and the
+residual-fused extension is called with a private workspace.
+
+WHY A TINY M CANNOT SHADOW A PIN. M (rows) is the token count on the HSTU
+projections (total jagged tokens per rank, ~2.0-2.4 M at yambda-5b), the
+pre-contextual token count on the preprocessor MLPs, and the per-rank sample
+count (BATCH_SIZE=1024) on the item MLP / multitask head / contextual baddbmm.
+The warmup uses M=16 (a multiple of 16 for _scaled_mm). Even if some tail batch
+ever produced M=16, nothing here can change what that batch resolves to: with
+PYTORCH_TUNABLEOP_TUNING=0, TunableOp::operator() looks the key up and, on a
+miss, runs "Default" WITHOUT adding the key to the results table
+(ATen/cuda/tunable/TunableOp.h: mgr.Add only under IsTuningEnabled()), so a
+later blas_solution_pins.install_for_tokens(16) still merges its pin and wins.
+The pins are installed lazily per M by install_for_tokens (hooks in
+modules/dlrm_hstu.py, ops/hstu_compute.py,
+ops/triton/triton_hstu_preprocess_and_attention.py); this module never calls
+it, so the pin state is left exactly as the first real batch expects it.
+TunableOp itself is configured from os.environ by apply_env_bootstrap (Phase 1
+of train_ranker), long before this runs.
+
+PREPROC_L2 HOOK (_warmup_preproc_fp8_l2, only with DLRM_HSTU_FP8_PREPROC_L2=1,
+default OFF; gate unset or "0": it returns before importing anything). It runs
+preproc_fp8_l2.warmup_kernels on private torch.full tensors: no _Site, module,
+parameter or RNG state. What it leaves behind: Triton compiled kernels, the
+finalize's autotune best_config under the gin pins, ops/hipblaslt_fp8_nn heuristic
+entries keyed by the exact warm-up token counts (removed again unless that
+module's cache mode is "exact"), and triton_fp8._quiet_seen shape keys. It skips
+like warmup() when TunableOp tuning or record-untuned is on, and releases its
+transient (torch.cuda.empty_cache) before alloc_pregrow runs. It imports no
+FlyDSL: run_blas_warmup runs before the DataLoader pre-start forks its pools.
+The stacked LayerNorm(512) backward kernels (FlyDSL) of that path are JIT-built
+after the forks by run_startup_preload (_prebuild_flydsl_ln_bwd, " grp3f8=..."),
+next to the other FlyDSL LayerNorm-backward kernels; without DL_PRESTART they
+compile at first use.
+"""
+
+import contextlib
+import logging
+import os
+import sys
+import time
+from typing import Callable, Iterator, List, Optional, Tuple
+
+import gin
+import torch
+import torch.nn.functional as F
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+# Rows of every synthetic GEMM. See the module docstring for why no real batch
+# depends on what this resolves to. Multiple of 16 for torch._scaled_mm.
+WARMUP_M: int = 16
+
+# Production shapes (yambda_5b.gin + dlrm_v4/configs.py): embedding/transducer
+# dim D=512, 4 heads x (linear 128, qk 128) -> uvqk N=2048, attention output
+# 3*4*128=1536, targets-only V/K pack N=1024, preprocessor hidden 256,
+# additional-embedding MLP in 2*512=1024, action MLP in 8*3=24, timestamp
+# postprocessor in 512+2*2=516, item MLP in 3*512=1536, 1 task, 8 contextual
+# slots (uid + 7 crosses).
+_D = 512
+_UVQK_N = 2048
+_ATTN_OUT = 1536
+_VK_N = 1024
+_U_N = 512
+_VQK_N = 1536
+_PRE_HIDDEN = 256
+_ADDL_IN = 1024
+_ACTION_IN = 24
+_POST_IN = 516
+_ITEM_IN = 1536
+_NUM_TASKS = 1
+_CONTEXTUAL = 8
+
+_BF16 = torch.bfloat16
+_F32 = torch.float32
+
+
+def _full(shape: Tuple[int, ...], value: float, dtype: torch.dtype,
+          device: torch.device, requires_grad: bool = False) -> torch.Tensor:
+    t = torch.full(shape, value, dtype=dtype, device=device)
+    if requires_grad:
+        t.requires_grad_(True)
+    return t
+
+
+# ----------------------------------------------------------------------------
+# BF16 / FP32 families. Each case returns the number of BLAS calls it issued.
+# Every case reproduces the call form (function, operand layout/strides, bias
+# kind, dtype) of a production call site; see the file list in run_cases().
+# ----------------------------------------------------------------------------
+
+
+def _addmm_bias_nn(device: torch.device, k: int, n: int, m: int) -> int:
+    """addmm(bias1d, x[M,K], W[K,N]) -- HSTU uvqk / targets V/K, U/Q projection
+    (GemmAndBias BFloat16 NN), plus the matching triton_addmm_bwd pair:
+    wgrad mm(x.t(), dz) (NT) and dgrad mm(dz, W.t()) (TN)."""
+    with torch.no_grad():
+        x = _full((m, k), 0.0625, _BF16, device)
+        w = _full((k, n), 0.0625, _BF16, device)
+        b = _full((n,), 0.0625, _BF16, device)
+        z = torch.addmm(b, x, w)
+        dz = torch.ones_like(z)
+        torch.mm(x.t(), dz)
+        torch.mm(dz, w.t())
+    return 3
+
+
+def _addmm_residual_nn(device: torch.device, k: int, n: int, m: int) -> int:
+    """addmm(residual2d[M,N], y[M,K], W[K,N]) -- bf16 HSTU output projection
+    (calibration steps / bf16 arm), plus its backward
+    dgrad mm(dout, W.t()) and wgrad mm(y.t(), dout) (triton_hstu_linear)."""
+    with torch.no_grad():
+        y = _full((m, k), 0.0625, _BF16, device)
+        w = _full((k, n), 0.0625, _BF16, device)
+        r = _full((m, n), 0.0625, _BF16, device)
+        out = torch.addmm(r, y, w)
+        dout = torch.ones_like(out)
+        torch.mm(dout, w.t())
+        torch.mm(y.t(), dout)
+    return 3
+
+
+def _fused_linear_norm(device: torch.device, k: int, n: int, m: int) -> int:
+    """ops/fused_linear_norm.py _LinearNormFunction (preprocessor MLPs under
+    autocast bf16): fwd addmm(b, x, W.t()) with W[N,K] (GemmAndBias TN), bwd
+    dh @ W (NN) and dh.t() @ x (NT)."""
+    with torch.no_grad():
+        x = _full((m, k), 0.0625, _BF16, device)
+        w = _full((n, k), 0.0625, _BF16, device)
+        b = _full((n,), 0.0625, _BF16, device)
+        h = torch.addmm(b, x, w.t())
+        dh = torch.ones_like(h)
+        dh @ w
+        dh.t() @ x
+    return 3
+
+
+def _linear_autograd(device: torch.device, k: int, n: int, m: int,
+                     dtype: torch.dtype) -> int:
+    """nn.Linear forward + autograd backward on private leaves (F.linear ->
+    addmm(b, x, W.t()), AddmmBackward0 dgrad/wgrad). bf16: timestamp
+    postprocessor under the transducer autocast. fp32: item-embedding MLP and
+    multitask head, which run outside any autocast."""
+    with torch.enable_grad():
+        x = _full((m, k), 0.0625, dtype, device, requires_grad=True)
+        w = _full((n, k), 0.0625, dtype, device, requires_grad=True)
+        b = _full((n,), 0.0625, dtype, device, requires_grad=True)
+        y = F.linear(x, w, b)
+        y.backward(torch.ones_like(y))
+    return 3
+
+
+def _contextual_baddbmm(device: torch.device, m: int) -> int:
+    """modules/preprocessors.py contextual projection: baddbmm(bias[C,1,D],
+    x.view(-1,C,D).transpose(0,1), W[C,D,D]) in bf16 (strided-batched GEMM,
+    A with ld=C*D), plus its autograd backward (two bmm)."""
+    with torch.enable_grad():
+        bias = _full((_CONTEXTUAL, _D), 0.0, _BF16, device, requires_grad=True)
+        w = _full((_CONTEXTUAL, _D, _D), 0.0625, _BF16, device,
+                  requires_grad=True)
+        x = _full((m * _CONTEXTUAL, _D), 0.0625, _BF16, device,
+                  requires_grad=True)
+        out = torch.baddbmm(
+            bias.view(-1, 1, _D),
+            x.view(-1, _CONTEXTUAL, _D).transpose(0, 1),
+            w,
+        ).transpose(0, 1)
+        out.backward(torch.ones_like(out))
+    return 3
+
+
+# ----------------------------------------------------------------------------
+# FP8 families (only when the FP8 arm is on). Lowest-level torch._scaled_mm
+# with private scales; no triton_fp8 wrapper (they populate weight/scale/probe
+# caches), no bwd_fp8 entry point (it advances per-site counters).
+# ----------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _quiet_stderr(enabled: bool) -> Iterator[None]:
+    """Keep hipBLASLt's first-FP8-shape heuristic chatter (see
+    triton_fp8._scaled_mm_call) off fd 2. Exceptions still
+    propagate and are logged by the caller after fd 2 is restored."""
+    if not enabled:
+        yield
+        return
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    saved = os.dup(2)
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(devnull)
+
+
+def _fp8_cases(device: torch.device, m: int
+               ) -> List[Tuple[str, Callable[[], int]]]:
+    if torch.version.hip is None or not hasattr(torch, "_scaled_mm"):
+        return []
+    from generative_recommenders.ops.triton import triton_fp8 as tf8
+
+    e4m3 = tf8.fp8_e4m3_dtype()
+    from generative_recommenders.ops.triton import bwd_fp8
+
+    grad_dtype = getattr(bwd_fp8, "_GRAD_DTYPE", None)
+    dgrad_cases: List[Tuple[str, Callable[[], int]]] = []
+    if getattr(bwd_fp8, "_BWD_ENABLED", False) and grad_dtype is not None:
+        # bwd_fp8.output_projection_dgrad (gated by DLRM_HSTU_FP8_BWD alone):
+        # e5m2 grad x e4m3 W^T.
+        def dgrad() -> int:
+            g = torch.full((m, _D), 0.5, dtype=_BF16, device=device).to(grad_dtype)
+            w = torch.full((_ATTN_OUT, _D), 0.5, dtype=_BF16,
+                           device=device).to(e4m3)
+            torch._scaled_mm(
+                g, w.t(),
+                scale_a=torch.ones((1,), dtype=_F32, device=device),
+                scale_b=torch.ones((1,), dtype=_F32, device=device),
+                out_dtype=_BF16,
+            )
+            return 1
+
+        dgrad_cases.append(("fp8 e5m2 x e4m3 -> bf16 out_proj dgrad", dgrad))
+        if getattr(bwd_fp8, "_OUT_WGRAD_ARMED", False) and os.environ.get(
+            "DLRM_HSTU_FP8_BWD_OUT_WGRAD_IMPL", "nn"
+        ) == "nn":
+            # FP8 output-projection wgrad, NN sub-mode (DLRM_HSTU_FP8_BWD_OUT_WGRAD=1
+            # only): ops/hipblaslt_fp8_nn.fp8_wgrad_nn, e4m3 y [M, 1536] x
+            # token-major dout [512, M] in the format the arm resolved. Warms
+            # the library load, its own hipBLASLt handle and workspace (the
+            # same per-device objects the first armed call would create) and
+            # one heuristic query. The algo cache is keyed by the exact token
+            # count, so the M=16 entry is valid only for an M=16 problem.
+            t_dtype = (
+                e4m3 if getattr(bwd_fp8, "_OUT_WGRAD_T_E4M3", False) else grad_dtype
+            )
+
+            def out_wgrad_nn() -> int:
+                from generative_recommenders.ops.hipblaslt_fp8_nn import (
+                    fp8_wgrad_nn,
+                )
+
+                y = torch.full((m, _ATTN_OUT), 0.5, dtype=_BF16,
+                               device=device).to(e4m3)
+                dout_t = torch.full((_D, m), 0.5, dtype=_BF16,
+                                    device=device).to(t_dtype)
+                one = torch.ones((1,), dtype=_F32, device=device)
+                out = fp8_wgrad_nn(y, dout_t, one, one, out_dtype=_F32)
+                if out is None:
+                    raise RuntimeError("no hipBLASLt NN algorithm")
+                return 1
+
+            dgrad_cases.append(("fp8 e4m3 x fp8 -> f32 out_proj wgrad (nn)",
+                                out_wgrad_nn))
+    if not tf8.hstu_fp8_gemm_enabled():
+        return dgrad_cases
+    fast_accum = bool(tf8._HSTU_FP8_FAST_ACCUM)
+    one11 = lambda: torch.ones((1, 1), dtype=_F32, device=device)  # noqa: E731
+
+    def act(k: int, dtype: torch.dtype = e4m3) -> torch.Tensor:
+        return torch.full((m, k), 0.5, dtype=_BF16, device=device).to(dtype)
+
+    def wcol(k: int, n: int) -> torch.Tensor:
+        # Column-major [K,N] E4M3, the layout _get_weight_shadow produces.
+        return torch.full((n, k), 0.5, dtype=_BF16, device=device).to(e4m3).t()
+
+    def scaled(k: int, n: int, out_dtype: torch.dtype, bias: bool,
+               scale_result: bool) -> int:
+        kwargs = {
+            "scale_a": one11(), "scale_b": one11(), "out_dtype": out_dtype,
+            "use_fast_accum": fast_accum,
+        }
+        if bias:
+            kwargs["bias"] = torch.zeros((n,), dtype=_BF16, device=device)
+        if scale_result:
+            kwargs["scale_result"] = one11()
+        a, b = act(k), wcol(k, n)
+        try:
+            torch._scaled_mm(a, b, **kwargs)
+        except TypeError:
+            # Same API-compat retry as triton_fp8._scaled_mm.
+            kwargs.pop("use_fast_accum", None)
+            torch._scaled_mm(a, b, **kwargs)
+        return 1
+
+    def scaled_out_fp8(k: int, n: int) -> int:
+        # scaled_mm_fp8_out_preq: E4M3 output with bf16 bias and scale_result
+        # (multiply/divide backends) or without it (input_scale backend). Try
+        # both forms so whichever the backend uses is warm.
+        count = 0
+        last_error: Optional[Exception] = None
+        for with_result in (True, False):
+            try:
+                count += scaled(k, n, e4m3, bias=True, scale_result=with_result)
+            except Exception as error:
+                last_error = error
+        if count == 0 and last_error is not None:
+            raise last_error
+        return count
+
+    def output_scale_probe() -> int:
+        # triton_fp8.fp8_supported()'s first-use backend probe (16x16 e4m3
+        # _scaled_mm + .item()): data-free; caches the same per-device mode
+        # string the first training step would cache.
+        tf8._fp8_output_scale_mode(device)
+        return 1
+
+    cases: List[Tuple[str, Callable[[], int]]] = [
+        ("fp8 output-scale-mode probe", output_scale_probe),
+        # scaled_addmm_fp8_preq, bf16 out + bf16 bias: QKV-fused U slice,
+        # full uvqk (non-QKV path), targets-only V/K bf16 output.
+        ("fp8 e4m3->bf16 +bias uvqk_u", lambda: scaled(_D, _U_N, _BF16, True, False)),
+        ("fp8 e4m3->bf16 +bias uvqk", lambda: scaled(_D, _UVQK_N, _BF16, True, False)),
+        ("fp8 e4m3->bf16 +bias targets_vk", lambda: scaled(_D, _VK_N, _BF16, True, False)),
+        # scaled_mm_fp8_out_preq, e4m3 out: QKV-fused V/Q/K and targets V/K.
+        ("fp8 e4m3->e4m3 +bias vqk", lambda: scaled_out_fp8(_D, _VQK_N)),
+        ("fp8 e4m3->e4m3 +bias targets_vk", lambda: scaled_out_fp8(_D, _VK_N)),
+        # Non-fused residual output projection fallback (_scaled_mm, no bias).
+        ("fp8 e4m3->bf16 out_proj", lambda: scaled(_ATTN_OUT, _D, _BF16, False, False)),
+    ]
+
+    # Output projection with the residual fused in (hipblaslt_scaled_addmm.cpp).
+    # Only if prebuild already loaded it: never trigger the (slow) build here.
+    ext_fn = getattr(tf8, "_residual_fused_extension", None)
+    if (
+        tf8._HSTU_FP8_FUSE_RESIDUAL
+        and ext_fn is not None
+        and ext_fn.cache_info().currsize > 0
+    ):
+        def residual_fused() -> int:
+            ext = ext_fn()
+            workspace = torch.empty(
+                tf8._HSTU_FP8_FUSE_RESIDUAL_WORKSPACE_BYTES,
+                dtype=torch.uint8, device=device,
+            )
+            a = act(_ATTN_OUT).contiguous()
+            w = wcol(_ATTN_OUT, _D)
+            r = torch.zeros((m, _D), dtype=_BF16, device=device)
+            algo = int(tf8._HSTU_FP8_FUSE_RESIDUAL_ALGORITHM)
+            try:
+                ext.scaled_addmm(a, w, r, one11(), one11(), workspace, algo)
+            except Exception:
+                # The heuristic may return fewer candidates at tiny M; the
+                # handle/library init is what we want, index 0 still gives it.
+                if algo == 0:
+                    raise
+                ext.scaled_addmm(a, w, r, one11(), one11(), workspace, 0)
+            return 1
+
+        cases.append(("fp8 residual-fused out_proj (ext)", residual_fused))
+
+    # U slice on the data-parallel hipBLASLt path (hipblaslt_scaled_mm_bias.cpp,
+    # DLRM_HSTU_FP8_FWD_U_DP=1 only): loads the code, creates the extension's
+    # per-device hipBLASLt handle and runs one heuristic query + GEMM with a
+    # private workspace of the production size. Only if prebuild already
+    # loaded it: never trigger the (slow) build here.
+    u_dp_fn = getattr(tf8, "_u_dp_extension", None)
+    if (
+        getattr(tf8, "_HSTU_FP8_FWD_U_DP", False)
+        and u_dp_fn is not None
+        and u_dp_fn.cache_info().currsize > 0
+    ):
+        def u_dp() -> int:
+            ext = u_dp_fn()
+            workspace = torch.empty(
+                tf8._HSTU_FP8_FWD_U_DP_WS_BYTES,
+                dtype=torch.uint8, device=device,
+            )
+            ext.scaled_mm_bias(
+                act(_D).contiguous(), wcol(_D, _U_N),
+                torch.zeros((_U_N,), dtype=_BF16, device=device),
+                one11(), one11(), workspace,
+            )
+            return 1
+
+        cases.append(("fp8 e4m3->bf16 +bias uvqk_u data-parallel (ext)", u_dp))
+
+    return cases + dgrad_cases
+
+
+def run_cases(device: torch.device, m: int = WARMUP_M
+              ) -> List[Tuple[str, Callable[[], int]]]:
+    """Every distinct (op, dtype, layout, epilogue) family of the first
+    forward+backward, at production N/K. Call sites:
+
+      bf16 addmm+bias1d NN (+NT wgrad, TN dgrad)
+          ops/hstu_compute.py:126, triton_hstu_preprocess_and_attention.py
+          (maybe_triton_addmm_fwd -> triton_addmm.py:1656; bwd triton_addmm.py:1637-1638)
+      bf16 addmm+residual2d NN (+TN dgrad, NT wgrad)
+          triton_hstu_linear.py:2726 fwd, :2812 / :2878 bwd
+      bf16 addmm(b, x, W.t()) TN (+NN dgrad, NT wgrad)
+          ops/fused_linear_norm.py:170, :235-236 (preprocessor MLPs)
+      bf16 F.linear + AddmmBackward0
+          modules/postprocessors.py _time_feature_combiner (autocast)
+      fp32 F.linear + AddmmBackward0
+          modules/dlrm_hstu.py _item_embedding_mlp, multitask prediction head
+      bf16 baddbmm strided-batched (+2 bmm)
+          modules/preprocessors.py:325
+      fp8 (see _fp8_cases)
+          triton_fp8.py scaled_addmm_fp8_preq / scaled_mm_fp8_out_preq,
+          hipblaslt_scaled_addmm.cpp, bwd_fp8.py:453
+    """
+    cases: List[Tuple[str, Callable[[], int]]] = [
+        # HSTU projections.
+        ("bf16 addmm+bias uvqk", lambda: _addmm_bias_nn(device, _D, _UVQK_N, m)),
+        ("bf16 addmm+bias targets_vk/uq", lambda: _addmm_bias_nn(device, _D, _VK_N, m)),
+        ("bf16 addmm+residual out_proj", lambda: _addmm_residual_nn(device, _ATTN_OUT, _D, m)),
+        # Preprocessor MLPs (FusedLinearNormMLP).
+        ("bf16 linear_norm content.0", lambda: _fused_linear_norm(device, _D, _PRE_HIDDEN, m)),
+        ("bf16 linear_norm *.2", lambda: _fused_linear_norm(device, _PRE_HIDDEN, _D, m)),
+        ("bf16 linear_norm additional.0", lambda: _fused_linear_norm(device, _ADDL_IN, _PRE_HIDDEN, m)),
+        ("bf16 linear_norm action.0", lambda: _fused_linear_norm(device, _ACTION_IN, _PRE_HIDDEN, m)),
+        # Contextual projection.
+        ("bf16 baddbmm contextual", lambda: _contextual_baddbmm(device, m)),
+        # Postprocessor (autocast bf16 nn.Linear).
+        ("bf16 linear postprocessor", lambda: _linear_autograd(device, _POST_IN, _D, m, _BF16)),
+        # Item MLP + multitask head (fp32, outside autocast).
+        ("fp32 linear item_mlp.0", lambda: _linear_autograd(device, _ITEM_IN, _D, m, _F32)),
+        ("fp32 linear item_mlp.2/head.0", lambda: _linear_autograd(device, _D, _D, m, _F32)),
+        ("fp32 linear head.2", lambda: _linear_autograd(device, _D, _NUM_TASKS, m, _F32)),
+    ]
+    cases += _fp8_cases(device, m)
+    return cases
+
+
+def _rng_snapshot(device: torch.device
+                  ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    cpu = torch.random.get_rng_state()
+    cuda = (
+        torch.cuda.get_rng_state(device)
+        if device.type == "cuda" and torch.cuda.is_available()
+        else None
+    )
+    return cpu, cuda
+
+
+def warmup(device: torch.device, m: int = WARMUP_M) -> Tuple[int, int, float]:
+    """Run every GEMM family once on synthetic tensors. Per-case failures are
+    logged and ignored; only a sticky device fault (failed synchronize) raises,
+    so the run dies before RUN_START instead of at step 1.
+
+    Returns (gemms_ok, families_failed, seconds)."""
+    t0 = time.perf_counter()
+    if device.type != "cuda" or not torch.cuda.is_available():
+        logger.info("[blas-warmup] skipped: no CUDA device (%s)", device)
+        return 0, 0, 0.0
+    if m <= 0 or m % 16 != 0:
+        logger.warning("[blas-warmup] skipped: BLAS_WARMUP_M=%d must be a "
+                       "positive multiple of 16", m)
+        return 0, 0, 0.0
+    try:
+        import torch.cuda.tunable as tunable
+
+        if tunable.is_enabled() and (
+            tunable.tuning_is_enabled()
+            or getattr(tunable, "record_untuned_is_enabled", lambda: False)()
+        ):
+            # Tuning/recording would tune or log tiny-M keys (minutes, and
+            # junk lines in the results/untuned files): never warm then.
+            logger.warning("[blas-warmup] skipped: TunableOp tuning or "
+                           "record-untuned is ON")
+            return 0, 0, 0.0
+    except Exception:
+        pass
+    try:
+        rng_before = _rng_snapshot(device)
+    except Exception as error:
+        logger.warning("[blas-warmup] skipped: RNG snapshot failed: %s", error)
+        return 0, 0, 0.0
+    ok = 0
+    failed = 0
+    try:
+        quiet = True
+        try:
+            from generative_recommenders.ops.triton import triton_fp8 as tf8
+
+            quiet = bool(tf8._HSTU_FP8_QUIET_HEURISTIC)
+        except Exception:
+            pass
+        with torch.cuda.device(device), torch.autocast("cuda", enabled=False):
+            try:
+                cases = run_cases(device, m)
+            except Exception:
+                logger.warning("[blas-warmup] could not build case list",
+                               exc_info=True)
+                cases = []
+            for name, fn in cases:
+                silenced = quiet and name.startswith("fp8")
+                if silenced:
+                    # fd 2 is /dev/null inside; leave a breadcrumb first so a
+                    # hard GPU abort in this window stays attributable.
+                    logger.info("[blas-warmup] %s (stderr silenced)", name)
+                try:
+                    with _quiet_stderr(silenced):
+                        ok += fn()
+                except Exception as error:  # never abort a run over a warmup
+                    failed += 1
+                    logger.warning("[blas-warmup] %s failed (ignored): %s",
+                                   name, error)
+            # Not swallowed: an asynchronous device fault here is sticky, the
+            # HIP context is unusable and step 1 would fail anyway -- later,
+            # inside the timed region, with a misleading stack. Fail now,
+            # before RUN_START.
+            try:
+                torch.cuda.synchronize(device)
+            except Exception as error:
+                raise RuntimeError(
+                    "[blas-warmup] device fault during warmup; the HIP context "
+                    "is unusable. Rerun with BLAS_WARMUP=0 to isolate."
+                ) from error
+    finally:
+        try:
+            rng_after = _rng_snapshot(device)
+            if not torch.equal(rng_before[0], rng_after[0]):
+                logger.error("[blas-warmup] CPU RNG state moved; restoring it")
+                torch.random.set_rng_state(rng_before[0])
+            if rng_before[1] is not None and rng_after[1] is not None and not (
+                torch.equal(rng_before[1], rng_after[1])
+            ):
+                logger.error("[blas-warmup] CUDA RNG state moved; restoring it")
+                torch.cuda.set_rng_state(rng_before[1], device)
+        except Exception as error:
+            logger.error("[blas-warmup] RNG state check failed: %s", error)
+    return ok, failed, time.perf_counter() - t0
+
+
+@gin.configurable
+def run_blas_warmup(device: torch.device, enabled: int = 0,
+                    m: int = WARMUP_M) -> None:
+    """train_ranker hook (gin run_blas_warmup.enabled = $BLAS_WARMUP)."""
+    if not int(enabled):
+        return
+    ok, failed, seconds = warmup(device, m=m)
+    if ok:
+        logger.info(
+            "armed OK: [blas-warmup] %d gemms in %.1fs before run_start "
+            "(M=%d, failed_families=%d, device=%s)",
+            ok, seconds, m, failed, device,
+        )
+    else:
+        logger.warning(
+            "[blas-warmup] requested but no GEMM ran (failed_families=%d, %.1fs)",
+            failed, seconds,
+        )
+    _warmup_preproc_fp8_l2(device)
+
+
+def _warmup_preproc_fp8_l2(device: torch.device) -> None:
+    """FP8 preprocessor L2 (ops/preproc_fp8_l2.py, DLRM_HSTU_FP8_PREPROC_L2=1,
+    default OFF): JIT-compile and first-use-load its Triton kernels and FP8
+    GEMMs on synthetic tensors before RUN_START (preproc_fp8_l2.warmup_kernels:
+    no _Site, module, parameter or RNG state touched), instead of in the first
+    FP8 training step. Logs one INFO line; the path's engagement is still
+    proven only by its "armed OK: ... first FP8 call" line in step WARMUP + 1. Gate unset or "0": returns before importing
+    anything (nothing changes). Gate on but declined (preproc_fp8_l2.enabled()
+    False), or TunableOp tuning / record-untuned on: no warm-up. Called from
+    run_blas_warmup, so BLAS_WARMUP=0 skips it too. Imports no FlyDSL (this
+    runs before the DataLoader pre-start forks its pools): its stacked
+    LayerNorm(512) backward is prebuilt by run_startup_preload after the
+    forks (_prebuild_flydsl_ln_bwd -> preproc_fp8_l2.prebuild_grouped)."""
+    # The gate's name, read without importing the module (unarmed: no import).
+    if os.environ.get("DLRM_HSTU_FP8_PREPROC_L2", "0") != "1":
+        return
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    try:
+        import torch.cuda.tunable as tunable
+
+        if tunable.is_enabled() and (
+            tunable.tuning_is_enabled()
+            or getattr(tunable, "record_untuned_is_enabled", lambda: False)()
+        ):
+            # As warmup(): tuning/recording would tune or log warm-up-size keys.
+            logger.warning("[blas-warmup] preproc-fp8-l2 warm-up skipped: "
+                           "TunableOp tuning or record-untuned is ON")
+            return
+    except Exception:
+        pass
+    try:
+        from generative_recommenders.ops import preproc_fp8_l2 as l2
+
+        if not l2.enabled():
+            return
+        rng_before = _rng_snapshot(device)
+    except Exception as error:  # never abort a run over a warmup
+        logger.warning("[blas-warmup] preproc-fp8-l2 warm-up skipped: %s", error)
+        return
+    failure: Optional[BaseException] = None
+    calls, seconds = 0, 0.0
+    try:
+        quiet = True
+        try:
+            from generative_recommenders.ops.triton import triton_fp8 as tf8
+
+            quiet = bool(tf8._HSTU_FP8_QUIET_HEURISTIC)
+        except Exception:
+            pass
+        calls, seconds = l2.warmup_kernels(
+            device, quiet_stderr=lambda: _quiet_stderr(quiet)
+        )
+    except Exception as error:  # judged below, after the device check
+        failure = error
+    finally:
+        try:
+            rng_after = _rng_snapshot(device)
+            if not torch.equal(rng_before[0], rng_after[0]):
+                logger.error("[blas-warmup] CPU RNG state moved; restoring it")
+                torch.random.set_rng_state(rng_before[0])
+            if rng_before[1] is not None and rng_after[1] is not None and not (
+                torch.equal(rng_before[1], rng_after[1])
+            ):
+                logger.error("[blas-warmup] CUDA RNG state moved; restoring it")
+                torch.cuda.set_rng_state(rng_before[1], device)
+        except Exception as error:
+            logger.error("[blas-warmup] RNG state check failed: %s", error)
+    # Not swallowed, as in warmup(): a sticky device fault fails the run here,
+    # before RUN_START.
+    try:
+        torch.cuda.synchronize(device)
+    except Exception as error:
+        raise RuntimeError(
+            "[blas-warmup] device fault during the preproc-fp8-l2 warm-up "
+            f"({failure!r}); the HIP context is unusable. Rerun with "
+            "DLRM_HSTU_FP8_PREPROC_L2=0 or BLAS_WARMUP=0 to isolate."
+        ) from error
+    if failure is not None:
+        logger.warning("[blas-warmup] preproc-fp8-l2 warm-up failed (ignored; "
+                       "the first FP8 step compiles instead): %s", failure)
+    else:
+        logger.info(
+            "[preproc-fp8-l2] pre-run_start warm-up OK: %d kernel/GEMM calls in "
+            "%.2fs (rows=%s, emu=%s, device=%s)",
+            calls, seconds,
+            ",".join(str(r) for r in l2._WARM_ROWS),
+            ",".join(str(e) for e in l2._warm_emus()), device,
+        )
+    # Release the warm-up's transient cached blocks before alloc_pregrow maps
+    # the free HBM.
+    try:
+        torch.cuda.empty_cache()
+    except Exception as error:
+        logger.warning("[blas-warmup] empty_cache after the preproc-fp8-l2 "
+                       "warm-up failed: %s", error)
+
+
+def _preload_flydsl() -> str:
+    """Import the FlyDSL fwd/bwd kernel modules (dlopens libFlyPythonCAPI
+    once) -- the import the
+    first attention call would otherwise pay inside the timed region. Uses the
+    same latched loaders the first call uses, so the cached module objects are
+    exactly what production then reads. No kernel is compiled or launched."""
+    try:
+        from generative_recommenders.ops.flydsl import hstu_flydsl_mha as _mha
+
+        if _mha.unsupported_hardware_reason() is not None:
+            return "skip(unsupported)"
+        bwd = _mha._load_kernel() is not None
+        fwd = _mha._load_fwd_kernel() is not None
+        return f"bwd={int(bwd)} fwd={int(fwd)}"
+    except Exception as error:  # never abort a run over a preload
+        logger.warning("[startup-preload] flydsl import failed (ignored): %s", error)
+        return "error"
+
+
+# (wln_bwd_flydsl, DLRM_HSTU_FP8_WLN_BWD_FLYDSL) variants the step runs, as
+# (D, is_swish, residual, sum_dx, weight dtype): the STU norms pass weights
+# cast to x.dtype (modules/stu.py -> bf16), the preprocessor MLP norms pass the
+# fp32 Parameter uncast (ops/fused_linear_norm.py). Exactly the production
+# specializations: 4 mains + 3 finalizes (the two bf16 D=512 variants share
+# one finalize), plus the residual variant's mscale main with
+# DLRM_HSTU_FP8_WLN_BWD_FLYDSL_MSCALE on (and its packed-mask main when the
+# forward writes the bit-packed mask, _mscale_mask_bits_armed); any other
+# dtype only costs a first-step compile, it cannot break the run.
+_LN_BWD_WARM_VARIANTS = ((512, False, True, False, torch.bfloat16),
+                         # targets-only last STU layer under
+                         # TGT_SPARSE_RESID: residual=None (stu.py
+                         # residual_rows_only)
+                         (512, False, False, False, torch.bfloat16),
+                         (512, False, False, True, torch.float32),
+                         (256, True, False, True, torch.float32))
+
+
+def _mscale_mask_bits_armed(D: int) -> bool:
+    """Whether the fused posenc+dropout forward writes the input-dropout mask
+    bit-packed (DLRM_HSTU_FP8_DROPOUT_MASK_BITS) at this D: its static
+    switches and the forward's own layout decision
+    (triton_position._dropout_mask_bits_why_not with the mask/scale handoff
+    switch, on this device: the FP8 arm's fused residual + LN and the
+    first-use packed-fold self-test, whose cached result the forward then
+    reuses). Then the layer-0 mscale call gets the uint8 [N, D / 8] mask.
+    A prebuild hint only: if the check itself fails (e.g. a renamed
+    attribute), it says so and returns False -- the packed-mask kernel then
+    compiles at its first call -- instead of latching FlyDSL off."""
+    try:
+        from generative_recommenders.ops.input_dropout_fold import input_dropout_fold_enabled
+        from generative_recommenders.ops.triton import triton_position as _tp
+
+        return bool(
+            _tp._DROPOUT_MASK_BITS
+            and _tp._POSENC_DROPOUT_FUSE
+            and not _tp._dropout_mask_bits_why_not(
+                input_dropout_fold_enabled(),
+                D,
+                torch.device("cuda", torch.cuda.current_device()),
+            )
+        )
+    except Exception as error:
+        logger.warning("[startup-preload] packed-mask arming check failed, "
+                       "not prebuilt (ignored): %s", error)
+        return False
+
+
+def _prebuild_flydsl_ln_bwd() -> str:
+    """JIT-compile, load and launch once the WLN_BWD_FLYDSL FlyDSL
+    weighted-LayerNorm backward kernels (ops/flydsl/ln_bwd.py: build_ln_bwd
+    main + build_finalize, one flyc.jit specialization each per (variant,
+    weight dtype)) on synthetic zero/one tensors, so the first training
+    backward does not compile them after RUN_START. The jit cache key holds no
+    tensor shape or runtime scalar (flydsl jit_function.py _make_cache_key:
+    tensors key by type, M/ITERS/G are fx.Int32 runtime args), so a small M
+    builds exactly the production specialization. Compile/JIT on synthetic
+    inputs only: no data, no model state, no RNG draw (zeros/ones only);
+    outputs are discarded.
+
+    A FlyDSL import, compile or launch error latches WLN_BWD_FLYDSL off
+    (triton_layer_norm._wln_bwd_flydsl_disable: one loud "[ln-bwd] flydsl
+    DISABLED" line, every call then takes Triton) and returns "ln_bwd=error".
+
+    Then the same for the FlyDSL grouped preprocessor LayerNorm backward, when
+    that path can run and WLN_BWD_FLYDSL is not latched off (" grp3=1|error"),
+    and, only with DLRM_HSTU_FP8_PREPROC_L2=1, for the FP8 preprocessor's
+    stacked LayerNorm(512) backward (preproc_fp8_l2.prebuild_grouped:
+    " grp3f8=1|error|off"; "off" when that path cannot run, e.g. its kill
+    switch DLRM_HSTU_FP8_PREPROC_L2_GROUPED is "0" or WLN_BWD_FLYDSL is latched
+    off). Each latches only its own path off on an error and never aborts the
+    run. Neither runs when WLN_BWD_FLYDSL is off or the device is not gfx950
+    (the function returns before them). A failed synchronize is a sticky
+    device fault: it raises here, before RUN_START, as warmup() does."""
+    from generative_recommenders.ops.triton import triton_layer_norm as _tln
+
+    if not _tln._wln_bwd_flydsl_enabled():
+        return "ln_bwd=off"
+    device = torch.device("cuda", torch.cuda.current_device())
+    result = "ln_bwd=error"
+    try:
+        arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+        if not arch.startswith("gfx950"):
+            return f"ln_bwd=skip(arch {arch or 'unknown'})"
+        from generative_recommenders.ops.flydsl.ln_bwd import ln_bwd
+
+        m = 1024
+        built = 0
+        mscale = ""
+        for D, is_swish, residual, sum_dx, w_dtype in _LN_BWD_WARM_VARIANTS:
+            x = torch.zeros((m, D), dtype=torch.bfloat16, device=device)
+            dy = torch.zeros_like(x)
+            w = torch.ones((D,), dtype=w_dtype, device=device)
+            b = torch.zeros((D,), dtype=w_dtype, device=device)
+            mean = torch.zeros((m,), dtype=torch.float32, device=device)
+            rstd = torch.ones((m,), dtype=torch.float32, device=device)
+            res = torch.zeros_like(x) if residual else None
+            ln_bwd(dy, x, w, b, mean, rstd, res, is_swish=is_swish, sum_dx=sum_dx)
+            if residual and _tln._wln_bwd_flydsl_mscale_enabled():
+                # the same call with the dropout mask*scale
+                # epilogue (DLRM_HSTU_FP8_WLN_BWD_FLYDSL_MSCALE; the layer-0
+                # input-LayerNorm backward): one more main kernel, this
+                # variant's finalize; the scale is a runtime argument
+                mask = torch.ones((m, D), dtype=torch.bool, device=device)
+                ln_bwd(dy, x, w, b, mean, rstd, res, dropout_mask=mask, dropout_scale=1.0)
+                mscale = " mscale=1"
+                if _mscale_mask_bits_armed(D):
+                    # the packed-mask main (..._mscaleb_...) the bit-packed forward's
+                    # uint8 [N, D / 8] mask selects; same finalize
+                    bits = torch.full((m, D // 8), 0xFF, dtype=torch.uint8, device=device)
+                    ln_bwd(dy, x, w, b, mean, rstd, res, dropout_mask=bits, dropout_scale=1.0)
+                    mscale += " bits=1"
+            built += 1
+        result = f"ln_bwd={built}{mscale}"
+    except Exception as error:  # the run continues on the Triton path
+        _tln._wln_bwd_flydsl_disable("startup prebuild", error)
+    # FlyDSL grouped LayerNorm backward (ops/preproc_grouped_tail.py,
+    # ops/flydsl/ln_bwd_grouped.py), only when that path can run: its own
+    # latch on error, the per-call ln_bwd path is not affected (" grp3=1|error").
+    if _tln._WLN_BWD_FLYDSL_BROKEN is None:
+        try:
+            from generative_recommenders.ops import preproc_grouped_tail as _pgt
+
+            if _pgt.flydsl_grouped_bwd_wanted():
+                result += " " + _pgt.prebuild_flydsl_grouped(device)
+        except Exception as error:  # never abort a run over this prebuild
+            logger.warning("[startup-preload] grouped LN bwd prebuild skipped: %s", error)
+    # Stacked LayerNorm(512) backward (ops/preproc_fp8_l2.py STACKED
+    # BACKWARD, ops/flydsl/ln_bwd_grouped_fp8.py), only with
+    # DLRM_HSTU_FP8_PREPROC_L2=1 (unset or "0": this block imports nothing and
+    # appends nothing; the grouped block above already imported
+    # preproc_grouped_tail and, through it, preproc_fp8_l2 -- no FlyDSL, no
+    # build), here after the DataLoader forks: " grp3f8=1|error|off".
+    # prebuild_grouped checks that the path can run (kill switch on,
+    # WLN_BWD_FLYDSL not latched off, ...) and latches only the stacked path
+    # off on an error (the unstacked path runs).
+    if os.environ.get("DLRM_HSTU_FP8_PREPROC_L2", "0") == "1":
+        try:
+            from generative_recommenders.ops import preproc_fp8_l2 as _l2
+
+            result += " " + _l2.prebuild_grouped(device)
+        except Exception as error:  # never abort a run over this prebuild
+            logger.warning("[startup-preload] stacked LN bwd prebuild skipped: %s", error)
+            result += " grp3f8=error"
+    # Not swallowed, as in warmup(): an asynchronous device fault here is
+    # sticky, the HIP context is unusable and step 1 would fail anyway --
+    # later, inside the timed region, with a misleading stack. Fail now,
+    # before RUN_START.
+    try:
+        torch.cuda.synchronize(device)
+    except Exception as error:
+        raise RuntimeError(
+            "[startup-preload] device fault during the FlyDSL LayerNorm-backward "
+            "prebuild; the HIP context is unusable. Rerun with "
+            "DLRM_HSTU_FP8_WLN_BWD_FLYDSL=0 to isolate."
+        ) from error
+    return result
+
+
+def _gc_collect_and_freeze() -> int:
+    """One full Python GC + gc.freeze() before RUN_START, so the in-loop
+    utils._collect_and_freeze_gc (kept as is) only walks objects created
+    after it. Honors its kill switch $DLRM_HSTU_FP8_GC_FREEZE."""
+    import gc
+
+    knob = os.environ.get("DLRM_HSTU_FP8_GC_FREEZE", "1").strip().lower()
+    if knob in ("0", "false", "off", "no"):
+        return -1
+    gc.collect()
+    gc.freeze()
+    return gc.get_freeze_count()
+
+
+@gin.configurable
+def run_startup_preload(prestarted: bool, enabled: int = 0,
+                        flydsl: int = 1, gc_freeze: int = 1,
+                        ln_bwd: int = 1) -> None:
+    """train_ranker hook, called AFTER the DataLoader pre-start (gin
+    run_startup_preload.enabled = $BLAS_WARMUP). Runs only when every worker
+    pool was already forked by the pre-start (``prestarted``), so no pool forks
+    with the FlyDSL library loaded or with a different GC state than the legacy
+    order would give it. Library import, the JIT build of the WLN_BWD_FLYDSL
+    FlyDSL LayerNorm-backward kernels (``ln_bwd``: compiled and launched once
+    on synthetic zero/one tensors, outputs discarded; with them the grouped
+    and, under DLRM_HSTU_FP8_PREPROC_L2=1, the stacked LayerNorm(512)
+    backward kernels when those paths can run, see _prebuild_flydsl_ln_bwd)
+    and Python memory management only: no data, no RNG, no training state
+    (MLPerf training_rules L545-549: library initialization and JIT on
+    synthetic inputs). Not prestarted: none of these FlyDSL kernels is built
+    here; each compiles at its first use."""
+    if not int(enabled):
+        return
+    if not prestarted:
+        logger.info("[startup-preload] skipped: needs DL_PRESTART=1 (pools must "
+                    "be forked before the FlyDSL import)")
+        return
+    t0 = time.perf_counter()
+    fly = _preload_flydsl() if int(flydsl) else "off"
+    ln_time = ""
+    if int(flydsl) and int(ln_bwd) and fly.startswith("bwd="):
+        # after the pools fork (prestarted) and before gc.freeze, so the
+        # trace-time garbage is collected by the freeze below. A FlyDSL error
+        # latches WLN_BWD_FLYDSL off inside; only a device fault raises.
+        t_ln = time.perf_counter()
+        fly += " " + _prebuild_flydsl_ln_bwd()
+        ln_time = f" (ln_bwd prebuild {time.perf_counter() - t_ln:.2f}s)"
+    t1 = time.perf_counter()
+    try:
+        frozen = _gc_collect_and_freeze() if int(gc_freeze) else -2
+    except Exception as error:
+        logger.warning("[startup-preload] gc failed (ignored): %s", error)
+        frozen = -3
+    t2 = time.perf_counter()
+    logger.info(
+        "armed OK: [startup-preload] flydsl %s in %.2fs%s, gc frozen=%d in %.2fs "
+        "before run_start",
+        fly, t1 - t0, ln_time, frozen, t2 - t1,
+    )

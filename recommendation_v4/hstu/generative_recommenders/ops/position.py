@@ -32,7 +32,10 @@ except ImportError:
     triton_cc_add_timestamp_position_embeddings = None
 from generative_recommenders.common import HammerKernel
 from generative_recommenders.ops.triton.triton_position import (
+    posenc_dropout_fuse_supported,
     triton_add_timestamp_positional_embeddings,
+    triton_concat_add_timestamp_positional_embeddings,
+    triton_concat_add_timestamp_positional_embeddings_dropout,
 )
 
 try:
@@ -50,14 +53,117 @@ except ImportError:
 
 
 torch.fx.wrap("triton_add_timestamp_positional_embeddings")
+torch.fx.wrap("triton_concat_add_timestamp_positional_embeddings")
+torch.fx.wrap("triton_concat_add_timestamp_positional_embeddings_dropout")
 
-# DLRM_HSTU_FP8_POSENC_FAST (gin default on, yambda_5b.gin item (13); absent = off = the incumbent path).
+# DLRM_HSTU_FP8_POSENC_FAST (gin default on; absent = off = the unfused path).
 # TRITON kernel with grad enabled only: fold `seq_embeddings *
 # alpha` into the position kernel (forward bitwise identical; d_seq written by
 # the backward's pos pass, also bitwise identical to MulBackward) and use the
 # tiled pos/ts table-gradient reduction (fp32 in-tile accumulation instead of
-# the incumbent's bf16 running sum; fp32 atomics as before).
+# the unfused path's bf16 running sum; fp32 atomics in both).
 _POSENC_FAST: bool = os.environ.get("DLRM_HSTU_FP8_POSENC_FAST", "0") != "0"
+
+# DLRM_HSTU_FP8_POSENC_CONCAT_FOLD (gin default on; absent or =0 = the unfused
+# path). On the POSENC_FAST path (TRITON, grad enabled) the ContextualPreprocessor
+# does not materialize concat_2D_jagged(contextual [B*L, D], uih [N_uih, D])
+# (its only consumer is the positional encoder): the position kernel reads each
+# row from left/right directly and its backward pos pass writes d_left/d_right
+# directly, so there is no concat copy or split_2D_jagged backward.
+# Values are bitwise those of concat + posenc.
+_POSENC_CONCAT_FOLD: bool = (
+    os.environ.get("DLRM_HSTU_FP8_POSENC_CONCAT_FOLD", "0") != "0"
+)
+
+
+def posenc_concat_fold_enabled(kernel: HammerKernel) -> bool:
+    """Whether add_timestamp_positional_embeddings_concat may be used."""
+    return (
+        _POSENC_CONCAT_FOLD
+        and _POSENC_FAST
+        and kernel == HammerKernel.TRITON
+        and torch.is_grad_enabled()
+    )
+
+
+@torch.jit.unused
+def add_timestamp_positional_embeddings_concat(
+    alpha: float,
+    max_seq_len: int,
+    max_contextual_seq_len: int,
+    position_embeddings_weight: torch.Tensor,
+    timestamp_embeddings_weight: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    values_left: torch.Tensor,
+    values_right: torch.Tensor,
+    timestamps: torch.Tensor,
+    num_targets: Optional[torch.Tensor],
+    interleave_targets: bool,
+    time_bucket_fn: str = "sqrt",
+) -> torch.Tensor:
+    """== add_timestamp_positional_embeddings(seq_embeddings=concat_2D_jagged(
+    values_left (dense, values_left.shape[0] // B rows per sequence),
+    values_right (jagged; seq_offsets are the concatenated offsets)), ...)
+    on the POSENC_FAST TRITON path. Callers check posenc_concat_fold_enabled."""
+    assert time_bucket_fn in ["sqrt", "log"]
+    return triton_concat_add_timestamp_positional_embeddings(
+        values_left=values_left,
+        values_right=values_right,
+        seq_offsets=seq_offsets,
+        pos_embeddings=position_embeddings_weight,
+        ts_embeddings=timestamp_embeddings_weight,
+        timestamps=timestamps,
+        max_seq_len=max_seq_len,
+        max_contextual_seq_len=max_contextual_seq_len,
+        seq_lengths=seq_lengths,
+        num_targets=num_targets,
+        interleave_targets=interleave_targets,
+        time_bucket_fn=time_bucket_fn,
+        alpha=alpha,
+    )
+
+
+@torch.jit.unused
+def add_timestamp_positional_embeddings_concat_dropout(
+    alpha: float,
+    max_seq_len: int,
+    max_contextual_seq_len: int,
+    position_embeddings_weight: torch.Tensor,
+    timestamp_embeddings_weight: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    values_left: torch.Tensor,
+    values_right: torch.Tensor,
+    timestamps: torch.Tensor,
+    num_targets: Optional[torch.Tensor],
+    interleave_targets: bool,
+    dropout_p: float,
+    attach_dropout_handoff: bool,
+    time_bucket_fn: str = "sqrt",
+) -> torch.Tensor:
+    """DLRM_HSTU_FP8_POSENC_DROPOUT_FUSE: == input_dropout(
+    add_timestamp_positional_embeddings_concat(...), dropout_p, training=True)
+    bitwise (output, mask, CUDA generator state, gradients). Callers check
+    posenc_concat_fold_enabled and posenc_dropout_fuse_supported."""
+    assert time_bucket_fn in ["sqrt", "log"]
+    return triton_concat_add_timestamp_positional_embeddings_dropout(
+        values_left=values_left,
+        values_right=values_right,
+        seq_offsets=seq_offsets,
+        pos_embeddings=position_embeddings_weight,
+        ts_embeddings=timestamp_embeddings_weight,
+        timestamps=timestamps,
+        max_seq_len=max_seq_len,
+        max_contextual_seq_len=max_contextual_seq_len,
+        seq_lengths=seq_lengths,
+        num_targets=num_targets,
+        interleave_targets=interleave_targets,
+        time_bucket_fn=time_bucket_fn,
+        alpha=alpha,
+        dropout_p=dropout_p,
+        attach_dropout_handoff=attach_dropout_handoff,
+    )
 
 
 def add_timestamp_positional_embeddings(
