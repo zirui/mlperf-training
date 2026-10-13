@@ -74,6 +74,19 @@ Triton kernels on a small synthetic input built without RNG and checks the
 result bitwise against fp64. It leaves Triton compiled kernels and that
 module's gate cache behind; a failure latches only that path off.
 
+X2H HOOK (_prebuild_ec_dgrad_x2h, inside the EC_DGRAD_SEGREDUCE hook's RNG /
+sync bracket, only with DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE_HIP=1 (default OFF)
+while EC_DGRAD_SEGREDUCE is still armed; unset or "0": nothing is imported).
+ops/hip/ec_dgrad_x2h.prebuild builds x2h_pass.cu with hipcc (cached per source /
+flags / toolchain), checks it exactly on EC_DGRAD_SEGREDUCE's synthetic input
+and bitwise against the Triton passes on a deterministic rounding-heavy input
+(no RNG state; sentinel-filled outputs, counters checked after every call),
+then arms the device. It leaves the loaded library, the zero row and the tile
+counters behind and releases its transient (torch.cuda.empty_cache) before
+alloc_pregrow. A failure latches only X2H off (EC_DGRAD_SEGREDUCE keeps its
+Triton passes). With the knob on but EC_DGRAD_SEGREDUCE off, not armed or
+latched off by its prebuild, the hook prints the knob's IGNORED line instead.
+
 Indexed-X HOOK (_prebuild_ec_indexed_l1, only with DLRM_HSTU_FP8_EC_INDEXED_L1=1, default OFF; unset or "0":
 returns before importing anything). triton_ec_indexed_l1.prebuild compiles the six Triton kernels (_ecix_fwd,
 _ecix_wgrad, _ecix_wgrad_reduce x item + cat) on a synthetic integer-valued input built without RNG and checks
@@ -613,10 +626,12 @@ def _prebuild_ec_dgrad_segreduce(device: torch.device) -> None:
     against an fp64 reference. A failure latches the path off for the process
     (one FAILED CLOSED line) and startup goes on; a sticky device fault fails
     the run here, as in _warmup_preproc_fp8_l2. Gate unset or "0": returns
-    before importing anything."""
+    before importing anything. X2H (_prebuild_ec_dgrad_x2h) runs inside this
+    bracket, after this path's own prebuild."""
     if os.environ.get("DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE", "").strip().lower() not in (
         "1", "true", "on", "yes",
     ):
+        _x2h_ignored_without_ex2b("DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE is off")
         return
     if device.type != "cuda" or not torch.cuda.is_available():
         return
@@ -624,6 +639,7 @@ def _prebuild_ec_dgrad_segreduce(device: torch.device) -> None:
         from generative_recommenders.ops.triton import triton_ec_dgrad_segreduce as xs
 
         if not xs.enabled():
+            _x2h_ignored_without_ex2b("ec-dgrad-segreduce is not armed (see its IGNORED / FAILED CLOSED line)")
             return
         rng_before = _rng_snapshot(device)
     except Exception as error:  # never abort a run over a warmup
@@ -633,6 +649,7 @@ def _prebuild_ec_dgrad_segreduce(device: torch.device) -> None:
         xs.prebuild(device)
     except Exception as error:
         xs.latch_off("prebuild", error)
+    x2h_ran = _prebuild_ec_dgrad_x2h(device, xs)  # X2H: its own knob, only while this path is armed
     try:
         rng_after = _rng_snapshot(device)
         if not torch.equal(rng_before[0], rng_after[0]) or (
@@ -651,8 +668,67 @@ def _prebuild_ec_dgrad_segreduce(device: torch.device) -> None:
         raise RuntimeError(
             "[blas-warmup] device fault during the ec-dgrad-segreduce prebuild; "
             "the HIP context is unusable. Rerun with "
+            "DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE_HIP=0 (X2H) or "
             "DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE=0 to isolate."
         ) from error
+    if x2h_ran:  # release X2H's cross-check transient before alloc_pregrow
+        try:
+            torch.cuda.empty_cache()
+        except Exception as error:
+            logger.warning("[blas-warmup] empty_cache after the ec-dgrad-x2h prebuild failed: %s", error)
+
+
+# X2H: literal copies of ops/hip/ec_dgrad_x2h.ENV_VAR / TAG (read without importing).
+_X2H_ENV: str = "DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE_HIP"
+_X2H_TAG: str = "[ec-dgrad-x2h]"
+
+
+def _x2h_requested() -> bool:
+    return os.environ.get(_X2H_ENV, "").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _x2h_ignored_without_ex2b(why: str) -> None:
+    """X2H knob on while the fused EC dgrad (DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE) is off, not armed or
+    latched off: its IGNORED line, once per process (this hook runs once), every rank. Imports only
+    ops/utils; knob off: returns at once."""
+    if not _x2h_requested():
+        return
+    msg = f"{_X2H_TAG} {_X2H_ENV}=1 IGNORED (NOT armed): {why}; x2h_pass runs only as ec-dgrad-segreduce's pass"
+    try:
+        from generative_recommenders.ops.utils import arm_print_all_ranks
+
+        arm_print_all_ranks(msg)
+    except Exception:  # never abort a run over a warmup line
+        logger.warning("%s", msg)
+
+
+def _prebuild_ec_dgrad_x2h(device: torch.device, xs) -> bool:  # pyre-ignore[2]
+    """X2H (ops/hip/ec_dgrad_x2h.py, DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE_HIP=1, default OFF): called inside
+    _prebuild_ec_dgrad_segreduce's RNG / sync bracket, after that path's prebuild, and acts only while
+    it is still armed. ec_dgrad_x2h.prebuild builds and loads x2h_pass, checks it exactly and bitwise
+    against the Triton passes and arms the device ("[ec-dgrad-x2h] pre-run_start prebuild OK (...)",
+    every rank). A failure latches only X2H off (one FAILED CLOSED line; the fused EC dgrad stays on).
+    True when it ran (the caller then releases its transient). Knob unset or "0": returns before
+    importing."""
+    if not _x2h_requested():
+        return False
+    if not xs.enabled():
+        _x2h_ignored_without_ex2b("ec-dgrad-segreduce failed its pre-run_start prebuild (see its FAILED CLOSED line)")
+        return False
+    try:
+        from generative_recommenders.ops.hip import ec_dgrad_x2h as x2h
+    except Exception as error:  # dgrad_segreduce then declines X2H the same way: say it now
+        xs._say(f"{_X2H_TAG} FAILED CLOSED at prebuild (import): {type(error).__name__}: "
+                f"{str(error)[:300]} -> Triton _ecx_dgrad_pass for the rest of the run")
+        return False
+    try:
+        x2h.prebuild(device)  # arms the device or latches X2H off; never raises
+    except Exception as error:  # belt and braces
+        try:
+            x2h.latch_off("prebuild", error)
+        except Exception:
+            pass
+    return True
 
 
 def _prebuild_ec_indexed_l1(device: torch.device) -> None:

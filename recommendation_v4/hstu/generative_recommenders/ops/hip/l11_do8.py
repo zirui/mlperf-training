@@ -16,7 +16,7 @@
 """DO8: the attention-backward dO quantization folded into L11's e5m2-du mode.
 
 DLRM_HSTU_FP8_L11_DO8 (yambda_5b.gin; only "1" arms it, "0" or any other value is off). Producer side of the dO8
-contract in ops/flydsl/hstu_do8_registry.py ('plus' only).
+contract in ops/flydsl/hstu_do8_registry.py ('plus', and 'only' with DLRM_HSTU_FP8_L11_DO8_ONLY).
 
 WHAT. On an ordinary-layer backward call that L11 runs in its e5m2-du mode (DLRM_HSTU_FP8_BWD_DU_E5M2), and whose
 attention backward will quantize dO on the do_blk path (the attention forward tagged a dO8 site on `out`), ONE launch
@@ -57,6 +57,33 @@ with FAMILY. "armed OK: <FAMILY> prebuild before run_start ...", "armed OK: <FAM
 first published record, "<FAMILY> NOT armed: <reason> ..." once per unexpected reason, "<FAMILY> DISABLED: ...",
 "<FAMILY> INERT: ...", "<FAMILY> prebuild DEVICE FAULT: ...". Counters ("[l11-do8] counters ...") at events 1, 2, 4,
 8, ... and once at exit.
+
+DO8-ONLY (DLRM_HSTU_FP8_L11_DO8_ONLY == "1", read per call; contract v2 'only', ops/flydsl/hstu_do8_registry.py).
+On a call DO8 emits for, after every decline check and the dz8 / dO8 / E8 allocations (host only; the placeholder / partials allocations and the launch's checks follow it and are
+covered by cancel), registry.plan(site, attn) decides: "only" -> the EM = 2 launch from a second .so (l11_do8.cu built
+with -DL11DO8_ONLY=1: the same outputs minus the bf16 d(attn) store); autograd receives the launch's untouched d(attn)
+buffer as a placeholder (NaN-filled with DLRM_HSTU_FP8_L11_DO8_ONLY_POISON=1), and publish() hands the record over with
+bf16_written=False, re-raising any registry error (no exact fallback exists without the bf16 d(attn)). "plus" (and the
+knob unset or "0": then the registry is not even asked) -> exactly the DO8 path above. A planned call that fails after
+the plan is cancelled (registry.cancel) and falls back like any failed DO8 call (L11's own E5 launch writes the bf16
+d(attn)); a failed EM = 2 kernel launch (rc > 0) latches only 'only', any other failure latches DO8 as in 'plus'. The
+'only' .so has its own build, cache key, resource gate (EM = 2 instantiation, 0 VGPR spill, 0 scratch, LDS_BYTES) and
+first-use self-check (EM = 2 vs EM = 1 on self_check's synthetic inputs: dO8, E8, dz8 and every partial byte-identical,
+the EM = 2 d(attn) buffer's sentinel bytes untouched), built at prebuild after DO8's own self-check; any failure there
+(or of an EM = 2 kernel launch) latches only 'only' (DO8 keeps its 'plus' launches). The non-VD source
+(l11_do8_novd.cu, DLRM_HSTU_FP8_L11_VD != "1") has no 'only' build: 'plus' (one INERT line). Lines start with
+FAMILY_ONLY: "armed OK: ... only prebuild before run_start ...", "armed OK: ... only ACTIVE mode=e5 only ..." at the
+first 'only' record, "... only DISABLED: ...", "... only INERT: ...", "... only prebuild DEVICE FAULT: ..."; counters
+"[l11-do8] only counters: planned= only_launched= published= cancelled= fallback= plan_plus= latched=" at the arming
+line, at the first cancel / fallback / plan_plus, at a latch and once at exit.
+
+DO8 DIET (DLRM_HSTU_FP8_L11_DO8_DIET == "1", read once, lazily). l11_do8.cu carries a VALU/SGPR reduction of the
+emission tail (packed u16 group maxima, one SGPR row count per tile, a rolling E8 staging window, a packed exchange
+tree) behind its preprocessor switch L11DO8_DIET (default 1). Knob "1": no define (the .cu's default 1). Absent, "0"
+or any other value: the flags gain -DL11DO8_DIET=0, which compiles the non-diet kernel body in every guarded region,
+for the 'plus' and the 'only' .so alike; the define is part of the flags, so each setting has its own cache key and
+.so. Same output bytes either way (only the ISA differs). The non-VD l11_do8_novd.cu has no such switch (the define is inert there).
+The prebuild lines gain "; diet OFF (...)" only when the knob is not "1".
 """
 
 import atexit
@@ -116,10 +143,36 @@ HD: int = 128  # head dim (H * HD = 512 = L11's D)
 B_MAX: int = 8192  # sequences per list build (1024 threads x 8)
 # The production instantiation's template arguments in the mangled name (E5 1, WLIST 2, EM 1, RET 0, EMV 2, TM 0).
 _PROD_MANGLE: str = "ILi1ELi2ELi0ELi0ELi1ELi2ELi1ELi0ELi1ELi2ELi1ELi0ELi2ELi0EE"
+# DO8-ONLY: the producer knob of contract v2 (== hstu_do8_registry.ONLY_ENV; the registry reads the
+# same variable per call), its line family, the 'only' build of l11_do8.cu and its instantiation (EM 2).
+ONLY_KNOB: str = KNOB + "_ONLY"
+FAMILY_ONLY: str = FAMILY + " only"
+ITEM_ONLY: str = "(DO8-ONLY)"
+_ONLY_DEFINE: str = "-DL11DO8_ONLY=1"
+_LIB_NAME_ONLY: str = "libl11_do8_only.so"
+_ONLY_MANGLE: str = "ILi1ELi2ELi0ELi0ELi1ELi2ELi1ELi0ELi1ELi2ELi2ELi0ELi2ELi0EE"
+_POISON_BF16: int = 0x7FC0  # contract v2 debug knob (registry.poison_requested): a bf16 NaN in every placeholder word
+_SENTINEL_BF16: int = 0x7FA5  # the 'only' self-check's prefill of the EM = 2 d(attn) buffer (a NaN payload)
+# The attribute an EM = 2 placeholder carries (its site), so publish() can never send it out as 'plus'
+_ONLY_PLACEHOLDER_ATTR: str = "_l11_do8_only_placeholder_site"
+# DO8 DIET: the knob, and the define its "off" adds to every l11_do8 build ('plus' and 'only'); "1" adds nothing (the
+# .cu defaults L11DO8_DIET to 1).
+DIET_KNOB: str = KNOB + "_DIET"
+_DIET_OFF_DEFINE: str = "-DL11DO8_DIET=0"
+
+
+class OnlyLaunchError(RuntimeError):
+    """DO8-ONLY: the EM = 2 kernel launch itself failed (l11do8_e5_only_launch rc > 0). This is the one
+    failure of an 'only' call that latches 'only' alone; any other failure of such a call (launch_e5_plus's checks,
+    plan(cap), the drain, the placeholder / partials allocations, the host work after the launch) can happen to a
+    'plus' call too and latches DO8, as it does there."""
+
 
 _lock = threading.Lock()
 _requested: Optional[bool] = None
 _override: Optional[bool] = None
+_diet: Optional[bool] = None  # DO8 DIET knob, read once (lazily, at the first build)
+_diet_override: Optional[bool] = None
 _broken: Optional[str] = None
 _lib: Optional[ctypes.CDLL] = None
 _lib_path: Optional[Path] = None
@@ -152,6 +205,26 @@ _COUNTS: Dict[str, int] = {
 }
 _DECLINED: Dict[str, int] = {}
 _STATE: Dict[str, Any] = {"events": 0, "atexit": False}
+# DO8-ONLY state: latch, prebuild flag, the 'only' .so, the in-flight 'only' call (its site and a weakref to its
+# placeholder, from the launch to publish) and the producer-side counters.
+_only_broken: Optional[str] = None
+_only_prebuilt: bool = False
+_only_lib: Optional[ctypes.CDLL] = None
+_only_lib_path: Optional[Path] = None
+_fn_launch_only: Optional[Callable[..., int]] = None
+_impl_only: str = ""
+_only_resources: Dict[str, Any] = {}
+_only_logged: bool = False
+_ONLY_CALL: Dict[str, Any] = {}
+_ONLY_COUNTS: Dict[str, int] = {
+    "planned": 0,
+    "only_launched": 0,
+    "published": 0,
+    "cancelled": 0,
+    "fallback": 0,
+    "plan_plus": 0,
+}
+_ONLY_STATE: Dict[str, Any] = {"atexit": False}
 
 
 # ---------------------------------------------------------------------------- knob / latch / lines
@@ -202,6 +275,33 @@ def set_requested_for_testing(value: Optional[bool]) -> None:
     _requested = None
 
 
+def diet_requested() -> bool:
+    """DLRM_HSTU_FP8_L11_DO8_DIET == "1" (surrounding whitespace ignored; read once, lazily: the first build runs after
+    the gin env bootstrap). Absent, "", "0" or any other value: False -> every l11_do8 build adds -DL11DO8_DIET=0 (the
+    non-diet kernel body). The gin file binds it True."""
+    global _diet
+    if _diet_override is not None:
+        return _diet_override
+    if _diet is None:
+        _diet = os.environ.get(DIET_KNOB, "").strip() == "1"
+    return _diet
+
+
+def set_diet_for_testing(value: Optional[bool]) -> None:
+    """Tests only: force the DIET knob (None = read the environment again). A library already loaded is not rebuilt:
+    use reset_for_testing(unload=True) before the next _load()."""
+    global _diet_override, _diet
+    _diet_override = value
+    _diet = None
+
+
+def _diet_tail() -> str:
+    """The prebuild lines' DIET note: empty with the knob on (the lines are unchanged), else names the OFF build."""
+    if diet_requested():
+        return ""
+    return f"; diet OFF ({DIET_KNOB} != 1: {_DIET_OFF_DEFINE}, non-diet kernel body)"
+
+
 def set_prebuilt_for_testing(value: bool) -> None:
     global _prebuilt
     _prebuilt = value
@@ -223,6 +323,7 @@ def reset_for_testing(unload: bool = False) -> None:
         _COUNTS[k] = 0
     _DECLINED.clear()
     _STATE["events"] = 0
+    _reset_only_for_testing(unload)
     if unload:
         with _lock:
             _lib = None
@@ -230,6 +331,23 @@ def reset_for_testing(unload: bool = False) -> None:
             _fn_launch = _fn_wl_build = _fn_wl_cap = _fn_plan = _fn_drain = None
             _impl = ""
             _resources.clear()
+
+
+def _reset_only_for_testing(unload: bool) -> None:
+    global _only_broken, _only_prebuilt, _only_logged, _only_lib, _only_lib_path, _fn_launch_only, _impl_only
+    _only_broken = None
+    _only_prebuilt = False
+    _only_logged = False
+    _ONLY_CALL.clear()
+    for k in _ONLY_COUNTS:
+        _ONLY_COUNTS[k] = 0
+    if unload:
+        with _lock:
+            _only_lib = None
+            _only_lib_path = None
+            _fn_launch_only = None
+            _impl_only = ""
+            _only_resources.clear()
 
 
 def _fail_closed() -> bool:
@@ -320,6 +438,95 @@ def note_bf16_mode(ctx: Any) -> None:
         _COUNTS["bf16_mode"] += 1
 
 
+# ---------------------------------------------------------------------------- DO8-ONLY knob / latch / lines
+def only_requested() -> bool:
+    """DLRM_HSTU_FP8_L11_DO8_ONLY == "1" (surrounding whitespace ignored), read per call like the registry's own read of
+    the same variable (hstu_do8_registry.only_requested, which prints the REQUESTED / invalid-value lines). Absent, "",
+    "0" or any other value: False, and DO8 runs exactly its 'plus' path."""
+    return os.environ.get(ONLY_KNOB, "").strip() == "1"
+
+
+def only_enabled() -> bool:
+    """An 'only' launch is possible: the knob on, DO8 enabled, the 'only' .so prebuilt and not latched."""
+    return only_requested() and enabled() and _only_prebuilt and _only_broken is None
+
+
+def only_broken() -> Optional[str]:
+    return _only_broken
+
+
+def only_prebuilt() -> bool:
+    return _only_prebuilt
+
+
+def only_resources() -> Dict[str, Any]:
+    return dict(_only_resources)
+
+
+def only_impl() -> str:
+    return _impl_only
+
+
+def only_library_path() -> Optional[Path]:
+    return _only_lib_path
+
+
+def only_counters() -> Dict[str, Any]:
+    out: Dict[str, Any] = dict(_ONLY_COUNTS)
+    out["latched"] = int(_only_broken is not None)
+    return out
+
+
+def set_only_prebuilt_for_testing(value: bool) -> None:
+    global _only_prebuilt
+    _only_prebuilt = value
+
+
+def only_summary_line(final: bool = False) -> str:
+    c = _ONLY_COUNTS
+    return (
+        f"[l11-do8] only counters: planned={c['planned']} only_launched={c['only_launched']} "
+        f"published={c['published']} cancelled={c['cancelled']} fallback={c['fallback']} plan_plus={c['plan_plus']} "
+        f"latched={int(_only_broken is not None)}" + (" final=1" if final else "")
+    )
+
+
+def _only_final() -> None:
+    if any(_ONLY_COUNTS.values()) or _only_broken is not None:
+        arm_print_all_ranks(only_summary_line(final=True))
+
+
+def _only_atexit() -> None:
+    if not _ONLY_STATE["atexit"]:
+        _ONLY_STATE["atexit"] = True
+        atexit.register(_only_final)
+
+
+def _only_event(key: str) -> None:
+    """Count one 'only' event; the counter line at the first cancel / fallback / plan_plus of the process."""
+    _ONLY_COUNTS[key] += 1
+    _only_atexit()
+    if key in ("cancelled", "fallback", "plan_plus") and _ONLY_COUNTS[key] == 1:
+        arm_print_all_ranks(only_summary_line())
+
+
+def _disable_only(reason: str) -> None:
+    """Latch DO8-ONLY (only 'only') off for this process and print one DISABLED line: DO8 keeps its 'plus' launches
+    (EM = 1, the bf16 d(attn) written) and its own latch."""
+    global _only_broken
+    if _fail_closed():
+        raise RuntimeError(f"{FAMILY_ONLY} failed with {KNOB}_FAIL_CLOSED=1: {reason}")
+    if _only_broken is not None:
+        return
+    _only_broken = reason
+    _only_atexit()
+    arm_print_all_ranks(
+        f"{FAMILY_ONLY} DISABLED: {reason} -> {ITEM} 'plus' for this process (the bf16 d(attn) is written; "
+        "DO8 and L11 unaffected)"
+    )
+    arm_print_all_ranks(only_summary_line())
+
+
 # ---------------------------------------------------------------------------- registry (hstu_do8_registry)
 def registry() -> Any:
     """The consumer's registry module, or None when this tree has no registry (one INERT line, knob on only)."""
@@ -371,35 +578,40 @@ def _source() -> Path:
     return _SOURCE if l11.vd_requested() else _SOURCE_NOVD
 
 
-def _flags(src: bytes) -> List[str]:
+def _flags(src: bytes, only: bool = False) -> List[str]:
     sha = hashlib.sha256(src).hexdigest()
-    return [f"--offload-arch={_ARCH}", *_BASE_FLAGS, *_SCHED_FLAGS[sched()], f'-DL11DO8_SRC_SHA256="{sha}"']
+    # DO8 DIET: knob off -> -DL11DO8_DIET=0 (before the 'only' define); on -> no define
+    diet = [] if diet_requested() else [_DIET_OFF_DEFINE]
+    return [f"--offload-arch={_ARCH}", *_BASE_FLAGS, *_SCHED_FLAGS[sched()], f'-DL11DO8_SRC_SHA256="{sha}"'] + diet + (
+        [_ONLY_DEFINE] if only else []
+    )
 
 
-def build_command(source: Path, out: Path) -> List[str]:
-    """The exact hipcc command of `build`."""
-    return [l11._hipcc(), str(source.resolve()), *_flags(source.read_bytes()), "-o", str(out.resolve())]
+def build_command(source: Path, out: Path, only: bool = False) -> List[str]:
+    """The exact hipcc command of `build`. only=True: the DO8-ONLY .so (the same flags + -DL11DO8_ONLY=1)."""
+    return [l11._hipcc(), str(source.resolve()), *_flags(source.read_bytes(), only), "-o", str(out.resolve())]
 
 
-def cache_key(source: Optional[Path] = None) -> str:
+def cache_key(source: Optional[Path] = None, only: bool = False) -> str:
     source = source or _source()
     src = source.read_bytes()
     digest = hashlib.sha256()
     digest.update(src)
-    digest.update(b"\0" + "\0".join(_flags(src)).encode())
+    digest.update(b"\0" + "\0".join(_flags(src, only)).encode())
     digest.update(b"\0" + _ARCH.encode())
     digest.update(b"\0" + l11._toolchain(l11._hipcc()).encode())
     return digest.hexdigest()[:16]
 
 
-def _cache_dir(source: Optional[Path] = None) -> Path:
+def _cache_dir(source: Optional[Path] = None, only: bool = False) -> Path:
     root = os.environ.get(KNOB + "_CACHE", "").strip() or _CACHE_ROOT
-    return Path(root) / cache_key(source)
+    return Path(root) / cache_key(source, only)
 
 
-def check_resources(kernels: List[Dict[str, str]]) -> Dict[str, Any]:
+def check_resources(kernels: List[Dict[str, str]], mangle: str = _PROD_MANGLE) -> Dict[str, Any]:
     """DO8's own gate (L11's is untouched): the 'plus' kernel and the list builder must report 0 VGPR spill and 0
-    scratch, and the 'plus' kernel exactly LDS_BYTES of LDS; raises otherwise (the caller latches DO8 off)."""
+    scratch, and the 'plus' kernel exactly LDS_BYTES of LDS; raises otherwise (the caller latches DO8 off). DO8-ONLY:
+    mangle=_ONLY_MANGLE gates the 'only' .so the same way (its single DO8 kernel must be the EM = 2 instantiation)."""
     mine = [k for k in kernels if KERNEL_NAME in k.get("Function Name", "")]
     wlb = [k for k in kernels if BUILD_KERNEL_NAME in k.get("Function Name", "")]
     if len(mine) != 1:
@@ -414,7 +626,7 @@ def check_resources(kernels: List[Dict[str, str]]) -> Dict[str, Any]:
                 f"resource check: {k.get('Function Name')} VGPR spill {spill}, scratch {scratch} B/lane (need 0/0)"
             )
     p = mine[0]
-    if _PROD_MANGLE not in p.get("Function Name", ""):
+    if mangle not in p.get("Function Name", ""):
         raise RuntimeError(f"resource check: unexpected instantiation {p.get('Function Name')}")
     lds = int(p.get("LDS Size [bytes/block]", "-1"))
     if lds != LDS_BYTES:
@@ -432,24 +644,27 @@ def check_resources(kernels: List[Dict[str, str]]) -> Dict[str, Any]:
     }
 
 
-def build(source: Optional[Path] = None) -> Tuple[Path, Dict[str, Any]]:
+def build(source: Optional[Path] = None, only: bool = False) -> Tuple[Path, Dict[str, Any]]:
     """Compile (cache hit: no compile) and return (library path, resource summary). Raises on any failure (missing
     hipcc, compile error or compiler crash, timeout, VGPR spill, scratch, LDS mismatch). Same race-safe cache protocol
-    as L11's loader (per-host/pid/thread temp file, atomic renames, sidecar before the .so)."""
+    as L11's loader (per-host/pid/thread temp file, atomic renames, sidecar before the .so). only=True: the DO8-ONLY
+    .so (-DL11DO8_ONLY=1, its own cache key, file name and gate on the EM = 2 instantiation)."""
     source = source or _source()
-    so = _cache_dir(source) / _LIB_NAME
-    meta = so.with_name(_LIB_NAME + ".resources.json")
+    name = _LIB_NAME_ONLY if only else _LIB_NAME
+    mangle = _ONLY_MANGLE if only else _PROD_MANGLE
+    so = _cache_dir(source, only) / name
+    meta = so.with_name(name + ".resources.json")
     if so.is_file() and meta.is_file():
         summary = json.loads(meta.read_text())
-        check_resources(summary["kernels_raw"])
+        check_resources(summary["kernels_raw"], mangle)
         return so, summary
     so.parent.mkdir(parents=True, exist_ok=True)
     tag = f"tmp-{socket.gethostname()}-{os.getpid()}-{threading.get_ident()}"
-    tmp = so.parent / f"{tag}-{_LIB_NAME}"
-    tmp_meta = so.parent / f"{tag}-{_LIB_NAME}.resources.json"
+    tmp = so.parent / f"{tag}-{name}"
+    tmp_meta = so.parent / f"{tag}-{name}.resources.json"
     work = so.parent / f"{tag}-build"
     src = source.read_bytes()
-    cmd = build_command(source, tmp)
+    cmd = build_command(source, tmp, only)
     try:
         work.mkdir(parents=True, exist_ok=True)
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_BUILD_TIMEOUT_S, cwd=str(work))
@@ -457,7 +672,7 @@ def build(source: Optional[Path] = None) -> Tuple[Path, Dict[str, Any]]:
         if proc.returncode != 0 or not tmp.is_file():
             raise RuntimeError(f"hipcc rc={proc.returncode} (sched={sched()}): {log.strip()[-1200:]}")
         kernels = l11.parse_resource_remarks(log)
-        summary = check_resources(kernels)
+        summary = check_resources(kernels, mangle)
         summary["kernels_raw"] = kernels
         summary["src_sha256"] = hashlib.sha256(src).hexdigest()
         tmp_meta.write_text(json.dumps(summary))
@@ -541,6 +756,43 @@ def _load() -> None:
         _build_secs = time.perf_counter() - t0
         _lib_path = so
         _lib = lib
+
+
+def _load_only() -> None:
+    """DO8-ONLY: build (or reuse) + gate + load the 'only' .so and bind l11do8_e5_only_launch, whose C signature is
+    l11do8_e5_plus_launch's (same argtypes, copied from the bound 'plus' entry: _load() runs first). The work list,
+    plan and drain stay the 'plus' .so's. Raises on any failure (the caller latches 'only' only)."""
+    global _only_lib, _only_lib_path, _fn_launch_only, _impl_only
+    if _only_lib is not None:
+        return
+    _load()
+    with _lock:
+        if _only_lib is not None:
+            return
+        assert _fn_launch is not None
+        so, summary = build(only=True)
+        lib = ctypes.CDLL(str(so))
+        abi = lib.l11do8_abi_version
+        abi.restype = ctypes.c_int
+        abi.argtypes = []
+        got = int(abi())
+        if got != _ABI_VERSION:
+            raise RuntimeError(f"'only' .so: l11do8_abi_version()={got}, expected {_ABI_VERSION}")
+        launch = lib.l11do8_e5_only_launch
+        launch.restype = ctypes.c_int
+        launch.argtypes = list(_fn_launch.argtypes)
+        tag = lib.l11do8_impl
+        tag.restype = ctypes.c_char_p
+        tag.argtypes = []
+        impl_ = (tag() or b"").decode()
+        if "EM 2 only" not in impl_:
+            raise RuntimeError(f"'only' .so impl {impl_[:200]!r} is not the EM 2 build")
+        _only_resources.clear()
+        _only_resources.update({k: v for k, v in summary.items() if k != "kernels_raw"})
+        _impl_only = impl_
+        _fn_launch_only = launch
+        _only_lib_path = so
+        _only_lib = lib
 
 
 def wl_cap(m: int, b: int) -> int:
@@ -679,13 +931,23 @@ def launch_e5_plus(
     cap: int,
     do8: torch.Tensor,
     e8: torch.Tensor,
+    only: bool = False,
+    dx: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """One DO8 launch on the current stream into the caller's dz8 / do8 / e8 (raw: tests and the self-check keep the
     partials). Returns (dx, DWP, DBP, DUCS, AMAXP, P); raises on a launch error (rc > 0). `run_e5_plus` is the
-    production entry."""
+    production entry. DO8-ONLY: only=True launches the EM = 2 instantiation of the 'only' .so (same outputs, dx NOT
+    written: the returned dx is the untouched placeholder); dx = a caller buffer of attn's shape / dtype (the 'only'
+    self-check prefills a sentinel), else a fresh torch.empty_like(attn) in both modes."""
     _load()
-    assert _fn_launch is not None and _fn_drain is not None
+    if only:
+        _load_only()
+    fn = _fn_launch_only if only else _fn_launch
+    assert fn is not None and _fn_drain is not None
     m = int(attn.shape[0])
+    if dx is not None and not (dx.dtype == attn.dtype and tuple(dx.shape) == tuple(attn.shape) and dx.is_contiguous()
+                               and l11._a16(dx) and dx.device == attn.device):
+        raise RuntimeError(f"dx layout {dx.dtype} {tuple(dx.shape)} {dx.stride()} (attn {tuple(attn.shape)})")
     rows_out = int(dz8.shape[0])
     if not (dz8.dtype == torch.float8_e5m2 and dz8.dim() == 2 and int(dz8.shape[1]) == l11.DU_ROW
             and dz8.stride() == (l11.DU_ROW, 1) and l11._a16(dz8) and m <= rows_out < m + l11.E5_MAX_PAD):
@@ -706,13 +968,14 @@ def launch_e5_plus(
         if stale != 0:
             _print_once(f"stale:{stale}", f"{FAMILY}: stale HIP error {stale} drained before the launch (not ours)")
         stream = torch.cuda.current_stream(device).cuda_stream
-        dx = torch.empty_like(attn)
+        if dx is None:
+            dx = torch.empty_like(attn)  # 'plus': the bf16 d(attn); 'only': the placeholder (not written)
         dwp = torch.empty((P, l11.D), dtype=torch.float32, device=device)
         dbp = torch.empty((P, l11.D), dtype=torch.float32, device=device)
         ducs = torch.empty((P, l11.D), dtype=torch.float32, device=device)
         amaxp = torch.empty((G * 8,), dtype=torch.float32, device=device)
         rc = int(
-            _fn_launch(
+            fn(
                 g8.data_ptr(), w8.data_ptr(), sa.data_ptr(), sb.data_ptr(), m,
                 attn.data_ptr(), u.data_ptr(), random_mask.data_ptr(), mean.data_ptr(), rstd.data_ptr(),
                 norm_weight.data_ptr(), norm_bias.data_ptr(), dx.data_ptr(), dz8.data_ptr(), rows_out,
@@ -722,7 +985,8 @@ def launch_e5_plus(
             )
         )
     if rc > 0:
-        raise RuntimeError(f"l11do8_e5_plus_launch rc={rc} (hipError) M={m}")
+        msg = f"l11do8_e5_{'only' if only else 'plus'}_launch rc={rc} (hipError) M={m}"
+        raise OnlyLaunchError(msg) if only else RuntimeError(msg)  # only the EM = 2 kernel's own rc latches 'only'
     if rc < 0:
         _print_once(f"stale:{-rc}", f"{FAMILY}: stale HIP error {-rc} drained at the launch (not ours; result used)")
     return dx, dwp, dbp, ducs, amaxp, P
@@ -755,11 +1019,19 @@ def run_e5_plus(
     DuE5m2Emit) -- the same checks (l11._operands_ok, l11.e5_decline_reason), the same dz8 / record construction --
     plus (dO8 [M, 512] e4m3fn, E8 [M, 4] uint8) for `site` (from emission_site). None = declined (its own line) or
     failed (DO8 latched, DISABLED line): the caller then runs L11's own run_e5 on the SAME operands, which writes only
-    fresh buffers too, so nothing of this attempt is visible."""
+    fresh buffers too, so nothing of this attempt is visible.
+    DO8-ONLY: after every decline check and the dz8 / dO8 / E8 allocations, `_plan_only` asks registry.plan(site, x)
+    (x = the attn the forward received); the placeholder / partials allocations and launch_e5_plus's checks (layouts,
+    plan(cap), the drain) follow it and are covered by cancel. "only" -> the EM = 2 launch, and dx is the untouched
+    placeholder (poisoned on request) that publish() then hands over with bf16_written=False. A failure after an "only"
+    plan (or with a plan left open on the site) cancels it (registry.cancel) before returning None (L11's own run_e5
+    then writes the bf16 d(attn)). Only the EM = 2 kernel's own failure (rc > 0: OnlyLaunchError) latches 'only' alone;
+    any other failure of the call can happen to a 'plus' call too and latches DO8, as there."""
     if not (enabled() and _prebuilt and l11.enabled() and l11.prebuilt()):
         return None
     m = int(x.shape[0])
     why = l11._operands_ok(g8, w8, sa, sb, m)
+    only = launched = False
     try:
         from generative_recommenders.ops.triton import bwd_fp8, hstu_du_e5m2
 
@@ -778,10 +1050,14 @@ def run_e5_plus(
         dz8 = torch.empty((rows_out, du_row_width), dtype=grad_dtype, device=x.device)
         do8 = torch.empty((m, l11.D), dtype=torch.float8_e4m3fn, device=x.device)
         e8 = torch.empty((m, H), dtype=torch.uint8, device=x.device)
+        only = _plan_only(site, x)  # DO8-ONLY: contract v2 plan(); False with the knob off (cancel covers the rest)
         dx, dwp, dbp, ducs, amaxp, P = launch_e5_plus(
             g8, w8, sa, sb, x, u, random_mask, mean, rstd, weight, bias, dropout_ratio, inv_scale, dz8, wl, cnt, cap,
-            do8, e8,
+            do8, e8, only=only,
         )
+        launched = True
+        if only and _registry_mod.poison_requested():
+            dx.view(torch.int16).fill_(_POISON_BF16)  # contract v2 debug knob: any hidden reader sees NaN
         dweight = torch.empty((l11.D,), dtype=weight.dtype, device=x.device)
         dbias = torch.empty((l11.D,), dtype=weight.dtype, device=x.device)
         l11.dwdb_finalize(dwp, dbp, dweight, dbias, P)
@@ -799,24 +1075,73 @@ def run_e5_plus(
             generation=generation,
             buffer_ptr=0,  # no d(uvqk) buffer handed over (placeholder du), as run_e5
         )
-    except Exception as error:  # noqa: BLE001 -- latch DO8 only; the caller runs L11's own launch
+    except Exception as error:  # noqa: BLE001 -- latch DO8 (or 'only' only); the caller runs L11's own launch
+        if only or getattr(site, "only_plan", None) is not None:
+            # DO8-ONLY: this call will not publish 'only' (L11's own run_e5 writes the bf16 d(attn)): close the plan,
+            # also one left open on the site by a raise inside _plan_only after registry.plan answered "only"
+            _cancel_only(site)
+        if only and isinstance(error, OnlyLaunchError):
+            # the EM = 2 kernel launch itself failed (rc > 0): latch 'only' only; DO8 'plus' keeps running
+            _disable_only(f"e5 only launch: {type(error).__name__}: {str(error)[:600]}")
+            return None
+        if only:
+            # launch_e5_plus's checks, plan(cap), the drain, the placeholder / partials allocations
+            # (incl. OOM) or the host work after the launch: failures a 'plus' call can have too -> latch DO8, as 'plus'
+            stage = "after" if launched else "before"
+            _disable(f"e5 only call ({stage} the EM = 2 launch): {type(error).__name__}: {str(error)[:600]}")
+            return None
         _disable(f"e5 plus: {type(error).__name__}: {str(error)[:600]}")
         return None
     _count("emitted")
+    if only:
+        _ONLY_CALL.update(site=site, dx=weakref.ref(dx))  # publish() hands this placeholder over as 'only'
+        setattr(dx, _ONLY_PLACEHOLDER_ATTR, site)  # publish() never sends it out as 'plus'
+        _only_event("only_launched")
     if not l11._active_e5_logged:
         # L11's own e5 ACTIVE line, once per process, printed here because this call ran L11's e5m2-du mode through
         # the DO8 kernel (l11.run_e5, which prints it, did not run). Same text as l11_outproj_lnmd.run_e5 plus a DO8
         # tail; impl= names the kernel that ran (DO8's own impl, "+vd(...)" only for the l11_do8.cu build), not
-        # L11's .so.
+        # L11's .so. DO8-ONLY: an 'only' first call adds its build.
         l11._active_e5_logged = True
+        only_tail = f"; {ITEM_ONLY}: EM 2 build, no bf16 d(attn) store, impl={_impl_only}" if only else ""
         arm_print_all_ranks(
             f"armed OK: {l11.FAMILY} ACTIVE mode=e5 (du e5m2 producer contract) ({l11.KNOB}, with "
             f"DLRM_HSTU_FP8_BWD_DU_E5M2): one {l11.KERNEL_NAME} E5 launch replaces hipBLASLt F8B8BS NTB0 out-proj "
             f"dgrad + _ln_mul_dropout_bwd_dx_du_rng_v3 (du e5m2 EMIT: e5m2 u block + pad rows of dz8, amax/colsum "
             f"partials; no bf16 du, dy never in HBM); impl={_impl} M={m} Mp={int(dz8.shape[0])} P={P} "
-            f"device={x.device}; launched as {KERNEL_NAME} ({ITEM}, + dO8/E8)"
+            f"device={x.device}; launched as {KERNEL_NAME} ({ITEM}, + dO8/E8{only_tail})"
         )
     return dx, du, dweight, dbias, emit, do8, e8
+
+
+def _plan_only(site: Any, attn: torch.Tensor) -> bool:
+    """DO8-ONLY, contract v2 plan(): True = this call runs the EM = 2 launch and publishes 'only'. Host only, after
+    every decline check and the dz8 / dO8 / E8 allocations; the placeholder / partials allocations and launch_e5_plus's
+    checks follow it and are covered by cancel. Knob unset / "0" / other: False without touching the registry or any
+    state.
+    Knob on: 'plus' without asking when the 'only' .so is not prebuilt / latched (counted fallback); else
+    registry.plan(site, attn) ("plus" reasons are counted and printed by the registry: plan_plus here)."""
+    if not only_requested():
+        return False
+    _ONLY_CALL.clear()  # a stale entry of a call that never published (it raised) is not this call's
+    reg = registry()
+    if reg is None or not (_only_prebuilt and _only_broken is None):
+        _only_event("fallback")
+        return False
+    if reg.plan(site, attn) != "only":  # never raises
+        _only_event("plan_plus")
+        return False
+    _only_event("planned")
+    return True
+
+
+def _cancel_only(site: Any) -> None:
+    """Contract v2 cancel(): an "only" plan whose 'only' call did not complete (L11's own launch rewrites the call,
+    bf16 d(attn) included): close it, so the attention backward binds as for any call without a record."""
+    _ONLY_CALL.clear()
+    reg = registry()
+    if reg is not None and reg.cancel(site):
+        _only_event("cancelled")
 
 
 def publish(site: Any, dattn: torch.Tensor, do8: torch.Tensor, e8: torch.Tensor) -> bool:
@@ -824,10 +1149,23 @@ def publish(site: Any, dattn: torch.Tensor, do8: torch.Tensor, e8: torch.Tensor)
     record to the registry ('plus': bf16_written=True). True = published. A refusal is counted (the consumer then
     quantizes the bf16 d(attn): dO8/E8 exact) and never raises. A refused (or publish-latched) call is not
     bit-identical to DO8 off: DO8's launch already ran, so its dW/dB/u-colsum keep DO8's tile-walk fp32 order
-    (the same fp32 summation-order change as L11's); d(attn), dz8 and amax are bitwise."""
+    (the same fp32 summation-order change as L11's); d(attn), dz8 and amax are bitwise.
+    DO8-ONLY: when this site's call ran the EM = 2 launch (run_e5_plus), the record goes out as 'only' instead
+    (_publish_only: bf16_written=False, every error re-raised)."""
     reg = registry()
     if reg is None or site is None:
         return False
+    if _ONLY_CALL and _ONLY_CALL.get("site") is site:
+        return _publish_only(reg, site, dattn, do8, e8)
+    if getattr(dattn, _ONLY_PLACEHOLDER_ATTR, None) is not None:
+        # An EM = 2 placeholder whose call is no longer the in-flight 'only' call (another DO8 call planned between
+        # its launch and this publish). Fail closed: its bf16 values were never written, so a 'plus' record
+        # (bf16_written=True) would let the dkdv_fp8_sink exact re-run or a debug reader quantize garbage. The raise aborts the
+        # backward before the attention backward runs; were it swallowed, the still-open plan would make bind raise.
+        raise RuntimeError(
+            f"{FAMILY_ONLY}: publish got an EM = 2 placeholder that is not the in-flight 'only' call's; its bf16 values "
+            "were never written, so it cannot be published as 'plus' (contract v2)"
+        )
     try:
         rec = reg.publish(site, dattn, do8, e8, producer="L11", bf16_written=True)
     except Exception as error:  # noqa: BLE001 -- the registry never raises for 'plus'; be fail-safe anyway
@@ -853,6 +1191,37 @@ def publish(site: Any, dattn: torch.Tensor, do8: torch.Tensor, e8: torch.Tensor)
             f"skipped when taken; bf16 d(attn) still written); impl={_impl} M={int(dattn.shape[0])} cap={_WL_MEMO.get('cap')} G={G} P={P} "
             f"device={dattn.device}"
         )
+    return True
+
+
+def _publish_only(reg: Any, site: Any, dattn: torch.Tensor, do8: torch.Tensor, e8: torch.Tensor) -> bool:
+    """DO8-ONLY, contract v2 'only' publish: after the LAST write (the EM = 2 launch emitted dO8/E8; nothing writes
+    the placeholder), publish(..., bf16_written=False). Never swallowed: the bf16 d(attn) does not exist, so a failed
+    'only' publish has no exact fallback; the registry's ValueError / Do8OnlyError (and a d(attn) that is not this
+    call's placeholder) propagate out of the backward, which aborts before the attention backward runs (were one
+    swallowed, the still-open plan would make bind raise)."""
+    ref = _ONLY_CALL.get("dx")
+    _ONLY_CALL.clear()
+    if ref is None or ref() is not dattn:
+        raise RuntimeError(
+            f"{FAMILY_ONLY}: publish got a d(attn) that is not the placeholder of this site's EM = 2 launch; its bf16 "
+            "values were never written, so it cannot be published as 'plus' (contract v2)"
+        )
+    reg.publish(site, dattn, do8, e8, producer="L11", bf16_written=False)
+    _count("published")
+    _only_event("published")
+    global _only_logged
+    if not _only_logged:
+        _only_logged = True
+        G, _, _, P = plan(int(_WL_MEMO.get("cap", 0))) if _WL_MEMO.get("cap") else (0, 0, 0, 0)
+        arm_print_all_ranks(
+            f"armed OK: {FAMILY_ONLY} ACTIVE mode=e5 only ({ONLY_KNOB}, {ITEM_ONLY}, with {ITEM} and "
+            f"hstu_do8_registry contract v2): one {KERNEL_NAME} EM=2 launch emits the C8 attention backward's e4m3 "
+            f"dO + E8 and SKIPS the bf16 d(attn) store (autograd receives a placeholder; poison="
+            f"{int(bool(reg.poison_requested()))}); impl={_impl_only} M={int(dattn.shape[0])} cap={_WL_MEMO.get('cap')} "
+            f"G={G} P={P} device={dattn.device}"
+        )
+        arm_print_all_ranks(only_summary_line())
     return True
 
 
@@ -1047,6 +1416,163 @@ def prebuild(l11_ready: bool, e5_expected: bool, self_check_fn: Optional[Callabl
         f"armed OK: {FAMILY} prebuild before run_start: built+loaded+self-check OK {time.perf_counter() - t0:.1f}s "
         f"(VGPR {_resources.get('vgpr')}, spill {_resources.get('vgpr_spill')}, scratch {_resources.get('scratch')}, "
         f"LDS {_resources.get('lds')}, SGPR spill {_resources.get('sgpr_spill')}, sched={_resources.get('sched')}; "
-        f"so {so_key}; {detail})"
+        f"so {so_key}; {detail}{_diet_tail()})"
+    )
+    if only_requested():
+        prebuild_only()  # DO8-ONLY: its own build / gate / self-check / latch; never changes DO8's own result
+    return True
+
+
+# ---------------------------------------------------------------------------- DO8-ONLY self-check / prebuild
+def self_check_only() -> Tuple[bool, str]:
+    """DO8-ONLY first-use check: the EM = 2 launch vs the EM = 1 launch on self_check's seeded SYNTHETIC inputs (same
+    recipe, seed and device list; no training data, no global RNG draw, no FP8 scale state, no registry). Both write
+    into prefilled dz8 / dO8 / E8. Gates: dO8, E8, the WHOLE dz8 (u block, pad rows, untouched guard columns), the
+    AMAXP / DWP / DBP / DUCS partials and P byte-identical; the EM = 2 d(attn) buffer, prefilled with a NaN sentinel,
+    unchanged in every byte (no DX store); EM = 1's d(attn) finite and written, its dO8 written, E8 = 127 groups
+    present. EM = 1 itself was just gated against L11's E5 launch and quantize_do_e4m3_blk by self_check on these
+    inputs, so a pass makes EM = 2's dO8 / E8 the quantizer's bytes of the d(attn) it no longer stores."""
+    from generative_recommenders.ops.triton import bwd_fp8
+    from generative_recommenders.ops.triton import triton_hstu_linear as thl
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    # ---- self_check's inputs, the same recipe and seed (keep in step with self_check)
+    lens: List[int] = []
+    while sum(lens) < 32768:
+        lens.extend(_SELF_CHECK_LENS)
+    M, Dm, p = sum(lens), l11.D, 0.1
+    offs_h = [0]
+    for n_ in lens:
+        offs_h.append(offs_h[-1] + n_)
+    offs = torch.tensor(offs_h, dtype=torch.int64, device=dev)
+    N = max(lens)
+    g = torch.Generator(device=dev)
+    g.manual_seed(_SELF_CHECK_SEED)
+    g8f = torch.randn((M, Dm), generator=g, device=dev) * 1024.0
+    s5 = offs_h[5]
+    g8f[s5:s5 + min(8, lens[5])] = 0.0
+    g8 = g8f.clamp_(-57344.0, 57344.0).to(torch.float8_e5m2)
+    del g8f
+    w8 = (torch.randn((l11.NOUT, Dm), generator=g, device=dev) * 90.0).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
+    sa = torch.full((1,), 2.0**-19, dtype=torch.float32, device=dev)
+    sb = torch.full((1,), 0.0613 / 448.0, dtype=torch.float32, device=dev)
+    x = (torch.randn((M, Dm), generator=g, device=dev) * 0.5).to(torch.bfloat16)
+    u = torch.randn((M, Dm), generator=g, device=dev).to(torch.bfloat16)
+    wn = (1.0 + 0.05 * torch.randn((Dm,), generator=g, device=dev)).to(torch.bfloat16)
+    bn = (0.05 * torch.randn((Dm,), generator=g, device=dev)).to(torch.bfloat16)
+    xf = x.float()
+    mean = xf.mean(dim=1)
+    rstd = torch.rsqrt(xf.var(dim=1, unbiased=False) + 1e-6)
+    del xf
+    mask = thl._create_dropout_mask(
+        N=M, D=Dm, BLOCK_D=Dm, concat_u=True, concat_x=True, dropout_ratio=p, seed=_SELF_CHECK_SEED, device=dev,
+    )
+    grad_dtype, _ = bwd_fp8.grad_dtype_and_limit()
+    pad = int(bwd_fp8.uvqk_tm_pad())
+    rows_out = (M + pad - 1) // pad * pad
+    inv = torch.full((1,), 0.7371 * 2.0**-3, dtype=torch.float32, device=dev)
+    b = len(lens)
+    cap = wl_cap(M, b)
+    wl = torch.full((cap, 2), -7, dtype=torch.int32, device=dev)
+    cnt = torch.full((2,), -7, dtype=torch.int32, device=dev)
+    assert _fn_wl_build is not None
+    rc = int(_fn_wl_build(offs.data_ptr(), 1, b, M, max(1, min(128, (N + 63) // 64)), wl.data_ptr(), cap,
+                          cnt.data_ptr(), torch.cuda.current_stream(dev).cuda_stream))
+    if rc > 0:
+        return False, f"l11do8_wl_build_launch rc={rc}"
+
+    def launch(only: bool, dx: Optional[torch.Tensor]) -> Tuple[Any, ...]:
+        dz8 = torch.full((rows_out, l11.DU_ROW), 0x5A, dtype=torch.uint8, device=dev)
+        d8 = torch.full((M, Dm), 0x5A, dtype=torch.uint8, device=dev)
+        e8 = torch.full((M, H), 0xA5, dtype=torch.uint8, device=dev)
+        out = launch_e5_plus(g8, w8, sa, sb, x, u, mask, mean, rstd, wn, bn, p, inv, dz8.view(grad_dtype), wl, cnt,
+                             cap, d8.view(torch.float8_e4m3fn), e8, only=only, dx=dx)
+        return out + (dz8, d8, e8)
+
+    dx_p, dwp_p, dbp_p, ducs_p, amaxp_p, P_p, dz_p, d8_p, e8_p = launch(False, None)
+    sentinel = torch.full((M, Dm), _SENTINEL_BF16, dtype=torch.int16, device=dev)
+    dx_buf = sentinel.clone().view(torch.bfloat16)
+    dx_o, dwp_o, dbp_o, ducs_o, amaxp_o, P_o, dz_o, d8_o, e8_o = launch(True, dx_buf)
+    torch.cuda.synchronize()
+
+    def mism(a: torch.Tensor, c: torch.Tensor) -> int:
+        a8 = a.contiguous().view(torch.uint8).reshape(-1)
+        c8 = c.contiguous().view(torch.uint8).reshape(-1)
+        return -1 if a8.numel() != c8.numel() else int((a8 != c8).sum())
+
+    m_d8, m_e8, m_dz = mism(d8_o, d8_p), mism(e8_o, e8_p), mism(dz_o, dz_p)
+    m_dw, m_db, m_cs, m_am = mism(dwp_o, dwp_p), mism(dbp_o, dbp_p), mism(ducs_o, ducs_p), mism(amaxp_o, amaxp_p)
+    dx_changed = mism(dx_buf, sentinel.view(torch.bfloat16))
+    same_buf = dx_o.data_ptr() == dx_buf.data_ptr()
+    p_written = int((d8_p != 0x5A).sum())
+    dx_p_ok = bool(torch.isfinite(dx_p.float()).all())
+    e8_127 = int((e8_p == 127).sum())
+    detail = (
+        f"M={M} B={b} cap={cap} P={P_o}/{P_p}: EM=2 vs EM=1 dO8 mism {m_d8}, E8 mism {m_e8}, dz8 mism {m_dz} "
+        f"(u+pad+guard), DWP mism {m_dw}, DBP mism {m_db}, DUCS mism {m_cs}, AMAXP mism {m_am}; EM=2 d(attn) "
+        f"sentinel bytes changed {dx_changed} of {2 * M * Dm} (buffer returned {int(same_buf)}); EM=1 dO8 bytes "
+        f"written {p_written}, d(attn) finite {int(dx_p_ok)}, E8=127 bytes {e8_127}"
+    )
+    ok = (
+        P_o == P_p
+        and m_d8 == 0
+        and m_e8 == 0
+        and m_dz == 0
+        and m_dw == 0
+        and m_db == 0
+        and m_cs == 0
+        and m_am == 0
+        and dx_changed == 0
+        and same_buf
+        and p_written > 0
+        and dx_p_ok
+        and e8_127 > 0
+    )
+    return ok, detail
+
+
+def prebuild_only(self_check_fn: Optional[Callable[[], Tuple[bool, str]]] = None) -> bool:
+    """DO8-ONLY prebuild (prebuild() calls it after DO8's own prebuild passed, knob DLRM_HSTU_FP8_L11_DO8_ONLY == "1"):
+    the 'only' .so (l11_do8.cu with -DL11DO8_ONLY=1), its resource gate (the EM = 2 instantiation, 0 VGPR spill, 0
+    scratch, LDS_BYTES; the list builders 0 / 0) and self_check_only. Any failure latches 'only' only (one DISABLED
+    line; DO8 keeps its 'plus' launches). The non-VD source has no 'only' build: one INERT line, nothing built. A
+    self-check device fault re-raises (DO8's policy: abort before RUN_START)."""
+    global _only_prebuilt
+    if not (only_requested() and _prebuilt and _broken is None) or _only_broken is not None:
+        return False
+    if _source() == _SOURCE_NOVD:
+        _print_once(
+            "only-inert-novd",
+            f"{FAMILY_ONLY} INERT: needs DO8-VD (DLRM_HSTU_FP8_L11_VD=1, ops/hip/l11_do8.cu); the non-VD "
+            f"{_SOURCE_NOVD.name} has no 'only' build -> {ITEM} 'plus' (the bf16 d(attn) is written); nothing built",
+        )
+        return False
+    t0 = time.perf_counter()
+    try:
+        _load_only()
+    except Exception as error:  # noqa: BLE001 -- build / gate / load: latch 'only' only
+        _disable_only(f"prebuild build/load: {type(error).__name__}: {str(error)[:600]}")
+        return False
+    try:
+        ok, detail = (self_check_fn or self_check_only)()
+        torch.cuda.synchronize()
+    except Exception as error:  # noqa: BLE001
+        msg = f"{type(error).__name__}: {error}"
+        if l11._DEVICE_FAULT.search(msg):
+            arm_print_all_ranks(f"{FAMILY_ONLY} prebuild DEVICE FAULT: {msg[:600]}")
+            raise
+        _disable_only(f"prebuild self-check: {msg[:600]}")
+        return False
+    if not ok:
+        _disable_only(f"prebuild self-check mismatch: {detail}")
+        return False
+    _only_prebuilt = True
+    _only_atexit()
+    r = _only_resources
+    so_key = _only_lib_path.parent.name if _only_lib_path is not None else "?"
+    arm_print_all_ranks(
+        f"armed OK: {FAMILY_ONLY} prebuild before run_start: built+loaded+self-check OK {time.perf_counter() - t0:.1f}s "
+        f"(EM 2: VGPR {r.get('vgpr')}, spill {r.get('vgpr_spill')}, scratch {r.get('scratch')}, LDS {r.get('lds')}, "
+        f"SGPR spill {r.get('sgpr_spill')}, sched={r.get('sched')}; so {so_key}; {detail}{_diet_tail()})"
     )
     return True

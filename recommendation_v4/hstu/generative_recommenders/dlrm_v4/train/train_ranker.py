@@ -490,6 +490,20 @@ def _main_func(
 
     _alloc_pregrow.pregrow_before_run_start()
 
+    # Eval embedding lookahead side stream (gin apply_env_bootstrap.
+    # DLRM_HSTU_FP8_EVAL_EMB_LOOKAHEAD, default False = off; a pre-set env var
+    # wins, =0 is the kill switch; dlrm_v4/train/eval_lookahead.py). Knob off:
+    # returns at once (no stream, no allocation, no collective). Knob on: on
+    # every rank, here in the untimed initialization and after the pre-grow
+    # above sized main=rest, it creates the eval pipeline's dedicated side
+    # stream, places it off the main stream's hardware queue (host_sync_free.
+    # shares_hw_queue, at most 8 tries, fail closed), pre-grows its pool from
+    # the margin, and arms it only if every rank did (one all_reduce). Logs
+    # "armed OK: eval emb lookahead stream ready ..." or "... DECLINED ...".
+    from generative_recommenders.dlrm_v4.train import eval_lookahead as _evla
+
+    _evla.prepare_before_run_start()
+
     # Targeted HIP code-object preload (gin apply_env_bootstrap.
     # DLRM_HSTU_FP8_HIP_PRELOAD: yambda_5b.gin binds it ON; code default
     # unset = off; opt out with DLRM_HSTU_FP8_HIP_PRELOAD=0, a pre-set env var
@@ -528,8 +542,9 @@ def _main_func(
         # the logger (optimizer names/LRs read from gin internally). Seed is the
         # value setup() resolved and exported to $SEED.
         # Evidence for the cache-flush / clock rules: page-cache residency of the
-        # dataset files right before RUN_START, one line per node (mincore,
-        # reads nothing; sample pages should be zero after the flush).
+        # reference dataset .npy files opened before RUN_START (explicit list,
+        # no glob, so no non-reference file is mapped), one line per node
+        # (mincore, reads nothing; sample pages should be zero after the flush).
         if rank % max(1, torch.cuda.device_count()) == 0 and os.environ.get(
             "DLRM_DATA_PATH"
         ):

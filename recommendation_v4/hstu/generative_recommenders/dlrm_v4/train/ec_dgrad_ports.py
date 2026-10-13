@@ -189,7 +189,7 @@ def _fused(ctx, routed: List[Tuple[xs.PortRecord, torch.Tensor]]) -> torch.Tenso
         xs._say(
             f"{xs.ARMED_PREFIX} fused -- preprocessor L1 dgrads fused into the grouped "
             f"EC backward (cat T={cat.idx.numel()}, item T={item.idx.numel()}, U={U}; "
-            "_ecx_dgrad_pass x2 + _ecx_combine + _ecx_zero_uncovered; kill switch "
+            f"{xs.LAST_PASS_IMPL} x2 + _ecx_combine + _ecx_zero_uncovered; kill switch "
             f"{xs.ENV_VAR}=0)"
         )
     if _SELF_CHECKS_LEFT > 0 and os.environ.get(xs.CHECK_ENV_VAR, "0") == "1":

@@ -25,7 +25,7 @@ Enable with the single switch:
 
 That switch enables the whole path. The knobs below are tunables:
 
-    DLRM_HSTU_FP8_BWD_MARGIN=8         headroom over the observed amax
+    DLRM_HSTU_FP8_BWD_MARGIN=8         generic headroom over the window amax
     DLRM_HSTU_FP8_BWD_REFRESH_CALLS    steps between scale refreshes
     DLRM_HSTU_FP8_BWD_WARMUP_CALLS     backward calls run in BF16 first
     DLRM_HSTU_FP8_BWD_GRAD_FORMAT      e5m2 (default) or e4m3

@@ -381,11 +381,13 @@ def _const(c: Any, name: str) -> str:
 
 # Checker spellings (training_6.1.0/common.yaml allow-list) for the dtypes this
 # trainer can run, ordered lowest precision first. bf16 ranks below fp16: it
-# has 7 mantissa bits to fp16's 10 (same width, wider exponent).
-_PRECISION_ORDER = ("fp8", "bfloat16", "fp16", "fp32")
+# has 7 mantissa bits to fp16's 10 (same width, wider exponent). mxfp6 (E2M3
+# elements, per-32 E8M0 block scales) ranks below fp8.
+_PRECISION_ORDER = ("mxfp6", "fp8", "bfloat16", "fp16", "fp32")
 _COMM_PRECISION_NAMES = {"fp32": "fp32", "fp16": "fp16", "bf16": "bfloat16"}
 _TRITON_FP8_MODULE = "generative_recommenders.ops.triton.triton_fp8"
 _BWD_FP8_MODULE = "generative_recommenders.ops.triton.bwd_fp8"
+_MX6_FWD_MODULE = "generative_recommenders.ops.hip.mx6_fwd"
 
 # FP8 linear GEMMs armed by a switch of their own, which neither
 # _HSTU_FP8_GEMM nor _BWD_ENABLED sees. The gin binds these on independently of
@@ -484,7 +486,13 @@ def resolve_numerical_precisions(
       linear path in ``_FP8_LINEAR_PATHS`` is armed (preprocessor L2,
       the uvqk/vk projection backward, the Indexed-X FP8 L1 forward). Those
       are gated independently of DLRM_HSTU_FP8_FWD/BWD and stay bound on by
-      the gin when both are opted out.
+      the gin when both are opted out. mxfp6 when the MXFP6 forward K512 trio
+      is requested on top of the FP8 forward GEMMs
+      (``ops/hip/mx6_fwd.requested()`` / $DLRM_HSTU_FP8_FWD_MXFP6, default
+      off): U / VQK / VK then run the scaled MFMA on E2M3 operands with per-32
+      E8M0 block scales. It is reported whenever requested, because a site
+      that declines at runtime falls back to FP8: the disclosure can overstate
+      the lowest precision used, never understate it.
     * attn: fp8 when the e4m3 attention forward is on (``_HSTU_FP8_ATTENTION``:
       GEMM and FUSE_LN and FUSE_QKV and ATTN). The fp8 attention backward
       (k128 qk MFMA, C8 full-FP8) only engages on e4m3 q/k from that forward,
@@ -530,6 +538,17 @@ def resolve_numerical_precisions(
     else:
         fp8_bwd = on("DLRM_HSTU_FP8_BWD")
     fp8_other = bool(armed_fp8_linear_paths(env))
+    # The MXFP6 trio only replaces FP8 forward GEMMs, so it needs fp8_gemm.
+    live_mx6 = sys.modules.get(_MX6_FWD_MODULE) if env is None else None
+    if live_mx6 is not None and hasattr(live_mx6, "requested"):
+        mx6_fwd = bool(live_mx6.requested())
+    else:
+        # Parsed as the MX6 gates parse it (mx6_fwd.ENABLED, the call site's
+        # _MX6_FWD): exactly "1"; any other value leaves every MX6 site off.
+        mx6_fwd = e.get("DLRM_HSTU_FP8_FWD_MXFP6", "0") == "1"
+    linear = "fp8" if (fp8_gemm or fp8_bwd or fp8_other) else base
+    if mx6_fwd and fp8_gemm:
+        linear = "mxfp6"
 
     comm = ["fp32"]  # dense DDP allreduce
     for direction in ("forward", "backward"):
@@ -543,7 +562,7 @@ def resolve_numerical_precisions(
         comm.append(_COMM_PRECISION_NAMES[p])
 
     return {
-        "linear": "fp8" if (fp8_gemm or fp8_bwd or fp8_other) else base,
+        "linear": linear,
         "attn": "fp8" if fp8_attn else base,
         "comm": _lowest(*comm),
     }

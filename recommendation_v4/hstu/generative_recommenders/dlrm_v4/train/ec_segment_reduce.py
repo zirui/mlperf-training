@@ -46,8 +46,8 @@ logger: logging.Logger = logging.getLogger(__name__)
 # enable_segment_reduce()` calls with whatever the gin bound there.  These are
 # module state rather than import-time `os.environ` reads so gin's operative
 # config records them.  See that function for what each one means.
-_SPLIT_ABOVE: int = 1024
-_BLOCK_S: int = 32
+_SPLIT_ABOVE: int = 8192
+_BLOCK_S: int = 16
 _NUM_WARPS: int = 2
 _BLOCK_W_CAP: int = 512
 _GPU_PLANNER: bool = False
@@ -68,8 +68,8 @@ _STRIDED_LOGGED: bool = False
 
 
 def configure_segment_reduce(
-    split_above: int = 1024,
-    block_s: int = 32,
+    split_above: int = 8192,
+    block_s: int = 16,
     num_warps: int = 2,
     block_w_cap: int = 512,
     gpu_planner: bool = False,

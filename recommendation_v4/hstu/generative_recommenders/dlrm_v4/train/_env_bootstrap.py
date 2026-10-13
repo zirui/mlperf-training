@@ -51,7 +51,9 @@ _FP8_FORWARD_ARM: Dict[str, str] = {
     "DLRM_HSTU_FP8_GEMM_ASCALE_MARGIN": "1.5",
     # Raise rather than quietly serving bf16 under an FP8 label.
     "DLRM_HSTU_FP8_FAIL_CLOSED": "1",
-    # fp8 accumulate trades the accumulator precision this arm converged with.
+    # use_fast_accum=False. On ROCm (torch 2.12) tensor-wise torch._scaled_mm
+    # ignores the flag and hipBLASLt accumulates in fp32 either way; =1 only
+    # makes K512 decline.
     "DLRM_HSTU_FP8_GEMM_FASTACC": "0",
 }
 
@@ -252,6 +254,7 @@ def apply_env_bootstrap(
     DLRM_HSTU_FP8_BWD_MSPLIT_SCHED: Optional[str] = None,
     DLRM_HSTU_FP8_BWD_DQ_SPLIT_SCHED: Optional[str] = None,
     DLRM_HSTU_FP8_BWD_DQ_SPLIT_OPT: Optional[str] = None,
+    DLRM_HSTU_FP8_DQ8_DIET: Optional[bool] = None,
     DLRM_HSTU_FP8_BWD_DO8: Optional[bool] = None,
     DLRM_HSTU_FP8_BWD_DO8_TAKE: Optional[bool] = None,
     DLRM_HSTU_FP8_EC_CAT_FUSE: Optional[bool] = None,
@@ -266,6 +269,7 @@ def apply_env_bootstrap(
     DLRM_HSTU_FP8_WLN_BWD_FLYDSL: Optional[bool] = None,
     DLRM_HSTU_FP8_FWD_K512: Optional[bool] = None,
     DLRM_HSTU_FP8_FWD_K1536: Optional[bool] = None,
+    DLRM_HSTU_FP8_FWD_MXFP6: Optional[bool] = None,
     DLRM_HSTU_FP8_BIAS_CACHE_STRICT: Optional[bool] = None,
     DLRM_HSTU_FP8_BWD_WS_LAYOUT: Optional[str] = None,
     DLRM_HSTU_FP8_BWD_WS_AUX: Optional[Union[str, int]] = None,
@@ -273,6 +277,7 @@ def apply_env_bootstrap(
     DLRM_HSTU_FP8_GC_FREEZE: Optional[bool] = None,
     DLRM_HSTU_FP8_PROF_POST_GC: Optional[bool] = None,
     DLRM_HSTU_FP8_WARMUP_F2E: Optional[bool] = None,
+    DLRM_HSTU_FP8_WARMUP_FIN_RPP: Optional[bool] = None,
     DLRM_HSTU_FP8_DENSE_ADAM_FUSED: Optional[bool] = None,
     DLRM_HSTU_FP8_FLYDSL_CURRENT_STREAM: Optional[bool] = None,
     DLRM_HSTU_FP8_PREBUILD: Optional[bool] = None,
@@ -338,6 +343,8 @@ def apply_env_bootstrap(
     DLRM_HSTU_FP8_BWD_WGRAD_CK_W3_T256S: Optional[bool] = None,
     DLRM_HSTU_FP8_BWD_OUTPROJ_LNMD_FUSED: Optional[bool] = None,
     DLRM_HSTU_FP8_L11_DO8: Optional[bool] = None,
+    DLRM_HSTU_FP8_L11_DO8_ONLY: Optional[bool] = None,
+    DLRM_HSTU_FP8_L11_DO8_DIET: Optional[bool] = None,
     DLRM_HSTU_FP8_POSENC_DROPOUT_FUSE: Optional[bool] = None,
     DLRM_HSTU_FP8_POSENC_DROPOUT_V2: Optional[bool] = None,
     DLRM_HSTU_FP8_POSENC_SORT16: Optional[bool] = None,
@@ -348,6 +355,7 @@ def apply_env_bootstrap(
     DLRM_HSTU_FP8_EC_INDEXED_L1: Optional[bool] = None,
     DLRM_HSTU_FP8_EC_INDEXED_L1_FP8: Optional[bool] = None,
     DLRM_HSTU_FP8_EC_INDEXED_L1_FP8_BWD: Optional[str] = None,
+    DLRM_HSTU_FP8_EC_IX_WGRAD_IDX_AFTER_DOT: Optional[bool] = None,
     DLRM_HSTU_FP8_CONTEXTUAL_FUSE: Optional[bool] = None,
     DLRM_HSTU_FP8_LAZY_FLOPS_STASH: Optional[bool] = None,
     DLRM_HSTU_FP8_IDIST_AFTER_PREV_FWD: Optional[int] = None,
@@ -374,6 +382,7 @@ def apply_env_bootstrap(
     DLRM_HSTU_FP8_FWD_PV: Optional[bool] = None,
     DLRM_HSTU_FP8_PREPROC_L2: Optional[bool] = None,
     DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE: Optional[bool] = None,
+    DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE_HIP: Optional[bool] = None,
     DLRM_HSTU_FP8_BWD_VF3P: Optional[bool] = None,
     DLRM_HSTU_FP8_BWD_FULL_DSC_K: Optional[Union[str, int]] = None,
     DLRM_HSTU_FP8_FWD_K512_TILED_A: Optional[bool] = None,
@@ -384,7 +393,9 @@ def apply_env_bootstrap(
     DLRM_HSTU_FP8_ACTION_PREFILL_L2: Optional[bool] = None,
     DLRM_HSTU_FP8_ACTION_PREFILL: Optional[bool] = None,
     DLRM_HSTU_FP8_DD_OWN_H2D: Optional[bool] = None,
+    DLRM_HSTU_FP8_EVAL_EMB_LOOKAHEAD: Optional[bool] = None,
     DLRM_HSTU_FP8_PIPE_STREAM_PRIO_MN: Optional[int] = None,
+    DLRM_HSTU_FP8_STAGE_REF_ONLY: Optional[bool] = None,
 ) -> None:
     # A pre-set environment variable wins over the gin binding. The pinned
     # triton configs are MI350X-specific, so a different GPU arch (e.g. B200
@@ -580,6 +591,11 @@ def apply_env_bootstrap(
     _bind_value("DLRM_HSTU_FP8_BWD_MSPLIT_SCHED", DLRM_HSTU_FP8_BWD_MSPLIT_SCHED)
     _bind_value("DLRM_HSTU_FP8_BWD_DQ_SPLIT_SCHED", DLRM_HSTU_FP8_BWD_DQ_SPLIT_SCHED)
     _bind_value("DLRM_HSTU_FP8_BWD_DQ_SPLIT_OPT", DLRM_HSTU_FP8_BWD_DQ_SPLIT_OPT)
+    # dq8 epilogue diet (ops/triton/hstu_dq_e5m2.py): the dq-split
+    # _dq8_sched_kernel's full-tile epilogue without the row mask (byte-identical
+    # outputs). Code default off; the gin file binds it on; only "1" arms it.
+    # Read once at hstu_dq_e5m2 import.
+    _bind_bool("DLRM_HSTU_FP8_DQ8_DIET", DLRM_HSTU_FP8_DQ8_DIET)
     # dO8 consumer hook (ops/flydsl/hstu_do8_registry.py).
     # "1": the ordinary-layer attention forward creates a dO8 site on
     # training calls whose FlyDSL backward plans the C8 do_blk dO
@@ -654,6 +670,12 @@ def apply_env_bootstrap(
     # instead of the residual-fused hipBLASLt call; fp32 summation order only,
     # as the K=512 GEMM. Read once at triton_fp8 import.
     _bind_bool("DLRM_HSTU_FP8_FWD_K1536", DLRM_HSTU_FP8_FWD_K1536)
+    # MXFP6 forward K=512 trio (ops/hip/mx6_fwd.py): the training forward's
+    # LN store_t + U + V/Q/K and the targets-only LN store_t + V/K on the MX6
+    # LN producer and the MXFP6 GEMMs. A DECLARED PRECISION CHANGE, bound by
+    # the gin file (absent = off in code); only "1" arms it. Read once at
+    # import by triton_hstu_preprocess_and_attention / triton_fp8 / mx6_fwd.
+    _bind_bool("DLRM_HSTU_FP8_FWD_MXFP6", DLRM_HSTU_FP8_FWD_MXFP6)
     # Scaled-bias cache of the FP8 forward (ops/triton/triton_fp8.py
     # _scale_bias_for_fp8_output): absent or "1" = a hit is served only while a
     # weak reference shows the very bias tensor it came from is alive and is
@@ -685,6 +707,12 @@ def apply_env_bootstrap(
     # with DLRM_HSTU_FP8_BWD_DKDV_E5M2 on (code default); "0" = kill switch
     # (as FP8_WARMUP_SKIP=F2e). Read at warm-up time. Not FP8 math.
     _bind_bool("DLRM_HSTU_FP8_WARMUP_F2E", DLRM_HSTU_FP8_WARMUP_F2E)
+    # FP8 first-use warm-up item F2r (dlrm_v4/train/fp8_warmup.py): the two
+    # e5m2 sink finalizers compiled before RUN_START at every RPP bucket, on
+    # synthetic inputs. Absent or "1" = run it whenever the warm-up runs with a
+    # sink on (code default); "0" = kill switch (as FP8_WARMUP_SKIP=F2r). Read
+    # at warm-up time. Not FP8 math.
+    _bind_bool("DLRM_HSTU_FP8_WARMUP_FIN_RPP", DLRM_HSTU_FP8_WARMUP_FIN_RPP)
     # The dense Adam step and the clip multiply in one bitwise Triton launch
     # (ops/triton/dense_adam_fused.py). Absent = off in code; read when the
     # dense optimizer is constructed (after this runs). Only "0" disarms.
@@ -902,6 +930,21 @@ def apply_env_bootstrap(
     # DLRM_HSTU_FP8_BWD_OUTPROJ_LNMD_FUSED, DLRM_HSTU_FP8_BWD_DU_E5M2 and the
     # consumer knob DLRM_HSTU_FP8_BWD_DO8.
     _bind_bool("DLRM_HSTU_FP8_L11_DO8", DLRM_HSTU_FP8_L11_DO8)
+    # DO8 'only' mode (ops/hip/l11_do8.py with ops/flydsl/hstu_do8_registry.py):
+    # a DO8 call the consumer's plan() answers "only" for skips the bf16
+    # d(attn) store. Absent = off in code; read per call (forward and
+    # backward), so it binds before the first forward. Only "1" arms it;
+    # DLRM_HSTU_FP8_L11_DO8_ONLY=0 in the environment wins over this binding
+    # and restores DO8 'plus' exactly. Inert without DLRM_HSTU_FP8_L11_DO8 and
+    # its consumer knob.
+    _bind_bool("DLRM_HSTU_FP8_L11_DO8_ONLY", DLRM_HSTU_FP8_L11_DO8_ONLY)
+    # DO8 diet: the VALU/SGPR-trimmed form of DO8's emission tail
+    # (ops/hip/l11_do8.cu, preprocessor switch L11DO8_DIET; ops/hip/l11_do8.py).
+    # Absent = off in code (the build adds -DL11DO8_DIET=0); read once at the
+    # first DO8 build (the prebuild, after this runs). Only "1" arms it;
+    # DLRM_HSTU_FP8_L11_DO8_DIET=0 in the environment wins over this binding.
+    # Same output bytes either way. Inert without DLRM_HSTU_FP8_L11_DO8.
+    _bind_bool("DLRM_HSTU_FP8_L11_DO8_DIET", DLRM_HSTU_FP8_L11_DO8_DIET)
     # Glue-fusion bundle; absent = off in code, "0" is each part's kill
     # switch. Not FP8 math. All read at import time except
     # IDIST_AFTER_PREV_FWD (train pipeline build).
@@ -1056,6 +1099,12 @@ def apply_env_bootstrap(
     # ec_dgrad_ports.py). Read at first use; absent = off in code. DECLARED
     # fp32 reduction-order numerics change; "0" in the environment is the kill switch.
     _bind_bool("DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE", DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE)
+    # X2H: the fused EC dgrad's two passes on the persistent HIP kernel x2h_pass
+    # (ops/hip/ec_dgrad_x2h.py + x2h_pass.cu), bit-identical to the Triton pass, armed per device
+    # by a pre-RUN_START bitwise cross-check. Read at first use; absent = off in code; acts only
+    # while DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE is armed. No numerics change; "0" in the environment
+    # is the kill switch.
+    _bind_bool("DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE_HIP", DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE_HIP)
     # Indexed-X L1: the content/additional L1 forward and wgrad read X through the EC
     # index from the bf16 unique-row table (ops/ec_indexed_l1.py, ops/triton/triton_ec_indexed_l1.py). Read at
     # first use; absent = off in code. DECLARED fp32 reduction-order numerics change; "0" in the environment is
@@ -1078,6 +1127,12 @@ def apply_env_bootstrap(
             "DLRM_HSTU_FP8_EC_INDEXED_L1_FP8_BWD must be 'consistent' or 'ste', got "
             f"{os.environ['DLRM_HSTU_FP8_EC_INDEXED_L1_FP8_BWD']!r}"
         )
+    # IX wgrad index order: Indexed-X's split-K wgrad loads the next block's indices after the current
+    # block's dot (_ecix_wgrad) instead of one iteration ahead (_ecix_wgrad_idxpf) in
+    # ops/triton/triton_ec_indexed_l1.py. Read once, at the first wgrad / prebuild; absent = off in code
+    # (_ecix_wgrad_idxpf); acts only while Indexed-X is armed. Bitwise identical P / dW1; "0" in the environment
+    # is the kill switch.
+    _bind_bool("DLRM_HSTU_FP8_EC_IX_WGRAD_IDX_AFTER_DOT", DLRM_HSTU_FP8_EC_IX_WGRAD_IDX_AFTER_DOT)
     # vf3p: ops/flydsl/hstu_flydsl_mha.py
     # adds the bwd_dkdv VALU token "vf3p" to the effective
     # DLRM_HSTU_FP8_BWD_VALU set of the dq-split calls (needs ilp; not with
@@ -1134,6 +1189,12 @@ def apply_env_bootstrap(
     # whole memcpy stream (dlrm_v4/train/dd_own_h2d.py). Read when the train
     # pipeline is built; absent = off in code. Bitwise. Not FP8 math.
     _bind_bool("DLRM_HSTU_FP8_DD_OWN_H2D", DLRM_HSTU_FP8_DD_OWN_H2D)
+    # Eval embedding lookahead (dlrm_v4/train/eval_lookahead.py): the eval
+    # pipeline issues batch N+1's EC lookup and sequence all-to-all on a side
+    # stream at the end of progress(N). Read before RUN_START (train_ranker)
+    # and when the eval pipeline is built; absent = off in code, the gin binds
+    # True; only "1" arms it. Bitwise eval. Not FP8 math.
+    _bind_bool("DLRM_HSTU_FP8_EVAL_EMB_LOOKAHEAD", DLRM_HSTU_FP8_EVAL_EMB_LOOKAHEAD)
     # Train-pipeline memcpy / data-dist stream priority when the job spans
     # more than one node (host_sync_free.train_pipe_stream_priority; read when
     # the pre-grown pairs and the train pipeline are built). 1-node runs and
@@ -1141,6 +1202,11 @@ def apply_env_bootstrap(
     _bind_value(
         "DLRM_HSTU_FP8_PIPE_STREAM_PRIO_MN", DLRM_HSTU_FP8_PIPE_STREAM_PRIO_MN
     )
+    # Reference-data-only staging: a flag the launcher's data-staging step may
+    # read; nothing in the trainer reads the variable. Bound here so the
+    # binding is a declared parameter and the trainer's environment records
+    # it. Not FP8 math.
+    _bind_bool("DLRM_HSTU_FP8_STAGE_REF_ONLY", DLRM_HSTU_FP8_STAGE_REF_ONLY)
     # The sync-free step launches FlyDSL work while torchrec side streams are
     # current; the legacy null-stream launch races those producers. Refuse the
     # combination at startup.

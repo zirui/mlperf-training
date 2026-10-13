@@ -36,7 +36,10 @@ TILES (fixed; both members):
                 8 warps, 2 stages, matrix_instr_nonkdim 32 (v_mfma_f32_32x32x16_bf16); grid cdiv(M, 128).
   _ecix_wgrad   a256x256x64w8s2k16p256x8i: BN 256 x BKO 256 output tile, BM 64 tokens per step, 8 warps,
                 2 stages, matrix_instr_nonkdim 16 (v_mfma_f32_16x16x32_bf16); dh^T loaded directly as [BN, BM]
-                (ALOAD); the next block's indices loaded one iteration ahead (IDXPF); XCD remap 8.
+                (ALOAD); the next block's indices loaded after the current block's dot; XCD remap 8.
+                Gate DLRM_HSTU_FP8_EC_IX_WGRAD_IDX_AFTER_DOT (gin True; read once, wgrad_idx_after_dot());
+                "0" / absent launches _ecix_wgrad_idxpf instead (IDXPF: indices loaded one iteration
+                ahead), bitwise identical P and dW1.
   split rule    NT = 2 (item) / 4 (cat) output tiles; S0 = 256 // NT (one program per CU, 256 CUs);
                 CHUNK = cdiv(cdiv(M, S0), 64) * 64; S = cdiv(M, CHUNK) <= S0; grid NT * S.
   workspace     fp32 [S, 256, NH*512]: <= 64 MiB per call for every M (S <= S0); caching allocator, per call.
@@ -114,6 +117,10 @@ assert WIDTH % FWD_BK == 0 and WIDTH % WG_BKO == 0 and HID % FWD_BN == 0 and HID
 assert (HID * WIDTH) % RED_BLOCK == 0
 
 _ENABLED: Optional[bool] = None
+# The wgrad loop order. "1" (the gin default): _ecix_wgrad, the next block's indices loaded after the current
+# block's dot; absent / "0" (kill switch): _ecix_wgrad_idxpf, the IDXPF order. Bitwise identical P / dW1.
+WGRAD_IDX_AFTER_DOT_ENV: str = "DLRM_HSTU_FP8_EC_IX_WGRAD_IDX_AFTER_DOT"
+_WGRAD_IDX_AFTER_DOT: Optional[bool] = None
 _BROKEN: Optional[str] = None
 _ARCH_OK: Dict[int, Optional[str]] = {}
 # name -> Triton CompiledKernel of the last launch (tests / diagnostics: n_regs, n_spills, asm).
@@ -149,6 +156,19 @@ def enabled() -> bool:
             on = False
         _ENABLED = on
     return bool(_ENABLED) and _BROKEN is None
+
+
+def wgrad_idx_after_dot() -> bool:
+    """Which _ecix_wgrad loop order ecix_wgrad launches (env read once per process, at the first wgrad
+    or prebuild; absent = off in code = the IDXPF kernel _ecix_wgrad_idxpf; the gin file binds it on)."""
+    global _WGRAD_IDX_AFTER_DOT
+    if _WGRAD_IDX_AFTER_DOT is None:
+        _WGRAD_IDX_AFTER_DOT = os.environ.get(WGRAD_IDX_AFTER_DOT_ENV, "").strip().lower() in ("1", "true", "on", "yes")
+        logger.info("%s wgrad loop order: %s (%s=%r)", TAG,
+                    "_ecix_wgrad, index load after the dot" if _WGRAD_IDX_AFTER_DOT
+                    else "_ecix_wgrad_idxpf, IDXPF", WGRAD_IDX_AFTER_DOT_ENV,
+                    os.environ.get(WGRAD_IDX_AFTER_DOT_ENV))
+    return _WGRAD_IDX_AFTER_DOT
 
 
 def latch_off(where: str, exc: BaseException) -> None:
@@ -220,8 +240,63 @@ if triton is not None:
                         TAIL_ZERO_B: tl.constexpr):
             """P[s] = fp32 [BN, BKO] tile of dh[m0:m1]^T @ A[m0:m1] over split s's tokens [s*CHUNK, min(M, (s+1)*CHUNK)),
             in token order: n_full unmasked BM blocks, then one masked tail block. dh^T is loaded directly as
-            [BN, BM]; the next block's indices are loaded one iteration ahead. TAIL_ZERO_B: see the module
-            docstring."""
+            [BN, BM]; the next block's indices are loaded after the current block's dot (bitwise identical to
+            _ecix_wgrad_idxpf). TAIL_ZERO_B: see the module docstring."""
+            KT: tl.constexpr = NH * D
+            NT_K: tl.constexpr = KT // BKO
+            NT: tl.constexpr = (NOUT // BN) * NT_K
+            pid = tl.program_id(0)
+            if NUM_XCD > 1:
+                pid = _ecix_remap_xcd(pid, tl.num_programs(0), NUM_XCD)
+            s = pid // NT  # the NT output tiles of one split are adjacent logical ids (same XCD: shared dh rows)
+            t = pid % NT
+            tn = t // NT_K
+            tk = t % NT_K
+            m0 = s * CHUNK
+            m1 = tl.minimum(M, m0 + CHUNK)
+            nrow = m1 - m0
+            n_full = nrow // BM
+            offs_bm = tl.arange(0, BM)
+            offs_n = tn * BN + tl.arange(0, BN)
+            offs_o = tk * BKO + tl.arange(0, BKO)
+            rows = (m0 + offs_bm).to(tl.int64)
+            dh_ptrs = DH + offs_n[:, None] + rows[None, :] * NOUT  # dh^T tile [BN, BM] (MN-major A operand)
+            h = (tk * BKO) // D  # which member half this K tile reads (0 for item); BKO divides D
+            col = offs_o - h * D
+            ip = IDX + rows * NH + h
+            acc = tl.zeros((BN, BKO), dtype=tl.float32)
+            ii = tl.load(ip, mask=offs_bm < nrow, other=0)  # block 0's indices (the chunk may be one partial block)
+            for it in range(0, n_full):
+                a = tl.load(dh_ptrs)
+                b = tl.load(U + (ii.to(tl.int32) * D)[:, None] + col[None, :])
+                acc = tl.dot(a, b, acc)
+                # the next block's indices, loaded AFTER this block's dot (same values, same tl.dot sequence,
+                # bitwise identical P and dW1; the software pipeliner then schedules the next block's gathered
+                # rows earlier in the loop body)
+                ii = tl.load(ip + BM * NH, mask=(it + 1) * BM + offs_bm < nrow, other=0)
+                ip += BM * NH
+                dh_ptrs += BM * NOUT
+            rem = nrow - n_full * BM
+            if rem > 0:
+                rmask = offs_bm < rem
+                a = tl.load(dh_ptrs, mask=rmask[None, :], other=0.0)
+                if TAIL_ZERO_B:
+                    b = tl.load(U + (ii.to(tl.int32) * D)[:, None] + col[None, :], mask=rmask[:, None], other=0.0)
+                else:  # masked lanes gather U[0]
+                    b = tl.load(U + (ii.to(tl.int32) * D)[:, None] + col[None, :])
+                acc = tl.dot(a, b, acc)
+            p_ptrs = P + s.to(tl.int64) * (NOUT * KT) + offs_n[:, None] * KT + offs_o[None, :]
+            tl.store(p_ptrs, acc)
+
+        @triton.jit(do_not_specialize=["M", "CHUNK"], do_not_specialize_on_alignment=["IDX"])
+        def _ecix_wgrad_idxpf(DH, U, IDX, P, M, CHUNK,
+                              NH: tl.constexpr, D: tl.constexpr, NOUT: tl.constexpr,
+                              BN: tl.constexpr, BKO: tl.constexpr, BM: tl.constexpr, NUM_XCD: tl.constexpr,
+                              TAIL_ZERO_B: tl.constexpr):
+            """DLRM_HSTU_FP8_EC_IX_WGRAD_IDX_AFTER_DOT=0: the IDXPF loop order, the next block's indices prefetched
+            one iteration ahead. Same parameters, same values, same
+            tl.dot sequence as _ecix_wgrad, so P and dW1 are bitwise identical; only the loop statement order (and
+            with it the software-pipelined schedule) differs."""
             KT: tl.constexpr = NH * D
             NT_K: tl.constexpr = KT // BKO
             NT: tl.constexpr = (NOUT // BN) * NT_K
@@ -439,7 +514,8 @@ def ecix_wgrad(dh: torch.Tensor, table: torch.Tensor, idx: torch.Tensor, nh: int
                  and workspace.numel() >= need, f"workspace must be contiguous fp32 on {dev} with >= {need} elements")
         _ptr_class_ok("workspace", workspace)
         ws = workspace
-    LAST_KERNELS["wgrad%d" % nh] = _ecix_wgrad[(nt * s,)](
+    wgrad_kernel = _ecix_wgrad if wgrad_idx_after_dot() else _ecix_wgrad_idxpf
+    LAST_KERNELS["wgrad%d" % nh] = wgrad_kernel[(nt * s,)](
         dh, table, idx, ws, m, chunk,
         NH=nh, D=WIDTH, NOUT=HID, BN=WG_BN, BKO=WG_BKO, BM=WG_BM, NUM_XCD=WG_NUM_XCD,
         TAIL_ZERO_B=TAIL_ZERO_B, **WG_KW)
@@ -534,7 +610,8 @@ def prebuild(device: Any, m: int = 20100, n_rows: int = 96) -> str:
             bad.append(f"nh={nh}: h {nb_h} / dW {nb_w} elements differ")
     if bad:
         raise RuntimeError(f"{TAG} prebuild differs from the exact reference: " + "; ".join(bad))
-    msg = (f"{TAG} pre-run_start prebuild OK (_ecix_fwd, _ecix_wgrad, _ecix_wgrad_reduce x item+cat; exact check "
+    wg = "_ecix_wgrad" if wgrad_idx_after_dot() else "_ecix_wgrad_idxpf"  # the kernel just checked
+    msg = (f"{TAG} pre-run_start prebuild OK (_ecix_fwd, {wg}, _ecix_wgrad_reduce x item+cat; exact check "
            f"M={m} U={n_rows} bitwise, device={dev})")
     _say(msg)
     return msg

@@ -105,7 +105,8 @@ _IGNORED_SAID: bool = False
 _ARMED: Set[str] = set()
 # name -> Triton CompiledKernel of the last launch (tests / diagnostics: n_regs, n_spills, asm).
 LAST_KERNELS: Dict[str, Any] = {}
-STATS: Dict[str, int] = {"uprep_launch": 0, "uprep_reuse": 0, "w1q_launch": 0, "fwd8_launch": 0}
+STATS: Dict[str, int] = {"uprep_launch": 0, "uprep_reuse": 0, "uprep_dropped_on_free": 0, "w1q_launch": 0,
+                         "fwd8_launch": 0}
 
 
 class Unsupported(ValueError):
@@ -500,13 +501,26 @@ def ecix_fwd8(u8: torch.Tensor, sx: torch.Tensor, sxi: torch.Tensor, idx: torch.
     return _launch_fwd8(u8, sx, sxi, idx, nh, w8, sw, b1, m)
 
 
+def _drop_ucache(ref: Any) -> None:
+    """U-cache lifetime. weakref callback: the emb_c of the cached U prep died; drop the entry so its U8 / SX / SXI (/ Ud) are freed.
+    Without it an entry used by one member only (asymmetric publish, a per-member Unsupported, an IX or IX-FP8F latch
+    between the members) would stay alive until the next fwd8 call, or for the rest of the run after a latch. Ud is
+    still held by the autograd node that saved it, so the backward is unaffected."""
+    global _UCACHE
+    c = _UCACHE
+    if c is not None and c.ref is ref:
+        _UCACHE = None
+        STATS["uprep_dropped_on_free"] += 1
+
+
 class _UPrepEntry:
-    """The U prep of one emb_c object, shared by the two members of one step (no reference cycle: weakref)."""
+    """The U prep of one emb_c object, shared by the two members of one step (no reference cycle: weakref; the
+    weakref's callback drops the entry when emb_c dies, so the prep never outlives the step's table)."""
 
     __slots__ = ("ref", "version", "ptr", "stream", "write_ud", "out", "used")
 
     def __init__(self, emb_c: torch.Tensor, stream: Any, write_ud: bool, out: Tuple[Any, ...], nh: int) -> None:
-        self.ref = weakref.ref(emb_c)
+        self.ref = weakref.ref(emb_c, _drop_ucache)
         self.version = emb_c._version
         self.ptr = emb_c.data_ptr()
         self.stream = stream

@@ -2094,43 +2094,6 @@ class _WindowView:
             next(self._it)
 
 
-@gin.configurable
-def window_prime_pacing(fraction: float = 0.0) -> float:
-    """Pacing of the double-buffered loader's prime of the window after next.
-
-    WHAT: ``_PrefetchingWindowLoader`` keeps two persistent worker pools. When
-    window k+1 starts, the pool that served window k is reset for window k+2
-    and, by default, immediately primed with its full prefetch depth
-    (``prefetch_factor * num_workers`` batches). Every worker of that pool then
-    builds batches back to back, and the pool's pin-memory thread pins them, in
-    the first seconds of window k+1 -- a burst of input work on top of the
-    active pool's steady production, inside the trainer's process tree, at
-    every window boundary except the last of a run.
-
-    With ``fraction`` f in (0, 1] the reset sends no index; the main thread then
-    releases indices to that pool gradually, in proportion to the active
-    window's pulls, so the full prefetch depth is reached after ``ceil(f *
-    num_batches)`` pulls of window k+1 (and is topped up to the full depth when
-    window k+2 opens if that is earlier). The worker pools, the prefetch depth
-    the next window starts with, and every batch (indices, order, content,
-    worker assignment) are unchanged; only WHEN the window after next's
-    indices are handed to its workers changes. Inputs are read inside the timed
-    region, after the previous window started.
-
-    ``fraction`` <= 0 (env kill switch ``DL_PRIME_PACE=0``) keeps the one-shot
-    prime. Needs the persistent double-buffered loader and the chained window
-    stream (TP_WARM_WINDOWS=1), which call ``pace_tick`` on every pull;
-    without them the loader keeps the one-shot prime.
-    """
-    try:
-        f = float(fraction)
-    except (TypeError, ValueError):
-        f = 0.0
-    if f != f or f <= 0.0:  # NaN / off
-        return 0.0
-    return min(f, 1.0)
-
-
 class _PrefetchingWindowLoader:
     """Double-buffered window loader for the persistent streaming path.
 
@@ -2180,18 +2143,6 @@ class _PrefetchingWindowLoader:
         # Buffers whose worker pool was forked by prestart() (empty window, RNG
         # neutral); their first _prepare replays the iterator-creation RNG draw.
         self._prestarted: List[bool] = [False] * n_buffers
-        # Paced prime of the window after next (window_prime_pacing). _paced[b]:
-        # pool b was reset without its prime and still has indices to receive;
-        # _prep_done[b]: its background _prepare finished (only then may the
-        # main thread touch that iterator); _pending: the buffer being prepared
-        # for the window after next (None when there is none).
-        self._pace: float = window_prime_pacing()
-        self._paced: List[bool] = [False] * n_buffers
-        self._prep_done: List[threading.Event] = [
-            threading.Event() for _ in range(n_buffers)
-        ]
-        self._pending: Optional[int] = None
-        self._prep_err: List[Optional[BaseException]] = [None] * n_buffers
         # $DL_WBND_DIAG=1: per-window prepare/activate timing lines (diagnostic,
         # off by default).
         self._diag: bool = os.environ.get("DL_WBND_DIAG", "0") == "1"
@@ -2232,9 +2183,7 @@ class _PrefetchingWindowLoader:
         finally:
             torch.set_rng_state(rng_state)
 
-    def _prepare(
-        self, buf: int, ts: int, skip_samples: int = 0, paced: bool = False
-    ) -> None:
+    def _prepare(self, buf: int, ts: int, skip_samples: int = 0) -> None:
         # train_window_indices() is the O(N) mask (+ uid-hash filter for the
         # holdout); numpy releases the GIL for it, so it overlaps the main
         # thread's GPU dispatch. iter() then kicks off this pool's background
@@ -2242,142 +2191,43 @@ class _PrefetchingWindowLoader:
         # excluded here. `skip_samples` is non-zero only for the very first
         # window after a mid-window resume; subsequent windows always start at 0.
         t0 = time.time()
-        try:
-            self._samplers[buf].set_window(
-                self._dataset.dataset.train_window_indices(ts),
-                skip_samples=skip_samples,
-            )
-            t_idx = time.time()
-            if self._prestarted[buf]:
-                # Only ever true for the primed buffers, whose first _prepare runs on
-                # the main thread (stream() priming loop) -- same thread and same
-                # point in the RNG stream as the iterator creation it replaces.
-                self._prestarted[buf] = False
-                _draw_like_iterator_creation()
-            it = getattr(self._dls[buf], "_iterator", None)
-            if paced and it is not None:
-                # Pace only windows at least as long as the prefetch depth: a
-                # shorter window's whole prime is small, and releasing it late
-                # leaves the pool too little time to build it before the window
-                # opens (the next window would then start by waiting on its
-                # first batches). Shorter windows keep the one-shot prime.
-                try:
-                    n_next = int(len(self._dls[buf]))
-                except TypeError:
-                    n_next = it._prefetch_factor * it._num_workers
-                paced = n_next >= it._prefetch_factor * it._num_workers
-            if paced and it is not None:
-                # window_prime_pacing: reset the already-running persistent
-                # workers WITHOUT the one-shot prime (the reset's priming loop
-                # runs prefetch_factor * num_workers times); the main thread
-                # releases the indices gradually via pace_tick(). Restore the
-                # depth right away so the steady state (one index per consumed
-                # batch) and the top-up bound are unchanged.
-                full_pf = it._prefetch_factor
-                it._prefetch_factor = 0
-                try:
-                    self._iters[buf] = iter(self._dls[buf])
-                finally:
-                    it._prefetch_factor = full_pf
-                self._paced[buf] = True
-            else:
-                self._iters[buf] = iter(self._dls[buf])
-            t1 = time.time()
-            if self._diag:
-                _it = self._iters[buf]
-                logger.warning(
-                    "[wbnd] prepare rank=%d ts=%d buf=%d idx_ms=%.1f reset_ms=%.1f "
-                    "prime=%d/%d paced=%d t0=%.3f t1=%.3f",
-                    self._samplers[buf]._rank, ts, buf, (t_idx - t0) * 1e3,
-                    (t1 - t_idx) * 1e3, getattr(_it, "_send_idx", -1),
-                    getattr(_it, "_prefetch_factor", 0)
-                    * getattr(_it, "_num_workers", 0),
-                    int(self._paced[buf]), t0, t1,
-                )
-        except BaseException as e:
-            # Surfaced on the main thread when this window is activated (paced
-            # mode): a pool whose reset failed must not be handed out with no
-            # task issued (its iterator would report a premature end).
-            self._prep_err[buf] = e
-            raise
-        finally:
-            self._prep_done[buf].set()
-
-    def _top_up(self, buf: int, target: int) -> int:
-        """Main thread: send indices to pool ``buf`` until it has ``target``
-        outstanding tasks (bounded by its prefetch depth) or its window's
-        sampler runs out. Returns the number of indices sent."""
-        it = self._iters[buf]
-        cap = it._prefetch_factor * it._num_workers
-        target = min(target, cap)
-        sent0 = it._send_idx
-        while it._tasks_outstanding < target:
-            before = it._send_idx
-            it._try_put_index()
-            if it._send_idx == before:
-                # Sampler exhausted: the window is shorter than the prefetch
-                # depth. Nothing left to pace for this pool.
-                self._paced[buf] = False
-                break
-        if it._tasks_outstanding >= cap:
-            self._paced[buf] = False
-        return it._send_idx - sent0
-
-    def pace_tick(self, consumed: int, total: int) -> None:
-        """Called by ``_WarmWindowStream`` (main thread) after each pull of the
-        active window: ``consumed`` of its ``total`` batches have been pulled.
-        Tops the pending pool (the window after next) up to
-        ``ceil(depth * consumed / ceil(fraction * total))`` outstanding tasks,
-        i.e. the full depth after the first ``fraction`` of the active window.
-        Only pools whose window holds at least ``depth`` batches are paced (see
-        ``_prepare``). A no-op unless that pool was reset without its prime and
-        its background preparation has finished."""
-        buf = self._pending
-        if buf is None or not self._paced[buf] or not self._prep_done[buf].is_set():
-            return
-        it = self._iters[buf]
-        cap = it._prefetch_factor * it._num_workers
-        ramp = max(1, int(math.ceil(self._pace * max(1, int(total)))))
-        if consumed >= ramp:
-            target = cap
-        else:
-            target = -(-cap * max(0, int(consumed)) // ramp)
-        if it._tasks_outstanding < target:
-            self._top_up(buf, target)
-
-    def _activate(self, buf: int, ts: int) -> None:
-        """Main thread, when pool ``buf``'s window becomes the one being pulled:
-        if pacing has not released its full prefetch depth yet (short active
-        window), send the rest now -- the depth the window starts with is the
-        same as with the one-shot prime."""
-        if self._pending == buf:
-            self._pending = None
-        it = self._iters[buf]
-        released = getattr(it, "_send_idx", -1)
-        catchup = 0
-        if self._paced[buf]:
-            catchup = self._top_up(buf, it._prefetch_factor * it._num_workers)
-            self._paced[buf] = False
+        self._samplers[buf].set_window(
+            self._dataset.dataset.train_window_indices(ts),
+            skip_samples=skip_samples,
+        )
+        t_idx = time.time()
+        if self._prestarted[buf]:
+            # Only ever true for the primed buffers, whose first _prepare runs on
+            # the main thread (stream() priming loop) -- same thread and same
+            # point in the RNG stream as the iterator creation it replaces.
+            self._prestarted[buf] = False
+            _draw_like_iterator_creation()
+        self._iters[buf] = iter(self._dls[buf])
         if self._diag:
+            t1 = time.time()
+            _it = self._iters[buf]
             logger.warning(
-                "[wbnd] activate rank=%d ts=%d buf=%d released=%d catchup=%d cap=%d t=%.3f",
-                self._samplers[buf]._rank, ts, buf, released, catchup,
-                getattr(it, "_prefetch_factor", 0) * getattr(it, "_num_workers", 0),
-                time.time(),
+                "[wbnd] prepare rank=%d ts=%d buf=%d idx_ms=%.1f reset_ms=%.1f "
+                "prime=%d/%d t0=%.3f t1=%.3f",
+                self._samplers[buf]._rank, ts, buf, (t_idx - t0) * 1e3,
+                (t1 - t_idx) * 1e3, getattr(_it, "_send_idx", -1),
+                getattr(_it, "_prefetch_factor", 0)
+                * getattr(_it, "_num_workers", 0),
+                t0, t1,
             )
 
     def _stream_single(
         self,
         ts_list: List[int],
         first_skip_samples: int,
-        pace: bool,
+        warm: bool,
         per_window_cap: Optional[int],
         first_window_trained: int,
         window_cap: Optional[int] = None,
     ):
         """window_single_pool: one persistent pool, windows chained in its batch
         sampler. Yields the same (ts, iterator, num_batches) triples as the
-        double-buffered path. With ``pace`` (chained warm stream) the iterator
+        double-buffered path. With ``warm`` (chained warm stream) the iterator
         is the same object for every window and the caller bounds each window
         by num_batches (_WarmWindowStream); without it each window gets a
         _WindowView of that iterator which ends after the window's batches.
@@ -2512,7 +2362,7 @@ class _PrefetchingWindowLoader:
                         rank, ts_list[i], getattr(it, "_send_idx", -1), depth,
                         time.time(), chain.waits, chain.wait_s,
                     )
-                if pace:
+                if warm:
                     yield ts_list[i], it, counts[i]
                 else:
                     # Per-window consumer (TRAIN_PIPELINE=0 / TP_WARM_WINDOWS=0):
@@ -2540,7 +2390,7 @@ class _PrefetchingWindowLoader:
         ts_list: List[int],
         first_skip_samples: int = 0,
         window_cap: Optional[int] = None,
-        pace: bool = False,
+        warm: bool = False,
         per_window_cap: Optional[int] = None,
         first_window_trained: int = 0,
     ):
@@ -2560,39 +2410,24 @@ class _PrefetchingWindowLoader:
         only tells the cold-page-cache read-ahead how many batches of each
         window are pulled; the stream itself is unchanged by it.
 
-        ``pace=True`` (the caller promises to call ``pace_tick`` on every pull)
-        enables ``window_prime_pacing`` for the windows prepared in the
-        background; without it every window gets the one-shot prime.
-        ``per_window_cap`` / ``first_window_trained`` are only used by the
-        single-pool mode, whose sampler must stop each window at the same
-        (capped) count the chained window stream pulls.
+        ``warm=True``: the caller is the chained warm stream
+        (``_WarmWindowStream``), which bounds each window by ``num_batches``.
+        ``warm``, ``per_window_cap`` and ``first_window_trained`` are only used
+        by the single-pool mode: it then hands out its one shared iterator
+        instead of a per-window view, and its sampler must stop each window at
+        the same (capped) count the chained window stream pulls. The
+        double-buffered pools ignore them: every pool reset sends its full
+        prefetch depth at once (one-shot prime).
         """
         n = len(ts_list)
         if n == 0:
             return
         if self._single:
             yield from self._stream_single(
-                ts_list, first_skip_samples, pace, per_window_cap,
+                ts_list, first_skip_samples, warm, per_window_cap,
                 first_window_trained, window_cap=window_cap,
             )
             return
-        pace_on = bool(pace) and self._pace > 0.0
-        # Every rank (rank=R/W): the per-rank arming check reads these lines.
-        _rk, _ws = self._samplers[0]._rank, self._samplers[0]._world_size
-        if pace_on:
-            logger.warning(
-                "armed OK: [wbnd] window prime pacing frac=%.2f rank=%d/%d: the "
-                "window after next is primed over the first %.0f%% of the "
-                "current window's pulls (DL_PRIME_PACE=0 restores the one-shot "
-                "prime)",
-                self._pace, _rk, _ws, 100.0 * self._pace,
-            )
-        elif pace:
-            logger.warning(
-                "[wbnd] prime pacing OFF (DL_PRIME_PACE=0) rank=%d/%d: one-shot "
-                "prime of the window after next",
-                _rk, _ws,
-            )
         threads: List[Optional[threading.Thread]] = [None] * self._n
         self._stream_threads = threads  # teardown_close() joins the live ones
         # Sampler release point (after RUN_START): the priming below hands the
@@ -2636,12 +2471,17 @@ class _PrefetchingWindowLoader:
                 if threads[buf] is not None:
                     threads[buf].join()
                     threads[buf] = None
-                if pace_on and self._prep_err[buf] is not None:
-                    raise RuntimeError(
-                        f"[wbnd] background preparation of train window {ts_list[i]} failed"
-                    ) from self._prep_err[buf]
-                if pace_on or self._diag:
-                    self._activate(buf, ts_list[i])
+                if self._diag:
+                    _it = self._iters[buf]
+                    logger.warning(
+                        "[wbnd] activate rank=%d ts=%d buf=%d released=%d "
+                        "catchup=0 cap=%d t=%.3f",
+                        self._samplers[buf]._rank, ts_list[i], buf,
+                        getattr(_it, "_send_idx", -1),
+                        getattr(_it, "_prefetch_factor", 0)
+                        * getattr(_it, "_num_workers", 0),
+                        time.time(),
+                    )
                 yield ts_list[i], self._iters[buf], len(self._dls[buf])
                 # The consumer is back for the next window: window i has been
                 # pulled completely (read-ahead pacing; one list store).
@@ -2652,19 +2492,8 @@ class _PrefetchingWindowLoader:
                 # carries `first_skip_samples`.
                 j = i + self._n
                 if j < n:
-                    # Main thread: reset the pacing state BEFORE the thread
-                    # starts; pace_tick() touches this pool only after
-                    # _prep_done is set.
-                    self._paced[buf] = False
-                    self._prep_err[buf] = None
-                    self._prep_done[buf].clear()
-                    if pace_on:
-                        self._pending = buf
                     th = threading.Thread(
-                        target=self._prepare,
-                        args=(buf, ts_list[j]),
-                        kwargs={"paced": pace_on},
-                        daemon=True,
+                        target=self._prepare, args=(buf, ts_list[j]), daemon=True
                     )
                     th.start()
                     threads[buf] = th
@@ -2796,7 +2625,6 @@ class _WarmWindowStream:
         window_stream,
         per_window_cap: Optional[int] = None,
         first_window_trained: int = 0,
-        pacer=None,
     ) -> None:
         self._gen = iter(window_stream)
         self._cap = per_window_cap if per_window_cap else None
@@ -2805,10 +2633,6 @@ class _WarmWindowStream:
         self._left: Optional[int] = None
         self._queue: "collections.deque" = collections.deque()
         self._pulls: int = 0
-        # window_prime_pacing: callable(consumed, total) run after every pull
-        # (``_PrefetchingWindowLoader.pace_tick``), or None.
-        self._pacer = pacer
-        self._active_total: int = 0
         # $DLQ_LOG_EVERY=N (diagnostic, default 0 = off): every N pulls log the
         # trainer's wait in next() and the active pool's in-flight depth.
         try:
@@ -2828,7 +2652,6 @@ class _WarmWindowStream:
         self._already_trained = 0
         self._active = it
         self._left = num_batches
-        self._active_total = num_batches
         self._queue.append((ts, num_batches))
 
     def _dlq_note(self, wait_ms: float) -> None:
@@ -2896,8 +2719,6 @@ class _WarmWindowStream:
                 self._dlq_note((time.perf_counter() - _dq_t0) * 1000.0)
             # Consumer position for the cold-page-cache read-ahead (one int add).
             _cold_prefetch.note_pull()
-            if self._pacer is not None:
-                self._pacer(self._active_total - self._left, self._active_total)
             if self._pulls < 3:
                 # Startup timeline only: wall time of the first three batches
                 # the pipeline pulls (dl_prestart report splits the first
@@ -4049,7 +3870,19 @@ def build_train_pipeline(
                     _dlstart.mark("enq3_done")
             return batch, context
 
-    return _StreamingTrainPipeline(
+    # Eval embedding lookahead (dlrm_v4/train/eval_lookahead.py; gin
+    # apply_env_bootstrap.DLRM_HSTU_FP8_EVAL_EMB_LOOKAHEAD, default False): only
+    # the forward-only eval pipeline, and only with the knob on, becomes an
+    # eval-only subclass that issues batch N+1's EC lookup and sequence
+    # all-to-all on a side stream at the end of progress(N). Role "train" always
+    # builds _StreamingTrainPipeline itself, with the same arguments.
+    pipeline_cls = _StreamingTrainPipeline
+    if role == "eval":
+        from generative_recommenders.dlrm_v4.train import eval_lookahead as _evla
+
+        if _evla.enabled():
+            pipeline_cls = _evla.wrap(_StreamingTrainPipeline)
+    return pipeline_cls(
         model=model,
         optimizer=optimizer,
         device=device,
@@ -5495,6 +5328,12 @@ def streaming_train_eval_loop(
                 logger.info(
                     "[pipeline] eval runs pipelined (forward-only progress())"
                 )
+            # Eval embedding lookahead (present only when the knob built the
+            # eval-only subclass): the batch cap bounds its issue, and interim
+            # eval metrics (collectives between batches) decline it.
+            _evla_configure = getattr(eval_pipeline, "dlrm_evla_configure", None)
+            if _evla_configure is not None:
+                _evla_configure(num_eval_batches, bool(eval_interim_metrics))
         with torch.no_grad():
             while True:
                 _t_next = time.perf_counter() if (label and rank == 0) else None
@@ -6003,13 +5842,11 @@ def streaming_train_eval_loop(
             # (handed via prefetcher.stream's first_skip_samples). The skip is
             # zero on cold start (resume_train_ts is None → first_skip_samples=0)
             # and on completed-window resume (mid-window slice is 0 too).
-            # window_prime_pacing needs a pull-side pace_tick on every batch,
-            # which only the chained warm stream provides.
             stream = prefetcher.stream(
                 train_ts_list,
                 first_skip_samples=first_skip_samples,
                 window_cap=num_train_batches,
-                pace=_warm_windows,
+                warm=_warm_windows,
                 per_window_cap=num_train_batches,
                 first_window_trained=(
                     resume_batch_idx_in_window
@@ -6028,11 +5865,6 @@ def streaming_train_eval_loop(
                     resume_batch_idx_in_window
                     if resume_batch_idx_in_window > 0
                     else 0
-                ),
-                pacer=(
-                    prefetcher.pace_tick
-                    if prefetcher._pace > 0.0 and not prefetcher._single
-                    else None
                 ),
             )
             while True:
