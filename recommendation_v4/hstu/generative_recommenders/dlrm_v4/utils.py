@@ -332,7 +332,6 @@ def _on_trace_ready_fn(
     state = {"fire_count": 0}
 
     def handle_fn(p: torch.profiler.profile) -> None:
-        os.makedirs(trace_dir, exist_ok=True)
         if trace_steps:
             i = state["fire_count"]
             step_label = (
@@ -346,16 +345,26 @@ def _on_trace_ready_fn(
         rank_str = f"_rank{rank}" if rank is not None else ""
         file_name = f"trace_step{step_label}{rank_str}.json"
         path = os.path.join(trace_dir, file_name)
-        logger.warning(
-            p.key_averages(group_by_input_shape=True).table(
-                sort_by="self_cuda_time_total"
-            )
-        )
-        # Tracing is best-effort: a write/trim failure (permissions, disk full,
-        # malformed export) must never crash the training run. Degrade to a
-        # warning so the loop continues — especially important since streaming
-        # enables output_trace by default.
+        # Tracing is best-effort: no part of this callback may crash the
+        # training run. It runs inside torch's profile.step(), which
+        # Profiler.step() calls unguarded, so an exception here would end the
+        # job. The op summary table is diagnostics only, and building it can
+        # raise inside torch (e.g. UnicodeDecodeError in key_averages() on
+        # with_stack=True captures). Log the failure and still export the trace.
         try:
+            logger.warning(
+                p.key_averages(group_by_input_shape=True).table(
+                    sort_by="self_cuda_time_total"
+                )
+            )
+        except Exception as exc:
+            logger.warning(f"Trace op table failed for {path}: {exc!r} (skipping)")
+        # A write/trim failure (permissions, disk full, malformed export) must
+        # never crash the training run either. Degrade to a warning so the loop
+        # continues — especially important since streaming enables output_trace
+        # by default.
+        try:
+            os.makedirs(trace_dir, exist_ok=True)
             p.export_chrome_trace(path)
             logger.warning(f"Trace written to: {path}")
             if keep_n_active is not None and keep_n_active > 0:
@@ -429,6 +438,13 @@ def _multi_window_schedule(
         return torch.profiler.ProfilerAction.NONE
 
     return schedule_fn
+
+
+def _post_export_gc_on() -> bool:
+    """Profiler post-export full GC (traced runs only): on unless
+    DLRM_HSTU_FP8_PROF_POST_GC=0 (the DLRM_HSTU_FP8_ prefix is forwarded into the
+    container by the launcher)."""
+    return os.environ.get("DLRM_HSTU_FP8_PROF_POST_GC", "1").strip() != "0"
 
 
 @gin.configurable
@@ -507,6 +523,7 @@ class Profiler:
         )
         self._active = active
         self._check_window(active, keep_active, skip_head, trim_warmup)
+        self._install_gc_trace()
         # Loop events inside a recorded window (see note_event), written into
         # the exported trace and cleared after each export.
         self._notes: List[dict] = []
@@ -646,6 +663,48 @@ class Profiler:
                 kind, step, offset, detail,
             )
 
+    def _install_gc_trace(self) -> None:
+        """Diagnostic, default off (DLRM_HSTU_FP8_GC_TRACE=1; traced runs only):
+        log every full (generation-2) CPython collection of >= 50 ms on every
+        rank with the profiler step, so a host stall can be matched to a GC
+        pause. Never changes what is collected or when."""
+        if os.environ.get("DLRM_HSTU_FP8_GC_TRACE", "0").strip() != "1":
+            return
+        state = {"t0": None}
+
+        def _cb(phase: str, info: Dict[str, Any]) -> None:
+            try:
+                if info.get("generation") != 2:
+                    return
+                if phase == "start":
+                    state["t0"] = time.perf_counter()
+                elif state["t0"] is not None:
+                    ms = (time.perf_counter() - state["t0"]) * 1e3
+                    state["t0"] = None
+                    if ms >= 50.0:
+                        logger.warning(
+                            "[gc2] rank=%d profiler_step=%d full collection %.1f ms "
+                            "collected=%s uncollectable=%s",
+                            self.rank, getattr(self._profiler, "step_num", -1), ms,
+                            info.get("collected"), info.get("uncollectable"),
+                        )
+            except Exception:
+                pass
+
+        gc.callbacks.append(_cb)
+        logger.warning("[gc2] rank=%d full-collection trace armed (>= 50 ms)", self.rank)
+
+    def _window_follows(self, n: int, horizon: int = 64) -> bool:
+        """True when the schedule enters WARMUP/RECORD again within ``horizon``
+        steps after step ``n`` (then that window's pre-window GC collects)."""
+        try:
+            for k in range(n + 1, n + 1 + horizon):
+                if self._sched(k) != torch.profiler.ProfilerAction.NONE:
+                    return True
+        except Exception:
+            return True
+        return False
+
     def step(self) -> None:
         """Advance the profiler to the next step.
 
@@ -688,6 +747,19 @@ class Profiler:
         DLRM_HSTU_FP8_GC_FREEZE), and re-freezing per window would move
         whatever is alive mid-training into the permanent generation, where
         cycles among those objects are never collected again. Traced runs only.
+
+        Full GC after the last export (independent of ``align_ranks``; kill
+        switch DLRM_HSTU_FP8_PROF_POST_GC=0). The pre-window collection above
+        has no counterpart after the LAST window: its export garbage
+        (many cyclic objects per rank) stays until each rank's own
+        CPython full collection, which lands at a different later step
+        on every rank and pauses that rank; under the per-step
+        collectives every such pause stalls all ranks, so a traced run
+        can show a cluster of up to one stall per rank some steps after the
+        last export. Collecting on every rank in the same
+        step right after the export turns that cluster into one pause at an
+        unexported step, as the pre-window collection does for the earlier
+        windows. Traced runs only; training math and data are unchanged.
         """
         n = getattr(self._profiler, "step_num", 0)
         try:
@@ -720,6 +792,29 @@ class Profiler:
                 except Exception as exc:
                     logger.warning(f"rank-align before trace window failed: {exc!r}")
         self._profiler.step()
+        if (
+            cur == torch.profiler.ProfilerAction.RECORD_AND_SAVE
+            and _post_export_gc_on()
+            and not self._window_follows(n)
+        ):
+            # Full GC right after the export of a window that no other window
+            # follows (traced runs only; see the docstring above): pay the
+            # export's full collection on every rank at this same, unexported
+            # step instead of at each rank's own later CPython collection. A
+            # window that another window follows is covered by that window's
+            # pre-window collection above. Best-effort: a capture must never be
+            # able to kill a run.
+            try:
+                t0 = time.perf_counter()
+                found = gc.collect()
+                if self.rank == 0:
+                    logger.warning(
+                        "Profiler: gc.collect() after trace export at profiler "
+                        "step %d: %d unreachable object(s), %.1f ms",
+                        n, found, (time.perf_counter() - t0) * 1e3,
+                    )
+            except Exception as exc:
+                logger.warning(f"gc after trace export failed: {exc!r}")
         if self._after_metric_log is not None:
             detail, self._after_metric_log = self._after_metric_log, None
             if _hsf.enabled():
@@ -915,6 +1010,14 @@ class MetricsLogger:
         from generative_recommenders.dlrm_v4 import seq_a2a_rowperm as _sarp
 
         _sarp.install()
+        # Rkeep rebag and Triton bounds check for the
+        # sequence-embedding (pooling NONE) TBE, patched into torchrec
+        # BatchedFusedEmbedding.forward (bitwise; switches
+        # DLRM_HSTU_FP8_TBE_REBAG / DLRM_HSTU_FP8_TBE_BOUNDS_TRITON). A no-op
+        # unless one of them is on; the KJT recat part needs no patch here.
+        from generative_recommenders.dlrm_v4 import b1pp as _b1pp
+
+        _b1pp.install()
         self._pending_train_loss: Optional[Any] = None
         # MLPerf `samples_count` progress unit: global trained samples, persisted
         # alongside global_step so a resumed run continues the count.

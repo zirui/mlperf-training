@@ -48,6 +48,7 @@ from generative_recommenders.ops.triton.triton_hstu_preprocess_and_attention imp
     triton_hstu_preprocess_and_attention,
     triton_hstu_preprocess_and_attention_targets_only,
 )
+from generative_recommenders.ops.flydsl.hstu_do8_registry import carry_site
 from torch.fx._symbolic_trace import is_fx_tracing
 
 try:
@@ -388,7 +389,12 @@ def hstu_preprocess_and_attention(
             u, attn_output, residual_proxy = triton_outputs
         else:
             u, attn_output = triton_outputs
-        attn_output = attn_output.view(-1, hidden_dim * num_heads)
+        # HSTUComputeOutputFunction receives this [T, H*D] view,
+        # not the attention Function's `out`, so the view carries out's dO8
+        # site (hstu_do8_registry.carry_site; a no-op without a site).
+        attn_output = carry_site(
+            attn_output, attn_output.view(-1, hidden_dim * num_heads)
+        )
         k = None
         v = None
     else:

@@ -25,7 +25,7 @@ import os
 import re
 import sys
 import time
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import gin
 import torch
@@ -387,9 +387,85 @@ _COMM_PRECISION_NAMES = {"fp32": "fp32", "fp16": "fp16", "bf16": "bfloat16"}
 _TRITON_FP8_MODULE = "generative_recommenders.ops.triton.triton_fp8"
 _BWD_FP8_MODULE = "generative_recommenders.ops.triton.bwd_fp8"
 
+# FP8 linear GEMMs armed by a switch of their own, which neither
+# _HSTU_FP8_GEMM nor _BWD_ENABLED sees. The gin binds these on independently of
+# DLRM_HSTU_FP8_FWD/BWD, so opting out of both does not turn them off. One row
+# per path: (name, gates); the path is armed when every gate is on. A gate is
+# (env switch, owning module, attribute). The attribute is a latched bool or a
+# zero-arg function returning the module's own resolved gate; it is read when
+# env is None and the module is imported. Otherwise the switch is read as
+# "1", as for the bwd_fp8 dgrad.
+_FP8_LINEAR_PATHS: Tuple[Tuple[str, Tuple[Tuple[str, str, str], ...]], ...] = (
+    # ops/preproc_fp8_l2.py: the content and
+    # additional preprocessor MLPs' L2 GEMMs in FP8 (e4m3 forward, e5m2 x e4m3
+    # dgrad, FP8 NN wgrad). It runs only inside the preprocessor grouped tail, so
+    # that gate comes first.
+    (
+        "preproc_l2",
+        (
+            (
+                "DLRM_HSTU_FP8_PREPROC_GROUPED_TAIL",
+                "generative_recommenders.modules.preprocessors",
+                "_PREPROC_GROUPED_TAIL",
+            ),
+            (
+                "DLRM_HSTU_FP8_PREPROC_L2",
+                "generative_recommenders.ops.preproc_fp8_l2",
+                "enabled",
+            ),
+        ),
+    ),
+    # The e5m2 x e4m3 uvqk / targets-only VK projection dgrad (and the fp8t
+    # wgrad) in ops/triton/bwd_fp8.py. Gated on its own switch, not on
+    # _BWD_ENABLED.
+    (
+        "uvqk_bwd",
+        (("DLRM_HSTU_FP8_BWD_UVQK", _BWD_FP8_MODULE, "uvqk_fp8_backward_enabled"),),
+    ),
+    # ops/triton/triton_ec_indexed_l1_fp8.py: the e4m3 Indexed-X L1
+    # forward of the EC preprocessor (per-row U scales, e4m3 W1). It runs only
+    # inside Indexed-X, so that gate comes first. Indexed-X alone
+    # (DLRM_HSTU_FP8_EC_INDEXED_L1) is bf16 and is not an FP8 path by itself.
+    (
+        "ix_fp8f",
+        (
+            (
+                "DLRM_HSTU_FP8_EC_INDEXED_L1",
+                "generative_recommenders.ops.triton.triton_ec_indexed_l1",
+                "enabled",
+            ),
+            (
+                "DLRM_HSTU_FP8_EC_INDEXED_L1_FP8",
+                "generative_recommenders.ops.triton.triton_ec_indexed_l1_fp8",
+                "fp8f_enabled",
+            ),
+        ),
+    ),
+)
+
 
 def _lowest(*precisions: str) -> str:
     return min(precisions, key=_PRECISION_ORDER.index)
+
+
+def _gate_on(gate: Tuple[str, str, str], env: Mapping[str, str], live: bool) -> bool:
+    """One gate of an _FP8_LINEAR_PATHS row (see there)."""
+    switch, module, attr = gate
+    mod = sys.modules.get(module) if live else None
+    if mod is not None and hasattr(mod, attr):
+        value = getattr(mod, attr)
+        return bool(value() if callable(value) else value)
+    return (env.get(switch) or "0").strip() == "1"
+
+
+def armed_fp8_linear_paths(env: Optional[Mapping[str, str]] = None) -> Tuple[str, ...]:
+    """Names of the _FP8_LINEAR_PATHS rows armed in this process (or in ``env``)."""
+    e = os.environ if env is None else env
+    return tuple(
+        name
+        for name, gates in _FP8_LINEAR_PATHS
+        if all(_gate_on(g, e, live=env is None) for g in gates)
+    )
 
 
 def resolve_numerical_precisions(
@@ -404,7 +480,11 @@ def resolve_numerical_precisions(
       $DLRM_HSTU_FP8_GEMM at import (set by _env_bootstrap from the gin
       DLRM_HSTU_FP8_FWD arm), or when the e4m3 output-projection dgrad is
       armed (``bwd_fp8._BWD_ENABLED`` / $DLRM_HSTU_FP8_BWD), which is gated on
-      its own switch rather than on _HSTU_FP8_GEMM.
+      its own switch rather than on _HSTU_FP8_GEMM, or when any other FP8
+      linear path in ``_FP8_LINEAR_PATHS`` is armed (preprocessor L2,
+      the uvqk/vk projection backward, the Indexed-X FP8 L1 forward). Those
+      are gated independently of DLRM_HSTU_FP8_FWD/BWD and stay bound on by
+      the gin when both are opted out.
     * attn: fp8 when the e4m3 attention forward is on (``_HSTU_FP8_ATTENTION``:
       GEMM and FUSE_LN and FUSE_QKV and ATTN). The fp8 attention backward
       (k128 qk MFMA, C8 full-FP8) only engages on e4m3 q/k from that forward,
@@ -417,8 +497,10 @@ def resolve_numerical_precisions(
 
     When ``env`` is None and the FP8 module is already imported (the trainer
     case: log_run_start runs after make_model), its latched flags are read
-    directly, so the answer is what the kernels will do. Otherwise (``env``
-    given, or not imported yet) the same gating chain is evaluated on ``env``.
+    directly, so the answer is what the kernels will do. For the preprocessor L2 that is
+    preproc_fp8_l2.enabled(), the cached gate GroupedTail itself asks.
+    Otherwise (``env`` given, or not imported yet) the same gating chain is
+    evaluated on ``env``.
     """
     base = "bfloat16" if bool(_gin_param("make_model.bf16_training", False)) else "fp32"
 
@@ -447,6 +529,7 @@ def resolve_numerical_precisions(
         fp8_bwd = bool(getattr(live_bwd, "_BWD_ENABLED"))
     else:
         fp8_bwd = on("DLRM_HSTU_FP8_BWD")
+    fp8_other = bool(armed_fp8_linear_paths(env))
 
     comm = ["fp32"]  # dense DDP allreduce
     for direction in ("forward", "backward"):
@@ -460,7 +543,7 @@ def resolve_numerical_precisions(
         comm.append(_COMM_PRECISION_NAMES[p])
 
     return {
-        "linear": "fp8" if (fp8_gemm or fp8_bwd) else base,
+        "linear": "fp8" if (fp8_gemm or fp8_bwd or fp8_other) else base,
         "attn": "fp8" if fp8_attn else base,
         "comm": _lowest(*comm),
     }

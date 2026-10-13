@@ -65,6 +65,7 @@ from generative_recommenders.dlrm_v4.utils import get_dataset, MetricsLogger, Pr
 from generative_recommenders.dlrm_v4 import host_sync_free as _hsf
 from generative_recommenders.dlrm_v4 import alloc_pregrow as _alloc_pregrow
 from generative_recommenders.dlrm_v4.train import cold_prefetch as _cold_prefetch
+from generative_recommenders.dlrm_v4.train import dd_own_h2d as _dd_own_h2d
 from generative_recommenders.dlrm_v4.train import dl_prestart as _dlstart
 from generative_recommenders.dlrm_v4.train.run_knobs import (
     eval_pool_log_line,
@@ -90,6 +91,7 @@ from generative_recommenders.dlrm_v4.train.ec_bf16_output import (
     enable_ec_cat_fuse,
     enable_ec_merge_uih_candidate,
     enable_segment_reduce,
+    note_ec_indexed_l1_chain,
 )
 from generative_recommenders.common import HammerKernel
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTU, DlrmHSTUConfig
@@ -475,24 +477,72 @@ class _ReadProbedDataset(HammerToTorchDataset):
         return super().__getitems__(indices)
 
 
+# Train fast-batch precondition: why the last fast_batch_pools call
+# kept the train pools on the per-sample path although the resolved
+# DL_FAST_BATCH (its gin default: the variable is not set) selects the fast
+# builder, namely that the single chained train pool (DL_SINGLE_POOL) is off; None when
+# it did not. Recomputed by every call; _log_fast_batch_pools names it in each
+# rank's train-pool line.
+_FAST_BATCH_TRAIN_HELD: Optional[str] = None
+
+
 @gin.configurable
 def fast_batch_pools(
     train_pools: Optional[int] = None,
     eval_pools: Optional[int] = None,
 ) -> None:
-    """Resolve the two fast-batch switches for this process and install them (datasets/dataset.py configure_fast_batch).
+    """Resolve the two fast-batch switches for this process and install them
+    (datasets/dataset.py configure_fast_batch).
 
-    ``train_pools`` = $DL_FAST_BATCH (gin dlfb/env_int): the train pools and
-    every loader that is not an eval loader. ``eval_pools`` =
-    $DL_FAST_BATCH_EVAL (gin dlfbe/env_int): every eval loader (the persistent
-    eval pool and the per-call eval loaders). > 0 = the batched builder
-    (DLRMv4YambdaDataset.build_batch), 0 = the per-sample path, and for
+    ``train_pools`` = $DL_FAST_BATCH (gin dlfb/env_int): the train
+    pools and every loader that is not an eval loader. ``eval_pools`` =
+    $DL_FAST_BATCH_EVAL (gin dlfbe/env_int): every eval loader (the
+    persistent eval pool and the per-call eval loaders). > 0 = the batched
+    builder (DLRMv4YambdaDataset.build_batch), 0 = the per-sample path, and for
     ``eval_pools`` < 0 = follow ``train_pools``. None (no gin binding: tests,
     tools that do not parse yambda_5b.gin) keeps the env-only code defaults
-    (DL_FAST_BATCH off; DL_FAST_BATCH_EVAL unset = follow it). Called in the
-    main process before any pool is built (make_train_test_dataloaders,
-    prestart_streaming_loaders, streaming_train_eval_loop); the forked workers
-    inherit the result. Idempotent: the same gin + env give the same values."""
+    (DL_FAST_BATCH off; DL_FAST_BATCH_EVAL unset = follow it).
+
+    Train precondition: the batched train builder is used with the single
+    chained train pool. The check reads that pool's own switch,
+    window_single_pool(), exactly as the loader does. When ``train_pools``
+    selects the builder from the gin default (DL_FAST_BATCH unset or empty in
+    the environment) and window_single_pool() is off (DL_SINGLE_POOL <= 0 in
+    the environment, its gin setting off, or no gin binding: the loader
+    then builds the two alternating pools), the train pools keep the
+    per-sample path and each rank's "[fast-batch] train pools" line says why.
+    A DL_FAST_BATCH set in the environment is applied as given
+    (DL_FAST_BATCH=1 still selects the fast builder). Only that switch is
+    checked: the loader shapes that never build the single pool although
+    window_single_pool() is on (PERSISTENT_LOADER=0 or DOUBLE_BUFFER=0) are
+    not held, so their train loaders take the batched builder too.
+
+    Called in the main process before any pool is built
+    (make_train_test_dataloaders, prestart_streaming_loaders,
+    streaming_train_eval_loop); the forked workers inherit the result.
+    Idempotent: the same gin + env give the same values."""
+    global _FAST_BATCH_TRAIN_HELD
+    _FAST_BATCH_TRAIN_HELD = None
+    if (
+        train_pools is not None
+        and int(train_pools) > 0
+        and not os.environ.get("DL_FAST_BATCH", "").strip()
+        and not window_single_pool()
+    ):
+        # The why: DL_SINGLE_POOL as set in the environment (empty = unset,
+        # as env_int reads it); when it is unset, the gin config decided.
+        single_env = os.environ.get("DL_SINGLE_POOL") or ""
+        _FAST_BATCH_TRAIN_HELD = (
+            f"gin default {int(train_pools)} held because the single chained "
+            "train pool is off: window_single_pool() False, "
+            + (
+                f"env DL_SINGLE_POOL={single_env}"
+                if single_env
+                else "DL_SINGLE_POOL unset: its gin setting or no window_single_pool.enabled binding"
+            )
+            + "; env DL_FAST_BATCH=1 overrides"
+        )
+        train_pools = 0
     configure_fast_batch(train_pools, eval_pools)
 
 
@@ -521,8 +571,8 @@ def fast_batch_onestore(level: Optional[int] = None) -> None:
     UIH/candidate tensors being views of the two halves of the merged
     tensors, and the pin thread pins such a batch with one pinned allocation
     and one copy; 0 = one storage per tensor (the kill switch). Acts only
-    where the fast builder runs: the eval loaders it is on for, and the train
-    pools only with DL_FAST_BATCH=1. None (no gin binding: tests, tools that
+    where the fast builder runs: the eval loaders it is on for
+    ($DL_FAST_BATCH_EVAL) and the train pools ($DL_FAST_BATCH). None (no gin binding: tests, tools that
     do not parse yambda_5b.gin) keeps the env-only code default (off). Called
     in the trainer process before any pool is built
     (make_train_test_dataloaders, prestart_streaming_loaders,
@@ -553,11 +603,21 @@ def _log_fast_batch_pools(rank: int, pools: Dict[str, HammerToTorchDataset]) -> 
     uses:
     ``armed OK: [fast-batch] <kind> pools: fast builder (build_batch; ...)`` or
     ``[fast-batch] <kind> pools: per-sample path (...)``, with the switch value
-    and where it came from (env, gin default, code default). Silent when
-    nothing selects the fast builder and no eval setting is given (the code
-    default without yambda_5b.gin)."""
+    and where it came from (env, gin default, code default; for
+    $DL_FAST_BATCH held off by the train precondition, the reason:
+    fast_batch_pools). Silent when nothing selects the fast builder, no eval
+    setting is given and nothing is held (the code default without
+    yambda_5b.gin)."""
     eval_setting = eval_fast_batch()
-    if not fast_batch_enabled() and eval_setting is None:
+    train_src = fast_batch_knob_source("train")
+    # Train precondition: the reason fast_batch_pools held the train
+    # switch off, while it still describes the installed value.
+    held = (
+        _FAST_BATCH_TRAIN_HELD
+        if not fast_batch_enabled() and train_src == "gin default"
+        else None
+    )
+    if not fast_batch_enabled() and eval_setting is None and held is None:
         return
     for kind, ds in pools.items():
         if kind in _FAST_BATCH_POOLS_LOGGED:
@@ -566,7 +626,7 @@ def _log_fast_batch_pools(rank: int, pools: Dict[str, HammerToTorchDataset]) -> 
         own = getattr(ds, "fast_batch", None)
         if own is None:
             on = fast_batch_enabled()
-            knob = f"DL_FAST_BATCH={int(on)}, {fast_batch_knob_source('train')}"
+            knob = f"DL_FAST_BATCH={int(on)}, {held or train_src}"
             if kind == "eval":
                 knob = f"DL_FAST_BATCH_EVAL unset or < 0: follows {knob}"
         else:
@@ -884,6 +944,16 @@ def make_model(
                     and u != hstu_config.uih_post_id_feature_name
                 ]
             )
+
+    # Indexed-X L1 (DLRM_HSTU_FP8_EC_INDEXED_L1, default off): the EC issues (U, idx) placeholders only when every
+    # consumer of the hoisted members is Indexed-X-aware. Registration only; nothing happens with the knob off.
+    note_ec_indexed_l1_chain(
+        fuse_linear_norm=fuse_linear_norm,
+        fuse_ln_residual=fuse_ln_residual,
+        bf16_training=bf16_training,
+        transducer_bf16_dtype=transducer_bf16_dtype,
+        uih_post_id=hstu_config.uih_post_id_feature_name,
+    )
 
     # bf16 autocast is off by default: on the PYTORCH attn backend the
     # pt_hstu_attention QK einsum backward overflows in bf16 at long
@@ -3511,6 +3581,7 @@ def build_train_pipeline(
     device: torch.device,
     grad_clip_norm: float = 1.0,
     defer_next_input_wait: bool = False,
+    role: str = "train",
 ) -> Any:
     """Build a ``TrainPipelineSparseDist`` for the DMP-wrapped HSTU model.
 
@@ -3522,7 +3593,12 @@ def build_train_pipeline(
     ``defer_next_input_wait`` queues the current backward/update before waiting
     for next-batch split sizes. The wait still finishes before advancing the
     batch queue. The production Gin enables it; False restores the earlier wait.
+
+    ``role`` is "train" or "eval" (the forward-only eval pipeline); only the
+    train pipeline takes the multi-node side-stream priority.
     """
+    if role not in ("train", "eval"):
+        raise ValueError("role must be 'train' or 'eval', got %r" % (role,))
     # Lazy import: keeps module import working on torchrec builds that move or
     # rename the pipeline, and matches the reference Primus-DLRM setup.
     from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
@@ -3589,6 +3665,11 @@ def build_train_pipeline(
     # sharded embedding path does not produce.)
     class _StreamingTrainPipeline(TrainPipelineSparseDist):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            # Next-batch input dist waits only on its own batch's H2D event, not
+            # on the whole memcpy stream (which by then also holds batch N+2's
+            # copy). Kill switch DLRM_HSTU_FP8_DD_OWN_H2D=0 (dd_own_h2d.py).
+            # Created first: the attach()/reset() overrides below use it.
+            self._dd_gate = _dd_own_h2d.OwnH2DGate()
             super().__init__(*args, **kwargs)
             # Host-sync-free step only (see host_sync_free.dist_init_on_main):
             # keep the forward's input-dist completion off the high-priority
@@ -3609,19 +3690,100 @@ def build_train_pipeline(
                     )
             # Allocator pre-grow (gin apply_env_bootstrap.DLRM_HSTU_FP8_ALLOC_PREGROW):
             # the side streams whose pools were mapped before RUN_START replace
-            # torchrec's (same priority) before any batch is issued on them.
-            _alloc_pregrow.adopt_streams(self)
+            # torchrec's before any batch is issued on them; each pipeline
+            # takes the pair made for its role (the pairs can have different
+            # priorities at 2+ nodes).
+            adopted = _alloc_pregrow.adopt_streams(self, role)
             self._alloc_reporter = _alloc_pregrow.make_reporter(self)
-            prio = _hsf.pipe_stream_priority()
+            # The train pipeline's side streams run at normal priority when
+            # the job spans >1 node (gin DLRM_HSTU_FP8_PIPE_STREAM_PRIO_MN);
+            # DLRM_HSTU_FP8_PIPE_STREAM_PRIO overrides it for every pipeline.
+            # None = torchrec's -1.
+            prio = (
+                _hsf.train_pipe_stream_priority()
+                if role == "train"
+                else _hsf.pipe_stream_priority()
+            )
+            if prio is None and self._memcpy_stream is not None:
+                # 1 node with the multi-node priority bound: one info line per process,
+                # train pipeline only (log only; the pair keeps torchrec's -1).
+                _hsf.log_train_pipe_priority_inactive(role)
             if prio is not None and self._memcpy_stream is not None:
-                # Explicit override only; rebuilt before any batch is issued on them.
-                self._memcpy_stream = torch.cuda.Stream(priority=prio)
-                self._data_dist_stream = torch.cuda.Stream(priority=prio)
-                logger.info(
-                    "DLRMV4 pipeline streams: memcpy prio=%d data_dist prio=%d",
-                    self._memcpy_stream.priority,
-                    self._data_dist_stream.priority,
+                # Default multi-node path (train pipeline, multi-node
+                # priority, no explicit override): its priority-0 pair must be the
+                # pre-grown pair whose hardware-queue placement alloc_pregrow
+                # probed before RUN_START. No placement probe runs here.
+                item34 = (
+                    role == "train"
+                    and prio != -1
+                    and _hsf.pipe_stream_priority() is None
                 )
+                if (
+                    self._memcpy_stream.priority == prio
+                    and self._data_dist_stream.priority == prio
+                    and (adopted or not item34)
+                ):
+                    # Already at this priority (the pre-grown pair was made at
+                    # it by alloc_pregrow._pair_priorities): keep it and its pools.
+                    logger.info(
+                        "DLRMV4 pipeline streams: kept %s pair memcpy prio=%d data_dist prio=%d (%s)",
+                        "pre-grown" if adopted else "torchrec",
+                        self._memcpy_stream.priority,
+                        self._data_dist_stream.priority,
+                        role,
+                    )
+                elif item34:
+                    # Any other train pair at this point (the allocator
+                    # pre-grow is off, or its pair was not adopted
+                    # at the requested priority) would need the probe inside
+                    # the timed region: fall back to -1 instead.
+                    _hsf.disable_train_pipe_priority(
+                        "no pre-RUN_START placement probe for this pair "
+                        "(allocator pre-grow off or its pair not adopted)"
+                    )
+                    prio = -1
+                    if (
+                        self._memcpy_stream.priority != -1
+                        or self._data_dist_stream.priority != -1
+                    ):
+                        # Not reached with torchrec 1.7, which creates its
+                        # pair at -1. Rebuilt before any batch is issued.
+                        self._memcpy_stream = torch.cuda.Stream(priority=-1)
+                        self._data_dist_stream = torch.cuda.Stream(priority=-1)
+                else:
+                    # Rebuilt before any batch is issued on them.
+                    memcpy = torch.cuda.Stream(priority=prio)
+                    data_dist = torch.cuda.Stream(priority=prio)
+                    if (
+                        role == "train"
+                        and prio != -1
+                        and _alloc_pregrow.guard_train_pair(
+                            torch.cuda.current_stream(), memcpy, data_dist
+                        )
+                    ):
+                        # Fell back: keep torchrec's own -1 pair.
+                        prio = -1
+                    else:
+                        self._memcpy_stream = memcpy
+                        self._data_dist_stream = data_dist
+                    logger.info(
+                        "DLRMV4 pipeline streams: memcpy prio=%d data_dist prio=%d (%s)",
+                        self._memcpy_stream.priority,
+                        self._data_dist_stream.priority,
+                        role,
+                    )
+                if role == "train" and _hsf.pipe_stream_priority() is None:
+                    if self._data_dist_stream.priority != -1:
+                        logger.info(
+                            "armed OK: multi-node train pipeline stream priority "
+                            "%d (DLRM_HSTU_FP8_PIPE_STREAM_PRIO_MN)",
+                            self._data_dist_stream.priority,
+                        )
+                    else:
+                        logger.info(
+                            "DLRMV4 multi-node side-stream priority off: train "
+                            "pipeline keeps torchrec priority -1"
+                        )
 
         def progress(self, dataloader_iter):
             out = super().progress(dataloader_iter)
@@ -3752,16 +3914,46 @@ def build_train_pipeline(
                 return
             if _dlstart.ACTIVE:
                 _dlstart.mark("idist0_begin")
+            # Inline (current-batch) path: stock torchrec wait; drop the
+            # batch's unused H2D event.
+            self._dd_gate.discard(context)
             super().start_sparse_data_dist(batch, context)
+
+        def _start_sparse_data_dist_own_h2d(self, batch, context):
+            # torchrec TrainPipelineSparseDist.start_sparse_data_dist with its
+            # _wait_for_batch(batch, memcpy_stream) replaced by a wait on this
+            # batch's own H2D event (dd_own_h2d.py). Here the memcpy stream
+            # already holds batch N+2's copy, which batch N+1 does not read.
+            if batch is None:
+                return
+            if not self._dd_gate.on:
+                super().start_sparse_data_dist(batch, context)
+                return
+            from torchrec.distributed.train_pipeline import utils as _tp_utils
+
+            with torch.autograd.profiler.record_function(
+                f"## start_sparse_data_dist {context.index} ##"
+            ):
+                with self._stream_context(self._data_dist_stream):
+                    if not self._dd_gate.wait(batch, context):
+                        _tp_utils._wait_for_batch(batch, self._memcpy_stream)
+                    with _tp_utils.use_context_for_postprocs(
+                        self._pipelined_postprocs, context
+                    ):
+                        _tp_utils._start_data_dist(
+                            self._pipelined_modules, batch, context
+                        )
 
         def wait_sparse_data_dist(self, context):
             deferred = self._deferred_input_dist
             if deferred is not None and deferred[1] is context:
                 if _dlstart.ACTIVE:
                     _dlstart.mark("idist1_begin")
+                # The idist gate (host poll on the previous forward) first,
+                # then the deferred input dist gated on its own H2D event.
                 self._gate_next_input_dist()
                 self._deferred_input_dist = None
-                super().start_sparse_data_dist(*deferred)
+                self._start_sparse_data_dist_own_h2d(*deferred)
             if defer_next_input_wait and self.contexts and context is not self.contexts[0]:
                 # Current backward does not consume the next batch's lengths.
                 # Keep its splits launch here, but let backward be queued before
@@ -3807,6 +3999,7 @@ def build_train_pipeline(
             # New pipeline generation: never poll an event from before detach.
             self._prev_fwd_done = None
             super().attach(model, sparse_dist)
+            self._dd_gate.clear()
             if not resume_in_flight or self.batches[0] is None:
                 return
             context = self.contexts[0]
@@ -3831,6 +4024,7 @@ def build_train_pipeline(
             self._deferred_input_dist = None
             self._deferred_split_wait = None
             self._prev_fwd_done = None
+            self._dd_gate.clear()
             super().reset()
 
         def copy_batch_to_gpu(self, dataloader_iter):
@@ -3846,9 +4040,13 @@ def build_train_pipeline(
             batch, context = super().copy_batch_to_gpu(dataloader_iter)
             if batch is None:
                 self._next_index -= 1
-            elif _dlstart.ACTIVE and self._next_index == 3:
-                # third H2D issued (pull3 + non_blocking copy enqueue)
-                _dlstart.mark("enq3_done")
+            else:
+                # "this batch's H2D is done" event, recorded right behind its
+                # copies; the deferred input dist waits on it (dd_own_h2d.py).
+                self._dd_gate.after_copy(self._memcpy_stream, batch, context)
+                if _dlstart.ACTIVE and self._next_index == 3:
+                    # third H2D issued (pull3 + non_blocking copy enqueue)
+                    _dlstart.mark("enq3_done")
             return batch, context
 
     return _StreamingTrainPipeline(
@@ -4130,6 +4328,21 @@ def data_pct_to_global_steps(
     return int(
         math.ceil(data_pct * float(total_train_samples) / float(global_batch_size))
     )
+
+
+def first_data_pct_eval_steps(
+    gstep0: int, eval_interval_steps: int, skip_eval_until_step: int
+) -> int:
+    """Training steps from global step ``gstep0`` to the first data-fraction
+    eval of the loop below: it evaluates after the step that makes the global
+    step g when g > 0, g % eval_interval_steps == 0 and g >=
+    skip_eval_until_step. 0 when the cadence is off (eval_interval_steps <= 0).
+    Used only to time the cold-prefetch eval holdout read-ahead."""
+    if eval_interval_steps <= 0:
+        return 0
+    lo = max(int(gstep0) + 1, int(skip_eval_until_step), 1)
+    first = -(-lo // int(eval_interval_steps)) * int(eval_interval_steps)
+    return first - int(gstep0)
 
 
 def resolve_skip_eval_until_step(
@@ -5275,7 +5488,8 @@ def streaming_train_eval_loop(
         nonlocal eval_pipeline
         if use_eval_pipeline and eval_pipeline is None:
             eval_pipeline = build_train_pipeline(
-                model, optimizer, device, grad_clip_norm=grad_clip_norm
+                model, optimizer, device, grad_clip_norm=grad_clip_norm,
+                role="eval",
             )
             if rank == 0:
                 logger.info(
@@ -5745,6 +5959,31 @@ def streaming_train_eval_loop(
             train_pipeline is not None
             and os.environ.get("TP_WARM_WINDOWS", "1") == "1"
         )
+        # Eval holdout read-ahead: with the streaming walk on
+        # ($DL_COLD_PREFETCH_STREAM), the walk also issues this rank's holdout
+        # ranges ahead of the first data-fraction eval, which the walk would
+        # otherwise leave cold (cold_prefetch module docstring). It is timed
+        # by the warm-keep stream's pull counts (the only consumer position
+        # the walk sees), so it is planned only with warm-keep on. Metadata
+        # only: no file access here; inert without the walk.
+        if (
+            _warm_windows
+            and eval_dl is not None
+            and eval_interval_steps > 0
+            and eval_global_indices is not None
+        ):
+            _cold_prefetch.set_eval_plan(
+                eval_global_indices,
+                int(getattr(eval_dl, "batch_size", 0) or 0),
+                first_data_pct_eval_steps(
+                    int(metric_logger.global_step.get("train", 0)),
+                    eval_interval_steps,
+                    skip_eval_until_step,
+                ),
+                num_eval_batches,
+            )
+        else:
+            _cold_prefetch.set_eval_plan(None, 0, 0)
         if train_pipeline is not None and rank == 0:
             logger.info(
                 "[pipeline] window warm-keep %s",

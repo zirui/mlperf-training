@@ -37,6 +37,26 @@
 // 2 waves/SIMD.
 // Build: hipcc -DKITTENS_CDNA4 --offload-arch=gfx950 -std=c++20 -O3 -DHK_N={1536|1024} -mllvm
 //        -amdgpu-sched-strategy=iterative-ilp -ffp-contract=off -shared -fPIC.
+//
+// TILED-A mode: kernel k512_2wg_kernel_tiled_a<N> (the
+// default ABI, body k512_2wg_body<..., TA = true>) reads A from the STEP-TILED token-major yT, e4m3
+// [ceil(M/128), 512, 128], token t / feature c at byte ((t / 128) * 512 + c) * 128 + t % 128 (ops/triton/wgrad_ck.py
+// "Step-tiled xT"; the LayerNorm store_t writes it for the K=tokens wgrad), instead of the row-major y [M, 512].
+// Entry k512_fp8_gemm_e4m3_bias_tiled_a_N{N}, same C signature as k512_fp8_gemm_e4m3_bias_N{N}.
+//   * The A rows of one WG tile (tokens row0..row0+127) are tile block row0/128: one contiguous 64 KiB block, K-row stride
+//     128 B, K step KK = K-rows [128KK, 128KK+128) at +16384*KK. The A item lands K-major in its LDS slot: K-row kk at
+//     kk*128, 16-token chunk c at 16-byte position c ^ f(kk), f(kk) = (kk & 7) ^ ((kk >> 4) & 1), so lane l of wave w,
+//     load i fetches chunk (l&7) ^ (l>>3) ^ ((w>>1)&1) of K-row 32i + 8w + l/8 (8 lanes = one 128 B line).
+//   * A fragments: 4 ds_read_b64_tr_b8 (gfx950 transposing LDS read) per 16x128 fragment, at +0/+1024/+8192/+9216 from
+//     one per-lane address; within a 16-lane group out[L][byte j] = lds[addr[2j + (L>>3)] + (L&7)], so lane 16g+s holds
+//     token 16c+s, K bytes 16g+[0,8), 16g+[8,16), 64+16g+[0,8), 64+16g+[8,16) = exactly the bytes of the row-major
+//     ds_read_b128 fragment: identical MFMA operands, bit-identical outputs.
+//   * Tail: tokens [M, Mp) of the last block are read as stored (the producers zero them); every output row depends only
+//     on its own token, and rows >= M are not stored.
+//   * Store guard: 2 x s_nop 7 after each buffer_store_dwordx4, so no instruction rewrites store data VGPRs within 16
+//     wait states (a rewrite within 3 wait states corrupts the stored bytes).
+//   SCHED 0 only. k512_2wg_kernel<...> (every row-major instantiation) runs k512_2wg_body<..., TA = false>, which
+//   does not instantiate any of this (discarded 'if constexpr' branches).
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 #include <utility>
@@ -46,6 +66,7 @@
 #endif
 
 namespace k512 {
+typedef int i32x2 __attribute__((ext_vector_type(2)));
 typedef int i32x4 __attribute__((ext_vector_type(4)));
 typedef int i32x8 __attribute__((ext_vector_type(8)));
 typedef float f32x4 __attribute__((ext_vector_type(4)));
@@ -129,6 +150,49 @@ __device__ __forceinline__ void read_B(i32x8 (&b)[2], uint32_t lpB0, uint32_t lp
     b[1] = frag<SL * SLOT + 2048>(lpB0, lpB1);
 }
 
+// ---- tiled-A mode only (see the header) ----
+// gfx950 transposing 8-bit LDS read, 8 bytes per lane
+template <int IMM>
+__device__ __forceinline__ i32x2 ds_read_tr8(uint32_t vaddr) {
+    static_assert(IMM >= 0 && IMM < 65536, "ds offset is 16 bit");
+    i32x2 v;
+    asm volatile("ds_read_b64_tr_b8 %0, %1 offset:%2" : "=v"(v) : "v"(vaddr), "i"(IMM) : "memory");
+    return v;
+}
+// One 16x128 A fragment from a K-major slot: 4 transposing reads at +0 (K 16g+0..7), +1024 (16g+8..15), +8192
+// (64+16g+0..7), +9216 (64+16g+8..15); the same bytes per lane as frag() on the row-major slot.
+template <int S>
+__device__ __forceinline__ i32x8 fragT(uint32_t tp) {
+    static_assert(S + 9216 < 65536, "A items never use slot 4");
+    const i32x2 r0 = ds_read_tr8<S>(tp);
+    const i32x2 r1 = ds_read_tr8<S + 1024>(tp);
+    const i32x2 r2 = ds_read_tr8<S + 8192>(tp);
+    const i32x2 r3 = ds_read_tr8<S + 9216>(tp);
+    const i32x4 lo = __builtin_shufflevector(r0, r1, 0, 1, 2, 3);
+    const i32x4 hi = __builtin_shufflevector(r2, r3, 0, 1, 2, 3);
+    return __builtin_shufflevector(lo, hi, 0, 1, 2, 3, 4, 5, 6, 7);
+}
+// v ^ IMM as one v_xor per fragment (asm volatile: not hoisted into 8 live address VGPRs)
+template <int IMM>
+__device__ __forceinline__ uint32_t xor_imm(uint32_t v) {
+    if constexpr (IMM == 0) {
+        return v;
+    } else {
+        uint32_t r;
+        asm volatile("v_xor_b32 %0, %1, %2" : "=v"(r) : "i"(IMM), "v"(v));
+        return r;
+    }
+}
+// A fragments of token subtiles c = 4H + m (rows [64H, 64H+64) of the tile) from a K-major slot; the address of
+// subtile c is bfT ^ 16c (bfT: per-lane base, see the kernel)
+template <int SL, int H>
+__device__ __forceinline__ void read_AT(i32x8 (&a)[4], uint32_t bfT) {
+    a[0] = fragT<SL * SLOT>(xor_imm<16 * (4 * H + 0)>(bfT));
+    a[1] = fragT<SL * SLOT>(xor_imm<16 * (4 * H + 1)>(bfT));
+    a[2] = fragT<SL * SLOT>(xor_imm<16 * (4 * H + 2)>(bfT));
+    a[3] = fragT<SL * SLOT>(xor_imm<16 * (4 * H + 3)>(bfT));
+}
+
 // acc[n][m] (+)= Bfrag[n] (16 output cols) x Afrag[m] (16 output rows): D'[col][row], lane holds 4 consecutive cols.
 template <bool FIRST>
 __device__ __forceinline__ void mma8(f32x4 (&c)[2][4], const i32x8 (&b)[2], const i32x8 (&a)[4]) {
@@ -152,10 +216,11 @@ __device__ __forceinline__ void g2l(i32x4 rsrc, uint32_t lds_addr, uint32_t voff
 
 // A item (128 rows x 128 K-bytes of K step KK) -> slot SL. 4 x 16 B per lane; per-lane voffsets carry the row
 // (bounds-checked: rows >= M are out of range and read as 0), the K-step column offset goes into soffset.
-template <int SL, int KK>
+// KSB = bytes per K step in A: 128 (row-major y), 16384 (tiled A: 128 K-rows of 128 tokens).
+template <int SL, int KK, int KSB = 128>
 __device__ __forceinline__ void issue_A(i32x4 rA, uint32_t ldsw, const uint32_t (&offA)[4]) {
 #pragma unroll
-    for (int i = 0; i < 4; ++i) g2l(rA, ldsw + SL * SLOT + i * 4096, offA[i], KK * 128);
+    for (int i = 0; i < 4; ++i) g2l(rA, ldsw + SL * SLOT + i * 4096, offA[i], KK * KSB);
 }
 // B item: rsrc base already selects B0 (+0) or B1 (+8 rows); per-i row offset 64*i rows = 32768 B in soffset.
 template <int SL, int KK>
@@ -166,14 +231,17 @@ __device__ __forceinline__ void issue_B(i32x4 rB, uint32_t ldsw, uint32_t offB) 
 
 }  // namespace k512
 
-template <int N, int NOCLAMP, int REMAP, int PRIO, int SCHED, int SAUX>
-__global__ __launch_bounds__(256, 2) void k512_2wg_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
-                                                          uint8_t* __restrict__ C, const uint16_t* __restrict__ bias,
-                                                          const float* __restrict__ sa, const float* __restrict__ sb,
-                                                          int M) {
+// The kernel body, force-inlined into the two __global__ entries below: k512_2wg_kernel (TA = false: row-major A) and
+// k512_2wg_kernel_tiled_a (TA = true: tiled A, see the header). The pointers carry no __restrict__ here: their noalias
+// comes from the kernels' parameters.
+template <int N, int NOCLAMP, int REMAP, int PRIO, int SCHED, int SAUX, bool TA>
+__device__ __forceinline__ void k512_2wg_body(const uint8_t* A, const uint8_t* B, uint8_t* C, const uint16_t* bias,
+                                              const float* sa, const float* sb, int M) {
 #pragma clang fp contract(off)
     using namespace k512;
     static_assert(N % BN == 0, "N must be a multiple of 256");
+    static_assert(!TA || SCHED == 0, "tiled A: SCHED 0 only");
+    constexpr int AKSB = TA ? 128 * BM : 128;  // A bytes per K step: 128 columns (row-major) | 128 K-rows of BM tokens
     constexpr int NT = N / BN;
     __shared__ __attribute__((aligned(2048))) uint8_t smem[NSLOT * SLOT];
 
@@ -200,7 +268,8 @@ __global__ __launch_bounds__(256, 2) void k512_2wg_kernel(const uint8_t* __restr
     if constexpr (NOCLAMP) asm volatile("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1\n s_nop 7\n s_nop 7" ::: "memory");
 
     // ---- buffer resources (scalar) ----
-    const i32x4 rA = make_rsrc(A + (size_t)row0 * KD, (uint32_t)(rows_valid * KD));
+    // tiled A: tile block row0/128 = 512 K-rows x 128 tokens, contiguous 64 KiB at byte row0 * KD, all of it in range
+    const i32x4 rA = make_rsrc(A + (size_t)row0 * KD, (uint32_t)((TA ? BM : rows_valid) * KD));
     const uint8_t* Bt = B + (size_t)col0 * KD;
     const i32x4 rB0 = make_rsrc(Bt, (uint32_t)((N - col0) * KD));
     const i32x4 rB1 = make_rsrc(Bt + 8 * KD, (uint32_t)((N - col0) * KD - 8 * KD));
@@ -210,8 +279,15 @@ __global__ __launch_bounds__(256, 2) void k512_2wg_kernel(const uint8_t* __restr
     // 16-byte chunk (l&7) ^ ((4*(w&1) + l/16) & 7)  (inverse of the st_16x128 XOR swizzle; HK global_to_shared).
     const uint32_t chunk = (uint32_t)((lane & 7) ^ ((4 * (w & 1) + (lane >> 4)) & 7));
     uint32_t offA[4];
+    if constexpr (TA) {
+        // tiled A, K-major slot: K-row 32i + 8w + l/8 (stride 128 B), 16-token chunk (l&7) ^ (l>>3) ^ ((w>>1)&1)
+        const uint32_t cT = (uint32_t)((lane & 7) ^ (lane >> 3) ^ ((w >> 1) & 1));
 #pragma unroll
-    for (int i = 0; i < 4; ++i) offA[i] = (uint32_t)(32 * i + 8 * w + (lane >> 3)) * KD + chunk * 16;
+        for (int i = 0; i < 4; ++i) offA[i] = (uint32_t)(32 * i + 8 * w + (lane >> 3)) * (uint32_t)BM + cT * 16u;
+    } else {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) offA[i] = (uint32_t)(32 * i + 8 * w + (lane >> 3)) * KD + chunk * 16;
+    }
     // B slot row r = 32*i + q (q = 8w + l/8): wave i's fragment row q -> jj = q/16, npos = q%16; output column (within
     // the WG tile) = 64*i + 16*(npos/4) + 4*(2h + jj) + npos%4 for slot h (h=1 adds 8 rows: the rB1 base).
     uint32_t offB;
@@ -231,6 +307,16 @@ __global__ __launch_bounds__(256, 2) void k512_2wg_kernel(const uint8_t* __restr
     const uint32_t lpA1 = lds0 + (uint32_t)r16 * 128u + (((uint32_t)(16 * q4 + 64)) ^ swz);
     const uint32_t lpB0 = lpA0 + (uint32_t)w * 4096u;
     const uint32_t lpB1 = lpA1 + (uint32_t)w * 4096u;
+    // tiled A: per-lane base of the transposing fragment reads, lane l = 16g + s: K-row 16g + s/2, token half 8(s&1),
+    // chunk position c ^ f, f = (s>>1) ^ (g&1) (= f(K-row) of all 4 reads); lds0 is 2048-aligned (address bits 4-6
+    // clear), so the address of token subtile c is (base ^ 16f) ^ 16c
+    uint32_t bfT = 0;
+    if constexpr (TA) {
+        const uint32_t s = (uint32_t)(lane & 15), g = (uint32_t)(lane >> 4);
+        const uint32_t f = (s >> 1) ^ (g & 1u);
+        const uint32_t base = lds0 + (16u * g + (s >> 1)) * 128u + 8u * (s & 1u);
+        bfT = base ^ (16u * f);
+    }
 
     i32x8 a[4], b0[2], b1[2];
     f32x4 acc[4][2][4];  // [cA: b0 x a(rows 0-63), cB: b1 x a(0-63), cC: b0 x a(64-127), cD: b1 x a(64-127)][n][m]
@@ -252,10 +338,11 @@ __global__ __launch_bounds__(256, 2) void k512_2wg_kernel(const uint8_t* __restr
         else asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         K512_BARRIER();  // ... and of every wave
         read_B<sB0>(b0, lpB0, lpB1);
-        read_A<sA, 0>(a, lpA0, lpA1);
+        if constexpr (TA) read_AT<sA, 0>(a, bfT);
+        else read_A<sA, 0>(a, lpA0, lpA1);
         asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
         K512_BARRIER();  // all waves consumed B0_KS -> its slot takes A_{KS+1}
-        if constexpr (KS + 1 < KSTEPS) issue_A<sB0, KS + 1>(rA, ldsw, offA);
+        if constexpr (KS + 1 < KSTEPS) issue_A<sB0, KS + 1, AKSB>(rA, ldsw, offA);
         if constexpr (KS == KSTEPS - 1) bias_prefetch();
         K512_SB();
         prio_on();
@@ -269,7 +356,8 @@ __global__ __launch_bounds__(256, 2) void k512_2wg_kernel(const uint8_t* __restr
         mma8<KS == 0>(acc[1], b1, a);
         prio_off();
         K512_SB();
-        read_A<sA, 1>(a, lpA0, lpA1);
+        if constexpr (TA) read_AT<sA, 1>(a, bfT);
+        else read_A<sA, 1>(a, lpA0, lpA1);
         asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
         K512_BARRIER();  // all waves consumed B1_KS and A_KS -> their slots take B0_{KS+2}, B1_{KS+2}
         if constexpr (KS + 2 < KSTEPS) {
@@ -422,8 +510,28 @@ __global__ __launch_bounds__(256, 2) void k512_2wg_kernel(const uint8_t* __restr
         const uint32_t nrec = (uint32_t)__builtin_amdgcn_readfirstlane(rv * N);  // keep the rsrc scalar (no waterfall)
         const i32x4 rC = make_rsrc(Ct + (size_t)(16 * g) * N, nrec);
         k512_llvm_buffer_store_v4i32(d, rC, (int)lane_off, 0, SAUX);  // SAUX: cache policy (gfx950 bit1 = nt)
+        if constexpr (TA) asm volatile("s_nop 7\n\ts_nop 7");  // tiled A: store-data guard (see the header)
         K512_SB();  // drain group by group (bounded temporaries; stores start early)
     }
+}
+
+template <int N, int NOCLAMP, int REMAP, int PRIO, int SCHED, int SAUX>
+__global__ __launch_bounds__(256, 2) void k512_2wg_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
+                                                          uint8_t* __restrict__ C, const uint16_t* __restrict__ bias,
+                                                          const float* __restrict__ sa, const float* __restrict__ sb,
+                                                          int M) {
+    k512_2wg_body<N, NOCLAMP, REMAP, PRIO, SCHED, SAUX, false>(A, B, C, bias, sa, sb, M);
+}
+
+// Tiled-A kernel (see the header): the default ABI (NOCLAMP=1, REMAP=1, PRIO=1, SCHED=0, SAUX=0) with A read from
+// the step-tiled yT [ceil(M/128), 512, 128].
+template <int N>
+__global__ __launch_bounds__(256, 2) void k512_2wg_kernel_tiled_a(const uint8_t* __restrict__ A,
+                                                                  const uint8_t* __restrict__ B, uint8_t* __restrict__ C,
+                                                                  const uint16_t* __restrict__ bias,
+                                                                  const float* __restrict__ sa,
+                                                                  const float* __restrict__ sb, int M) {
+    k512_2wg_body<N, 1, 1, 1, 0, 0, true>(A, B, C, bias, sa, sb, M);
 }
 
 template <int N, int NOCLAMP, int REMAP, int PRIO, int SCHED, int SAUX = 0>
@@ -447,6 +555,26 @@ static int k512_launch(const void* A, const void* B, void* C, const void* bias, 
 extern "C" int K512_CAT(k512_fp8_gemm_e4m3_bias_N, HK_N)(const void* A, const void* B, void* C, const void* bias,
                                                           const float* sa, const float* sb, int M, void* stream) {
     return k512_launch<HK_N, 1, 1, 1, 0>(A, B, C, bias, sa, sb, M, stream);
+}
+
+// Tiled-A launch (see the header): A = the step-tiled yT, e4m3 [ceil(M/128), 512, 128], 16-byte aligned; the tail tokens
+// [M, ceil(M/128)*128) of the last block are read as stored and do not affect the output.
+template <int N>
+static int k512_launch_tiled_a(const void* A, const void* B, void* C, const void* bias, const float* sa, const float* sb,
+                               int M, void* stream) {
+    if (M <= 0 || ((uintptr_t)A % 16) != 0) return (int)hipErrorInvalidValue;
+    const long long tiles = ((long long)M + 127) / 128 * (N / 256);
+    if (tiles > 0x7fffffffLL) return (int)hipErrorInvalidValue;
+    hipLaunchKernelGGL((k512_2wg_kernel_tiled_a<N>), dim3((unsigned)tiles), dim3(256), 0, (hipStream_t)stream,
+                       (const uint8_t*)A, (const uint8_t*)B, (uint8_t*)C, (const uint16_t*)bias, sa, sb, M);
+    return (int)hipGetLastError();
+}
+// Tiled-A entry: the default ABI kernel with A read from the step-tiled yT; bit-identical to
+// k512_fp8_gemm_e4m3_bias_N{N} on the row-major y with the same bytes.
+extern "C" int K512_CAT(k512_fp8_gemm_e4m3_bias_tiled_a_N, HK_N)(const void* A_tiled, const void* B, void* C,
+                                                                  const void* bias, const float* sa, const float* sb,
+                                                                  int M, void* stream) {
+    return k512_launch_tiled_a<HK_N>(A_tiled, B, C, bias, sa, sb, M, stream);
 }
 extern "C" const char* k512_fp8_gemm_impl(void) {
     return "2wg: 2 x 4-wave WG/CU, 128x256 tile, 5-slot 80 KiB LDS ring, swapped MFMA, FP16_OVFL sat, XCD remap";

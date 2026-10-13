@@ -107,28 +107,45 @@ _HSTU_FP8_TELEMETRY_INTERVAL: int = max(
 )
 # K=512 FP8 forward projection GEMM (ops/hip/k512_fp8_gemm.py) for the e4m3-out
 # V/Q/K (N=1536) and targets V/K (N=1024) projections in scaled_mm_fp8_out_preq,
-# instead of hipBLASLt. Default off (yambda_5b.gin turns it on). Differs only
-# in fp32 summation order: bit-identical to hipBLASLt's data-parallel tiles,
-# while hipBLASLt's stream-K tail tiles add split-K partials in another order;
+# instead of hipBLASLt. Default off (yambda_5b.gin turns it on). fp32
+# summation order only: bit-identical to hipBLASLt's data-parallel tiles, while
+# hipBLASLt's stream-K tail tiles add split-K partials in another order;
 # anything it does not cover stays on hipBLASLt.
 _HSTU_FP8_FWD_K512: bool = os.environ.get("DLRM_HSTU_FP8_FWD_K512", "0") == "1"
+# DLRM_HSTU_FP8_FWD_K512_TILED_A (code default off, yambda_5b.gin
+# binds it on, "0" in the environment is the kill switch): the targets-only
+# layer's V/K projection (N=1024, e4m3 out) reads its A from the step-tiled
+# token-major yT that the Triton v2 store_t writes for the fp8t V/K wgrad, on
+# the K512 library's tiled-A entry (ops/hip/k512_fp8_gemm.py), so that
+# LayerNorm needs no [M, 512] y (store_y=False: the unmodified v2 kernel still
+# WRITES y's bytes, but into a dedicated 1/32-size scratch that is discarded:
+# fewer DRAM write-backs, not fewer stores). Bit-identical: yT holds y's
+# bytes and the tiled-A entry equals the row-major K512 entry on y. Needs
+# DLRM_HSTU_FP8_FWD_K512 (the row-major entry, not hipBLASLt, is what the tiled
+# entry matches). Decided on the host before the LayerNorm
+# (k512_tiled_a_vk_decline_reason); a decline keeps the row-major y and
+# scaled_mm_fp8_out_preq.
+_HSTU_FP8_FWD_K512_TILED_A: bool = (
+    os.environ.get("DLRM_HSTU_FP8_FWD_K512_TILED_A", "0") == "1"
+)
 # K=1536 FP8 output-projection forward GEMM with the fused bf16 residual
 # (ops/hip/k1536_fp8_addmm.py) in scaled_addmm_fp8_preq's residual-fused branch,
-# instead of the hipBLASLt extension call. Default off (yambda_5b.gin turns it
-# on). Differs only in fp32 summation order, as K512; anything it does not
+# instead of the hipBLASLt extension call. Default off (yambda_5b.gin
+# turns it on). fp32 summation order only, as K512; anything it does not
 # cover stays on hipBLASLt.
 _HSTU_FP8_FWD_K1536: bool = os.environ.get("DLRM_HSTU_FP8_FWD_K1536", "0") == "1"
 # U-slice forward GEMM (QKV-fused path: e4m3 normed_x [M,512] x e4m3 W_u
 # [512,512] + bf16 bias -> bf16) always on hipBLASLt's data-parallel grid.
 # torch._scaled_mm hands hipBLASLt torch's process-wide 76 MiB workspace, and
-# with that much room the stream-K selection can pick a persistent 255/256-
-# workgroup grid, whose time is GPU- and placement-dependent. The choice is a
-# deterministic function of M and the workspace size (the persistent grid's
-# partial tiles need >= 63.75 MiB), so the call sites that pass
-# data_parallel=True go through hipblaslt_scaled_mm_bias.cpp -- the same
-# hipBLASLt call torch makes, with a private DLRM_HSTU_FP8_FWD_U_DP_WS_MIB
-# workspace. Same kernel, data-parallel grid, identical output bytes. Other
-# GEMMs keep torch's workspace. Default off.
+# with that much room the stream-K selection picks a persistent 255/256-
+# workgroup grid at many of the in-model token counts, whose run time is
+# variable. The choice is a deterministic function of M
+# and the workspace size (the persistent grid's partial tiles need >= 63.75
+# MiB), so the call sites that pass data_parallel=True go through
+# hipblaslt_scaled_mm_bias.cpp -- the same hipBLASLt call torch makes, with a
+# private DLRM_HSTU_FP8_FWD_U_DP_WS_MIB workspace. Same kernel, data-parallel
+# grid; identical output bytes. Other GEMMs keep torch's workspace.
+# Default off.
 _HSTU_FP8_FWD_U_DP: bool = os.environ.get("DLRM_HSTU_FP8_FWD_U_DP", "0") == "1"
 _HSTU_FP8_FWD_U_DP_WS_MIB: int = int(
     os.environ.get("DLRM_HSTU_FP8_FWD_U_DP_WS_MIB", "32")
@@ -161,7 +178,7 @@ def _env_true(name: str) -> bool:
 # the gin binding apply_env_bootstrap.DLRM_HSTU_FP8_WSHADOW_FUSED turns it on
 # (BATCH is a refinement, default on once FUSED is on). The aten
 # chain below (_pack_weight_layout + calibrated_scale + quantize_with_scale)
-# takes ~10 launches per (weight, layout);
+# is ~10 launches per (weight, layout).
 # triton_fp8_wshadow.refresh_shadows produces the same bytes (same
 # amax, same scale formula -- including aten's multiply-by-(float)(1/448.0)
 # for the CPU-scalar division -- same IEEE division, clamp and software
@@ -219,6 +236,18 @@ _inverse_scale_cache: Dict[
 ] = {}
 _folded_input_scale_cache: Dict[Tuple[object, ...], torch.Tensor] = {}
 _scaled_output_bias_cache: Dict[Tuple[object, ...], torch.Tensor] = {}
+# Weak reference to the bias tensor each _scaled_output_bias_cache entry was computed from (same keys). A hit is
+# valid only while that very tensor is alive: the key is (id, data_ptr, offset, _version), and a freed temporary
+# (e.g. the targets-only site's torch.cat of the V/K bias slices, whose _version is always 0) can hand its id and
+# allocator block to a later tensor with different values. Entries whose tensor is gone are purged.
+_scaled_output_bias_refs: Dict[Tuple[object, ...], "weakref.ReferenceType[torch.Tensor]"] = {}
+_SCALED_BIAS_PURGE_AT = 64
+# Kill switch DLRM_HSTU_FP8_BIAS_CACHE_STRICT (gin binding apply_env_bootstrap.DLRM_HSTU_FP8_BIAS_CACHE_STRICT):
+# unset or "1" = the weakref-validated hits and the purge above;
+# "0" = the unchecked cache (a key hit is returned unchecked, nothing is purged). Read on the first
+# _scale_bias_for_fp8_output call, never at import (this module can be imported before the env bootstrap runs),
+# cached for the process; one line per process: "[fp8-bias-cache] strict: ..." or "[fp8-bias-cache] legacy ...".
+_scaled_bias_strict: Optional[bool] = None
 _fp8_output_scale_mode_by_device: Dict[int, str] = {}
 _telemetry_calls: Dict[str, int] = {}
 _telemetry_last: Dict[str, dict[str, float | int | bool]] = {}
@@ -279,7 +308,7 @@ def hstu_fp8_attention_enabled() -> bool:
 
 
 def refuse_fp8_with_flydsl_attention_forward() -> None:
-    """No-op gate, kept for import compatibility.
+    """No-op. Kept so old call sites and tests still import a named gate.
 
     ``DLRM_HSTU_FP8_FWD=1`` plus ``HSTU_ATTN_FWD=flydsl`` (the gin default)
     selects the FlyDSL e4m3 attention forward (fused-silu epilogue included).
@@ -593,6 +622,21 @@ def _fold_output_scale_into_input(
     return folded
 
 
+def _scaled_bias_cache_strict() -> bool:
+    global _scaled_bias_strict
+    if _scaled_bias_strict is None:
+        _scaled_bias_strict = _env_on("DLRM_HSTU_FP8_BIAS_CACHE_STRICT")
+        if _scaled_bias_strict:
+            print(
+                "[fp8-bias-cache] strict: weakref-validated hits, purge at "
+                f"{_SCALED_BIAS_PURGE_AT}",
+                flush=True,
+            )
+        else:
+            print("[fp8-bias-cache] legacy (DLRM_HSTU_FP8_BIAS_CACHE_STRICT=0)", flush=True)
+    return _scaled_bias_strict
+
+
 def _scale_bias_for_fp8_output(
     bias: torch.Tensor,
     output_scale: torch.Tensor,
@@ -611,9 +655,18 @@ def _scale_bias_for_fp8_output(
                 output_scale_value,
             ),
         )
+    strict = _scaled_bias_cache_strict()
     cached = _scaled_output_bias_cache.get(key)
     if cached is not None:
-        return cached
+        if not strict:  # DLRM_HSTU_FP8_BIAS_CACHE_STRICT=0: unchecked hit
+            return cached
+        ref = _scaled_output_bias_refs.get(key)
+        if ref is not None and ref() is bias:
+            return cached
+        # The tensor this entry was computed from is gone (or unknown): the key was
+        # reused by a different tensor, so the cached values may be stale.
+        _scaled_output_bias_cache.pop(key, None)
+        _scaled_output_bias_refs.pop(key, None)
     if (
         output_scale_value is None
         or not math.isfinite(output_scale_value)
@@ -621,7 +674,17 @@ def _scale_bias_for_fp8_output(
     ):
         raise RuntimeError("FP8 bias requested before output scale calibration")
     scaled = (bias.detach().float() / output_scale_value).to(torch.bfloat16)
+    if not strict:  # DLRM_HSTU_FP8_BIAS_CACHE_STRICT=0: plain store (no ref, no purge)
+        _scaled_output_bias_cache[key] = scaled
+        return scaled
+    if len(_scaled_output_bias_cache) >= _SCALED_BIAS_PURGE_AT:
+        # purge entries whose tensor is gone or has been updated since (key[4] is its _version)
+        for dead in [k for k, r in _scaled_output_bias_refs.items()
+                     if r() is None or int(getattr(r(), "_version", 0)) != k[4]]:
+            _scaled_output_bias_cache.pop(dead, None)
+            _scaled_output_bias_refs.pop(dead, None)
     _scaled_output_bias_cache[key] = scaled
+    _scaled_output_bias_refs[key] = weakref.ref(bias)
     return scaled
 
 
@@ -688,6 +751,7 @@ def clear_fp8_scale_runtime_cache() -> None:
     _inverse_scale_cache.clear()
     _folded_input_scale_cache.clear()
     _scaled_output_bias_cache.clear()
+    _scaled_output_bias_refs.clear()
 
 
 def quantize_with_scale(
@@ -770,7 +834,7 @@ def _pack_weight_layout(weight: torch.Tensor, layout: _WeightLayout) -> torch.Te
     return packed
 
 
-# DEFAULT OFF: the weight-shadow refresh below as two
+# DLRM_HSTU_FP8_SHADOW_FUSED, DEFAULT OFF: the weight-shadow refresh below as two
 # Triton kernels (fp8_helpers_fused.shadow_refresh) instead of the ~9-kernel
 # torch chain; byte-identical shadow and scale (see that module's contract).
 _SHADOW_FUSED: bool = os.environ.get("DLRM_HSTU_FP8_SHADOW_FUSED", "0") == "1"
@@ -1006,6 +1070,7 @@ def clear_fp8_weight_cache() -> None:
     _inverse_scale_cache.clear()
     _folded_input_scale_cache.clear()
     _scaled_output_bias_cache.clear()
+    _scaled_output_bias_refs.clear()
     _fp8_output_scale_mode_by_device.clear()
     _telemetry_calls.clear()
     _telemetry_last.clear()
@@ -1215,9 +1280,9 @@ def _log_fp8_resolved_once() -> None:
 def record_fp8_capability(site: str) -> None:
     """Note that a fused production site ran, once per site per rank.
 
-    The capability FILE is what a certification run collects, and it is still
-    written only when asked for. The LOG LINE is for every other run, so the
-    log records that a fused FP8 site actually ran.
+    The capability FILE is what a certification run collects, and it is
+    written only when asked for. The LOG LINE is for every other run, so every
+    production FP8 run leaves a record that it ran FP8.
     """
 
     if site in _capability_sites:
@@ -1319,10 +1384,10 @@ def _scaled_mm_call(a: torch.Tensor, b: torch.Tensor, kwargs: Dict):
     print "Warning: Latency not found for MI_M=16, MI_N=16, MI_K=128,
     mi_input_type=BFloat8Float8_fnuz. Returning latency value of 32 (really
     slow)." many times, through an unbuffered std::cerr that issues one
-    write(2) per `<<` token. No environment variable gates it in hipBLASLt
-    1.2 / ROCm 7.2. With several ranks sharing one stderr pipe these writes
-    block the main thread. M is the jagged token count and changes every step,
-    so new shapes keep appearing.
+    write(2) per `<<` token. No environment variable gates it in hipBLASLt 1.2
+    / ROCm 7.2. When several ranks share one stderr pipe these writes are
+    expensive on the CPU, and M is the jagged token count that changes every
+    step, so new shapes keep appearing.
 
     Only the chatter changes. The GEMM, the heuristic and the kernel it picks
     are untouched, so the output is bit-identical. Redirection applies only to
@@ -1414,11 +1479,16 @@ def prebuild_extensions() -> bool:
     requested (bwd_fp8.prebuild_uvqk_extension; a no-op otherwise), the
     U-forward data-parallel extension when DLRM_HSTU_FP8_FWD_U_DP=1, the
     K=512 forward GEMM library when DLRM_HSTU_FP8_FWD_K512=1
-    (ops/hip/k512_fp8_gemm.prebuild), the K=1536 out-projection forward
-    GEMM library when DLRM_HSTU_FP8_FWD_K1536=1 (ops/hip/k1536_fp8_addmm.prebuild),
-    and the L11 fused out-proj dgrad + LN*U*dropout backward library with its
+    (ops/hip/k512_fp8_gemm.prebuild; with DLRM_HSTU_FP8_FWD_K512_TILED_A=1
+    also the startup self-check of its tiled-A entry, prebuild_tiled_a), the
+    K=1536 out-projection forward GEMM library when DLRM_HSTU_FP8_FWD_K1536=1
+    (ops/hip/k1536_fp8_addmm.prebuild), and the L11 fused out-proj dgrad +
+    LN*U*dropout backward library with its
     synthetic-data self-check when DLRM_HSTU_FP8_BWD_OUTPROJ_LNMD_FUSED=1
-    (triton_hstu_linear.prebuild_l11; a no-op otherwise).
+    (triton_hstu_linear.prebuild_l11; a no-op otherwise), then
+    L11's dO8/E8 emission variant (its own .so and self-check) when
+    DLRM_HSTU_FP8_L11_DO8=1 (triton_hstu_linear.prebuild_l11_do8; a no-op
+    otherwise).
     """
     built = False
     if _HSTU_FP8_FUSE_RESIDUAL:
@@ -1456,6 +1526,18 @@ def prebuild_extensions() -> bool:
         except k512_fp8_gemm.PrebuildError:
             if _HSTU_FP8_FAIL_CLOSED:
                 raise
+        if _HSTU_FP8_FWD_K512_TILED_A:
+            # DLRM_HSTU_FP8_FWD_K512_TILED_A: the startup self-check of the K512
+            # library's tiled-A entry (N=1024, the targets V/K) against its
+            # row-major entry on synthetic data (k512_fp8_gemm.prebuild_tiled_a;
+            # the library loaded above is reused). A failure is latched there:
+            # the targets layer then keeps the row-major y; fail-closed raises.
+            try:
+                if k512_fp8_gemm.prebuild_tiled_a((1024,)):
+                    built = True
+            except k512_fp8_gemm.PrebuildError:
+                if _HSTU_FP8_FAIL_CLOSED:
+                    raise
     if _HSTU_FP8_FWD_K1536 and _HSTU_FP8_FUSE_RESIDUAL:
         # DLRM_HSTU_FP8_FWD_K1536: hipcc build plus one launch on synthetic
         # zeros (k1536_fp8_addmm.prebuild); latched on failure, as for K512.
@@ -1467,13 +1549,19 @@ def prebuild_extensions() -> bool:
         except k1536_fp8_addmm.PrebuildError:
             if _HSTU_FP8_FAIL_CLOSED:
                 raise
-    # Fused out-proj dgrad + LN*U*dropout backward: hipcc
+    # L11 fused out-proj dgrad + LN*U*dropout backward: hipcc
     # build + load + synthetic self-check; a no-op unless
     # DLRM_HSTU_FP8_BWD_OUTPROJ_LNMD_FUSED=1. Last, after every other build:
     # its self-check launches the FP8 dgrad GEMM and the LN*U*dropout backward
     # kernels on private synthetic tensors (before run_blas_warmup and the
     # first training step; no model, data, RNG or FP8 scale state).
     if triton_hstu_linear.prebuild_l11():
+        built = True
+    # DO8: L11's dO8/E8 emission variant, built after L11 (it
+    # rides on a prebuilt L11); its own .so, flags, resource gate, self-check
+    # and latch: a failure latches DO8 off only. A no-op unless
+    # DLRM_HSTU_FP8_L11_DO8=1.
+    if triton_hstu_linear.prebuild_l11_do8():
         built = True
     return built
 
@@ -1905,6 +1993,407 @@ def _k512_fwd_or_none(
     )
 
 
+def _out_preq_operands(
+    device: torch.device,
+    scale_a: torch.Tensor,
+    weight: torch.Tensor,
+    normalized_layout: _WeightLayout,
+    bias: Optional[torch.Tensor],
+    output_scale: Optional[torch.Tensor],
+    scale_a_value: Optional[float],
+    output_scale_value: Optional[float],
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    str,
+]:
+    """The GEMM operands of scaled_mm_fp8_out_preq for an activation on `device`:
+    (weight_fp8, scale_b, effective_scale_a, effective_bias, scale_result,
+    output_scale_mode), i.e. the weight shadow, then the output-scale folding
+    of the backend mode. One reference for the row-major call and the
+    tiled-A call (scaled_mm_fp8_out_preq_tiled_a), so both hand K512 the same
+    operands."""
+
+    weight_fp8, scale_b = _get_weight_shadow(weight, normalized_layout)
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    output_scale_mode = _fp8_output_scale_mode(device)
+    effective_scale_a = scale_a
+    effective_bias = None if bias is None else bias.to(torch.bfloat16)
+    host_scale_values = (
+        None
+        if output_scale is None
+        else _trusted_host_scale_values(
+            scale_a,
+            output_scale,
+            scale_a_value,
+            output_scale_value,
+        )
+    )
+    if output_scale is None:
+        if output_scale_mode == "input_scale":
+            scale_result = None
+        else:
+            scale_result = _fp8_one_by_device.get(device_index)
+            if scale_result is None:
+                scale_result = torch.ones(
+                    (1, 1),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                _fp8_one_by_device[device_index] = scale_result
+    elif output_scale_mode == "input_scale":
+        effective_scale_a = _fold_output_scale_into_input(
+            scale_a,
+            output_scale,
+            scale_a_value=(
+                None if host_scale_values is None else host_scale_values[0]
+            ),
+            output_scale_value=(
+                None if host_scale_values is None else host_scale_values[1]
+            ),
+        )
+        effective_bias = (
+            None
+            if bias is None
+            else _scale_bias_for_fp8_output(
+                bias,
+                output_scale,
+                output_scale_value=(
+                    None if host_scale_values is None else host_scale_values[1]
+                ),
+            )
+        )
+        scale_result = None
+    else:
+        scale_result = inverse_scale_tensor(
+            output_scale,
+            value=(
+                None if host_scale_values is None else host_scale_values[1]
+            ),
+        )
+    return (
+        weight_fp8,
+        scale_b,
+        effective_scale_a,
+        effective_bias,
+        scale_result,
+        output_scale_mode,
+    )
+
+
+# -----------------------------------------------------------------------------
+# DLRM_HSTU_FP8_FWD_K512_TILED_A (the "b15t" path). Before
+# its LayerNorm the targets-only layer (triton_hstu_preprocess_and_attention)
+# asks the store_t (triton_layer_norm.store_t_skip_y_decline_reason) and
+# k512_tiled_a_vk_decline_reason; on None from both it runs the Triton v2
+# store_t with store_y=False (y's bytes still written, into a 1/32-size
+# discarded scratch; y = None) and the V/K projection runs as
+# scaled_mm_fp8_out_preq_tiled_a on the step-tiled yT. Every other outcome keeps
+# the row-major y for scaled_mm_fp8_out_preq (after the LayerNorm: y rebuilt
+# from yT bit for bit, b15t_row_major_y), with one "[b15t] declined" line per
+# reason (kind and detail). A decline AFTER the y skip (the projection could not
+# read yT: operands, launch error, ...) latches B15T off for the process
+# (latch_b15t_off): later calls write y again instead of rebuilding it every
+# step.
+
+_B15T_ARMED_LOGGED: bool = False
+_b15t_decline_logged: set = set()
+# Not None once a post-skip decline latched B15T off: "<kind>: <detail>".
+_B15T_LATCHED: Optional[str] = None
+
+
+def _b15t_print(message: str) -> None:
+    print(f"[b15t] {message}", flush=True)
+
+
+def k512_tiled_a_requested() -> bool:
+    """DLRM_HSTU_FP8_FWD_K512_TILED_A (read at import) is on."""
+    return _HSTU_FP8_FWD_K512_TILED_A
+
+
+def log_b15t_decline_once(kind: str, detail: str) -> None:
+    """One line per (reason kind, detail) per process: this call keeps the
+    row-major y and the V/K projection reads it (the knob-off path, bit for
+    bit)."""
+    key = (kind, detail)
+    if key in _b15t_decline_logged:
+        return
+    _b15t_decline_logged.add(key)
+    _b15t_print(f"declined -> row-major y + V/K projection ({kind}): {detail}")
+
+
+def latch_b15t_off(kind: str, detail: str) -> None:
+    """A decline after the y skip (y is rebuilt from yT for this call): logged
+    once (log_b15t_decline_once), then B15T stays off for the process, so later
+    targets-only calls write y in the LayerNorm instead of rebuilding it from yT
+    every step."""
+    global _B15T_LATCHED
+    log_b15t_decline_once(kind, detail)
+    if _B15T_LATCHED is None:
+        _B15T_LATCHED = f"{kind}: {detail}"
+        _b15t_print(
+            "LATCHED OFF for this process after a post-skip decline "
+            f"({kind}); the targets-only store_t writes y again"
+        )
+
+
+def b15t_latched() -> Optional[str]:
+    """The post-skip decline that latched B15T off ("<kind>: <detail>"), or None."""
+    return _B15T_LATCHED
+
+
+def _log_b15t_armed_once(n: int, rows: int, a_t: torch.Tensor) -> None:
+    global _B15T_ARMED_LOGGED
+    if _B15T_ARMED_LOGGED:
+        return
+    _B15T_ARMED_LOGGED = True
+    _b15t_print(
+        "ARMED targets VK reads tiled yT; store_t skips y: "
+        f"k512_2wg_kernel_tiled_a<{n}> on {a_t.device} reads the store_t yT "
+        f"{list(a_t.shape)} e4m3, first M={rows}; the Triton v2 store_t writes "
+        "y's bytes into a 1/32-size discarded scratch (store_y=False) "
+        "(DLRM_HSTU_FP8_FWD_K512_TILED_A=1; kill switch =0)"
+    )
+
+
+def reset_b15t_for_testing() -> None:
+    """Test-only: forget the B15T once-lines and the latch."""
+    global _B15T_ARMED_LOGGED, _B15T_LATCHED
+    _B15T_ARMED_LOGGED = False
+    _B15T_LATCHED = None
+    _b15t_decline_logged.clear()
+
+
+def b15t_row_major_y(activation_fp8_t: torch.Tensor, rows: int) -> torch.Tensor:
+    """The row-major e4m3 y [rows, D] whose bytes a store_t yT holds (step-tiled
+    [KT, 512, 128] or 2-D [D, Mp], zero tail): the fallback of a call whose y
+    write was skipped. A contiguous copy (the bytes the store_t writes as y)."""
+    if activation_fp8_t.dim() == 3:
+        from generative_recommenders.ops.hip import k512_fp8_gemm as k512
+
+        return k512.tiled_a_to_row_major(activation_fp8_t, rows)
+    return activation_fp8_t[:, :rows].t().contiguous()
+
+
+def k512_tiled_a_vk_decline_reason(
+    device: torch.device,
+    k_dim: int,
+    n_dim: int,
+    rows: int,
+) -> Optional[Tuple[str, str]]:
+    """Before the LayerNorm, on the host: why an e4m3-output projection
+    (scaled_mm_fp8_out_preq with an output scale) of a [rows, k_dim] e4m3 y into
+    n_dim columns would NOT run on the K512 tiled-A entry, or None when it would
+    (the LayerNorm may then write y's bytes into the discarded scratch instead
+    of an [M, 512] y). These are the checks of _k512_fwd_or_none
+    that need no operand (scaled_mm_fp8_out_preq_tiled_a makes them again with
+    the operand checks), the activation telemetry (it samples y's values) and
+    the tiled-A entry's startup self-check (k512_fp8_gemm.prebuild_tiled_a,
+    before RUN_START; without the prebuild it runs here once, with one device
+    sync). No tensor access and no device sync otherwise."""
+    from generative_recommenders.ops.hip import k512_fp8_gemm as k512
+
+    if _B15T_LATCHED is not None:
+        return ("latched", f"tiled-A V/K path latched off earlier: {_B15T_LATCHED}")
+    if not _HSTU_FP8_FWD_K512:
+        return (
+            "k512_off",
+            "DLRM_HSTU_FP8_FWD_K512 off (the tiled-A entry is bit-identical to "
+            "the K512 row-major entry, not to hipBLASLt)",
+        )
+    if k_dim != k512.K or n_dim not in k512.SUPPORTED_N:
+        return (
+            "shape",
+            f"K={k_dim} N={n_dim} (the kernel covers K={k512.K}, N in "
+            f"{k512.SUPPORTED_N})",
+        )
+    if rows < 1:
+        return ("rows", f"M={rows}")
+    if _HSTU_FP8_TELEMETRY_INTERVAL:
+        return (
+            "telemetry",
+            "DLRM_HSTU_FP8_TELEMETRY_INTERVAL > 0 samples the row-major y",
+        )
+    if _HSTU_FP8_FAST_ACCUM:
+        return ("fastacc", "DLRM_HSTU_FP8_GEMM_FASTACC=1 (K512 declines it)")
+    if torch.compiler.is_compiling():
+        return ("compile", "torch.compile tracing (ctypes launch)")
+    if device.type != "cuda" or (
+        device.index is not None and device.index != torch.cuda.current_device()
+    ):
+        return ("device", f"{device} is not the current CUDA device")
+    mode = _fp8_output_scale_mode(device)
+    if mode != "input_scale":
+        return ("mode", f"output_scale_mode={mode} (K512 needs input_scale)")
+    if not k512.tiled_a_ready(n_dim, build=False):
+        # Not checked yet on this device (no DLRM_HSTU_FP8_PREBUILD) or failed.
+        # The lazy self-check launches and syncs: never inside a CUDA graph
+        # capture, and any error it raises is a decline, not a crash.
+        if torch.cuda.is_current_stream_capturing():
+            return (
+                "not_ready",
+                f"N={n_dim} tiled-A self-check not run yet and the stream is "
+                "capturing (DLRM_HSTU_FP8_PREBUILD=1 runs it before RUN_START)",
+            )
+        try:
+            ready = k512.tiled_a_ready(n_dim, build=True)
+        except Exception as error:  # noqa: BLE001 - any error declines
+            return (
+                "not_ready",
+                f"N={n_dim} tiled-A self-check raised {type(error).__name__}: "
+                f"{error}",
+            )
+        if not ready:
+            why = (
+                k512.tiled_a_failure(n_dim)
+                or k512.failure(n_dim)
+                or "self-check did not pass"
+            )
+            return ("not_ready", f"N={n_dim} tiled-A entry unavailable: {why}")
+    return None
+
+
+def scaled_mm_fp8_out_preq_tiled_a(
+    activation_fp8_t: torch.Tensor,
+    rows: int,
+    scale_a: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    *,
+    weight_layout: Optional[_WeightLayout] = None,
+    output_scale: Optional[torch.Tensor] = None,
+    scale_a_value: Optional[float] = None,
+    output_scale_value: Optional[float] = None,
+) -> Optional[torch.Tensor]:
+    """scaled_mm_fp8_out_preq(y, scale_a, weight, bias, ...) for the
+    e4m3 y [rows, 512] whose bytes the step-tiled yT `activation_fp8_t` holds
+    (e4m3 [ceil(rows/128), 512, 128]; token t / feature c at
+    ((t // 128) * 512 + c) * 128 + t % 128: the store_t's yT), on the K512
+    library's tiled-A entry. The weight shadow, the scale and bias folding
+    (_out_preq_operands) and the K512 coverage are those of that call, and the
+    tiled-A entry is bit-identical to the row-major entry on y, so the output
+    bytes equal scaled_mm_fp8_out_preq(y, ...) whenever K512 takes that call.
+    Returns None, with the reason logged once and B15T latched off
+    (latch_b15t_off), when that call would not run on K512, the tiled-A entry
+    cannot take these operands or its launch fails: the caller then rebuilds y
+    (b15t_row_major_y) and calls scaled_mm_fp8_out_preq, which raises where that
+    call raises. Output-scaled projections only."""
+    from generative_recommenders.ops.hip import k512_fp8_gemm as k512
+
+    normalized_layout = _normalize_layout(weight, weight_layout)
+    output_columns = sum(end - start for start, end in normalized_layout)
+    reason: Optional[Tuple[str, str]] = None
+    if output_scale is None:
+        reason = ("output_scale", "no output scale (the tiled-A entry covers the e4m3 V/K call)")
+    elif (
+        not _HSTU_FP8_GEMM
+        or not activation_fp8_t.is_cuda
+        or not weight.is_cuda
+        or weight.dim() != 2
+        or weight.shape[0] % 16 != 0
+        or weight.shape[1] % 16 != 0
+        or output_columns % 16 != 0
+        or (
+            bias is not None
+            and (bias.dim() != 1 or bias.numel() != output_columns)
+        )
+    ):
+        # scaled_mm_fp8_out_preq raises on these: the caller's call does.
+        reason = (
+            "contract",
+            f"w={tuple(weight.shape)} layout={normalized_layout} bias="
+            f"{None if bias is None else tuple(bias.shape)}",
+        )
+    else:
+        reason = k512_tiled_a_vk_decline_reason(
+            activation_fp8_t.device, int(weight.shape[0]), output_columns, rows
+        )
+    if reason is not None:
+        latch_b15t_off(*reason)
+        return None
+    (
+        weight_fp8,
+        scale_b,
+        effective_scale_a,
+        effective_bias,
+        scale_result,
+        output_scale_mode,
+    ) = _out_preq_operands(
+        activation_fp8_t.device,
+        scale_a,
+        weight,
+        normalized_layout,
+        bias,
+        output_scale,
+        scale_a_value,
+        output_scale_value,
+    )
+    n_dim = weight_fp8.shape[-1]
+    # _k512_fwd_or_none's operand checks, with the tiled A.
+    if output_scale_mode != "input_scale" or scale_result is not None:
+        reason = (
+            "mode",
+            f"output_scale_mode={output_scale_mode} scale_result="
+            f"{'set' if scale_result is not None else 'None'}",
+        )
+    elif weight_fp8.dim() != 2 or weight_fp8.stride() != (1, k512.K):
+        reason = (
+            "weight",
+            f"weight_fp8 {tuple(weight_fp8.shape)} stride {weight_fp8.stride()}",
+        )
+    else:
+        reason = k512.ineligible_reason_tiled_a(
+            activation_fp8_t,
+            rows,
+            weight_fp8.t(),
+            effective_bias,
+            effective_scale_a,
+            scale_b,
+        )
+    if reason is not None:
+        latch_b15t_off(*reason)
+        return None
+    assert effective_bias is not None
+    try:
+        kernel = k512.kernel(n_dim)
+    except Exception as error:  # noqa: BLE001 - any error declines
+        latch_b15t_off("library", str(error))
+        return None
+    try:
+        output = k512.launch_tiled_a(
+            kernel,
+            activation_fp8_t,
+            rows,
+            weight_fp8.t(),
+            effective_bias,
+            effective_scale_a,
+            scale_b,
+        )
+    except RuntimeError as error:
+        # A launch error (hipError from the entry) is a decline, not a crash:
+        # the caller rebuilds y from yT and takes the row-major projection;
+        # B15T is latched off.
+        latch_b15t_off("launch", str(error))
+        return None
+    # K512's arming line for this N (its library takes the call), then the
+    # tiled-A entry's and this path's: printed after the first launch that
+    # succeeded.
+    k512.log_armed_once(kernel, rows)
+    k512.log_tiled_a_armed_once(kernel, rows)
+    _log_b15t_armed_once(kernel.n, rows, activation_fp8_t)
+    maybe_record_fp8_telemetry(
+        f"qkv_output:{id(weight)}:{tuple(weight.shape)}:{normalized_layout}",
+        output,
+        fp8_scale_tensor(output_scale),
+    )
+    return output
+
+
 def scaled_mm_fp8_out_preq(
     activation_fp8: torch.Tensor,
     scale_a: torch.Tensor,
@@ -1944,65 +2433,23 @@ def scaled_mm_fp8_out_preq(
         scale_a,
         cadence_divisor=64 if len(normalized_layout) > 1 else 1,
     )
-    weight_fp8, scale_b = _get_weight_shadow(weight, normalized_layout)
-    device_index = activation_fp8.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    output_scale_mode = _fp8_output_scale_mode(activation_fp8.device)
-    effective_scale_a = scale_a
-    effective_bias = None if bias is None else bias.to(torch.bfloat16)
-    host_scale_values = (
-        None
-        if output_scale is None
-        else _trusted_host_scale_values(
-            scale_a,
-            output_scale,
-            scale_a_value,
-            output_scale_value,
-        )
+    (
+        weight_fp8,
+        scale_b,
+        effective_scale_a,
+        effective_bias,
+        scale_result,
+        output_scale_mode,
+    ) = _out_preq_operands(
+        activation_fp8.device,
+        scale_a,
+        weight,
+        normalized_layout,
+        bias,
+        output_scale,
+        scale_a_value,
+        output_scale_value,
     )
-    if output_scale is None:
-        if output_scale_mode == "input_scale":
-            scale_result = None
-        else:
-            scale_result = _fp8_one_by_device.get(device_index)
-            if scale_result is None:
-                scale_result = torch.ones(
-                    (1, 1),
-                    dtype=torch.float32,
-                    device=activation_fp8.device,
-                )
-                _fp8_one_by_device[device_index] = scale_result
-    elif output_scale_mode == "input_scale":
-        effective_scale_a = _fold_output_scale_into_input(
-            scale_a,
-            output_scale,
-            scale_a_value=(
-                None if host_scale_values is None else host_scale_values[0]
-            ),
-            output_scale_value=(
-                None if host_scale_values is None else host_scale_values[1]
-            ),
-        )
-        effective_bias = (
-            None
-            if bias is None
-            else _scale_bias_for_fp8_output(
-                bias,
-                output_scale,
-                output_scale_value=(
-                    None if host_scale_values is None else host_scale_values[1]
-                ),
-            )
-        )
-        scale_result = None
-    else:
-        scale_result = inverse_scale_tensor(
-            output_scale,
-            value=(
-                None if host_scale_values is None else host_scale_values[1]
-            ),
-        )
     output = None
     if _HSTU_FP8_FWD_K512:
         output = _k512_fwd_or_none(

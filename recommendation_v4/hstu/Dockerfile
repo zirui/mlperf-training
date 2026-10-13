@@ -6,10 +6,8 @@ ARG BASE_IMAGE=rocm/primus:v26.3@sha256:1a02b74a94d82131f3f119a94ccbed45bb5b4cd7
 FROM ${BASE_IMAGE} AS stack
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# The base image ships an older primus-mllog. The compliance checker stays the
-# pinned mlcommons/logging from requirements.txt. End-of-run run_duration and
-# overall_throughput come from the same AMD-AGI/mlperf-common pin as Llama 3.1
-# 8B and GPT-OSS. --no-deps keeps that pin from replacing mlcommons/logging.
+# Replaces the base image's primus-mllog with the AMD-AGI/mlperf-common primus
+# mllog. --no-deps keeps mlcommons/logging from requirements.txt.
 ARG MLPERF_COMMON_REF=7771aeabc8b91402e95cb7a33f447d9d9941361f
 RUN python3 -m pip uninstall -y primus-mllog 2>/dev/null || true
 COPY requirements.txt /tmp/requirements.txt
@@ -38,8 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git build-essen
     rm -rf /var/lib/apt/lists/*
 RUN git clone "${FBGEMM_GIT}" /src/FBGEMM && cd /src/FBGEMM && \
     git checkout "${FBGEMM_COMMIT}" && git submodule update --init --recursive
-# Nightly builds name themselves after the build date; pin it so the version
-# matches the measured stack (2026.6.2).
+# Nightly builds name themselves after the build date; pin it to 2026.6.2.
 RUN cd /src/FBGEMM/fbgemm_gpu && \
     grep -q "today = date.today()" setup.py && \
     sed -i "s/today = date.today()/today = date(${FBGEMM_VERSION_DATE})/" setup.py && \

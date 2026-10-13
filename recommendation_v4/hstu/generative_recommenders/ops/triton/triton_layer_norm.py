@@ -301,7 +301,7 @@ def _weighted_layer_norm_fwd(
         # ROUND BEFORE ADDING. The unfused path stores the norm output at Y's
         # dtype and only then adds the residual to it, so rounding here
         # reproduces that arithmetic BIT FOR BIT. _weighted_layer_norm_bwd_dx
-        # handles its residual the same way.
+        # does the same.
         RESIDUAL_block_ptr = tl.make_block_ptr(
             base=RESIDUAL,
             shape=(N, D),
@@ -495,8 +495,8 @@ def _weighted_layer_norm_fwd_v2(
 
     The old kernel's bits depend on its autotune pick: the 16 configs fall
     into 8 classes with distinct y/mean/rstd bits, and at the preprocessor's
-    swish LinearNorm the pick can vary between cold starts (e.g. (1,1),
-    (8,4) or (2,1)). v2 reproduces the bits of one class, selected by EMU:
+    swish LinearNorm the pick varies between cold starts ((1,1), (8,4) and
+    (2,1) observed). v2 reproduces the bits of one class, selected by EMU:
       EMU=0: (BLOCK_N, num_warps) in {(1,1), (2,2), (4,4), (8,8)}: one row
              per wave, 4 elements per lane, 64-lane DPP tree;
       EMU=1: (2,1): two rows per wave, 8 elements per lane, 32-lane tree,
@@ -513,7 +513,7 @@ def _weighted_layer_norm_fwd_v2(
     it to. Only launched after the old autotuner's pick is known to be in
     the emulated class (maybe_weighted_layer_norm_swish_fwd_v2).
     Gate: DLRM_HSTU_FP8_WLN_FWD_V2 (gin default on in yambda_5b.gin;
-    absent or =0 = the old kernel)."""
+    absent or =0 = _weighted_layer_norm_fwd)."""
     pid = tl.program_id(0)
     nprog = tl.num_programs(0)
     num_blocks = tl.cdiv(N, BLOCK_N)
@@ -628,9 +628,10 @@ def _weighted_layer_norm_bwd_dx(
 ):
     # SUM_DX additionally emits sum(dx, axis=0) into DXSUM, using the same
     # [tile_num, D] partial-buffer scheme the kernel already runs for dw/db.
-    # It exists so the preceding nn.Linear's bias gradient -- otherwise a
-    # separate aten::sum over this dx -- can be read off here instead, while
-    # dx is still in registers. Zero extra global traffic on the dx side.
+    # It exists so the preceding nn.Linear's bias gradient -- which ATen
+    # otherwise computes as a separate aten::sum over this very dx -- can be
+    # read off here instead, while dx is still in registers. Zero extra global
+    # traffic on the dx side.
     #
     # It is a tl.constexpr, not a runtime flag, so with SUM_DX=False Triton
     # eliminates the accumulator entirely.
@@ -1180,7 +1181,7 @@ def _layer_norm_bwd_dwdbdx_p1(
     [NB, BLOCK_D] fp32 accumulator whose row j is the sequential chain
     ((0 + P[j]) + P[NB + j]) + P[2 NB + j] + ... over the [N, D] partials
     (masked rows add +0.0), then tl.sum's it over axis 0. At D=256 it gets
-    BLOCK_D=4: 64 programs, each walking all N=8192 partial rows 16 B at a
+    BLOCK_D=4: 64 programs, each walking all N partial rows 16 B at a
     time. Here each chain is one lane
     doing the same adds in the same order, over NB x cdiv(D, BLOCK_C)
     programs; ACC[a, j, :] is accumulator row j of array a."""
@@ -1450,11 +1451,11 @@ def _layer_norm_bwd_dwdbdx(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Finalize: _layer_norm_bwd_dwdb plus the dx column-sum.
+    """Bias-grad fold finalize: _layer_norm_bwd_dwdb plus the dx column-sum.
 
-    A SEPARATE kernel rather than a flag on _layer_norm_bwd_dwdb, so
-    _layer_norm_bwd_dwdb is not recompiled or re-autotuned, and the distinct
-    name shows in a trace whenever this path runs.
+    This is a SEPARATE kernel rather than a flag on _layer_norm_bwd_dwdb, so
+    _layer_norm_bwd_dwdb is not recompiled or re-autotuned, and seeing
+    _layer_norm_bwd_dwdbdx in a trace shows that the fold is active.
 
     The reduction is the same [tile_num, D] -> [D] shape the dw/db partials
     already use, so DXSUM costs one more strided read of an array the bwd_dx
@@ -1488,16 +1489,16 @@ def _layer_norm_bwd_dwdbdx(
 
 
 # DLRM_HSTU_FP8_WLN_FWD_V2 (gin default on in yambda_5b.gin; absent or
-# "0" = the old launch): the swish LinearNorm forward at
+# "0" = _weighted_layer_norm_fwd): the swish LinearNorm forward at
 # D == 256 (ops/fused_linear_norm._norm_fwd, the preprocessor MLPs) runs
 # _weighted_layer_norm_fwd_v2 instead of _weighted_layer_norm_fwd. "0"
-# restores the old launch, its grid and its autotune exactly. Read once.
+# restores the _weighted_layer_norm_fwd launch, its grid and its autotune exactly. Read once.
 _WLN_FWD_V2_ENABLED: Optional[bool] = None
 # (BLOCK_N, num_warps, grid multiplier of the CU count, NUM_STAGES).
 _WLN_FWD_V2_CFG: Tuple[int, int, int, int] = (16, 4, 64, 2)
-# Old autotune pick (BLOCK_N, num_warps) -> the v2 EMU mode reproducing its
-# bits (y, mean, rstd). Picks
-# not listed (e.g. (4,1), (8,1), (8,2), (1,2)) keep the old kernel.
+# _weighted_layer_norm_fwd autotune pick (BLOCK_N, num_warps) -> the v2 EMU
+# mode reproducing its bits (y, mean, rstd). Picks not listed (e.g. (4,1),
+# (8,1), (8,2), (1,2)) keep _weighted_layer_norm_fwd.
 _WLN_FWD_V2_EMU: Dict[Tuple[int, int], int] = {
     (1, 1): 0,
     (2, 2): 0,
@@ -1510,7 +1511,7 @@ _WLN_FWD_V2_EMU: Dict[Tuple[int, int], int] = {
 # Per (x, w, b dtype) key: the EMU mode for the old autotuner's pick, or -1
 # if v2 cannot reproduce it. v2 runs only once this is known, so it never
 # changes the bits relative to the old path in the same process. The first
-# call per key always takes the old path (and runs its autotune).
+# call per key always takes the old path (and runs its autotune as before).
 _WLN_FWD_V2_MODE: Dict[Tuple[torch.dtype, torch.dtype, torch.dtype], int] = {}
 
 
@@ -1768,9 +1769,9 @@ def triton_weighted_layer_norm_fp8_save_bf16_fwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Forward LayerNorm emitting scaled E4M3, BF16, mean and rstd in one pass.
 
-    Store-instead-of-recompute (DLRM_HSTU_FP8_SAVE_NORMED_X): the forward also
-    writes the BF16 copy the projection wgrad needs, so backward does not
-    re-run this kernel with the saved mean/rstd (COMPUTE_MEAN_AND_RSTD=False)
+    Store-instead-of-recompute (DLRM_HSTU_FP8_SAVE_NORMED_X): the FP8 forward
+    also writes the BF16 copy the projection wgrad needs, so the backward does
+    not re-run this kernel with the saved mean/rstd (COMPUTE_MEAN_AND_RSTD=False)
     to rebuild it. Both
     outputs derive from the same fp32 ``y = (x - mean) * rstd * w + b`` using
     the very fp32 mean/rstd that are stored and that the backward recompute
@@ -1961,8 +1962,7 @@ def _weighted_layer_norm_recompute_fp8t(
 
 
 # Fixed launch configs (no runtime autotune), (BLOCK_M, BLOCK_DC, num_warps)
-# keyed by also_bf16; tuned for the production token counts, D = 512 on
-# MI350X.
+# keyed by also_bf16, for the production token counts at D = 512 on MI350X.
 _LN_FP8T_CONFIG = {False: (256, 128, 4), True: (256, 64, 4)}
 
 
@@ -2093,7 +2093,7 @@ def _weighted_layer_norm_fwd_fp8_store_t(
     the token-major layout the FP8 projection wgrad consumes. Backward then
     skips _weighted_layer_norm_recompute_fp8t (a full re-read of x). Y and YT
     are byte-identical to the forward kernel's E4M3 output and to the
-    recompute kernel's output. Token columns [N, Mp) of YT are
+    recompute kernel's output (test-checked). Token columns [N, Mp) of YT are
     zero.
     """
     pid = tl.program_id(0)
@@ -2134,7 +2134,7 @@ def _weighted_layer_norm_fwd_fp8_store_t(
     )
 
 
-# (BLOCK_N, num_warps) for D = 512, tuned for the production token counts.
+# (BLOCK_N, num_warps) for D = 512 at the production token counts.
 _LN_FWD_STORE_T_CONFIG = (128, 16)
 
 
@@ -2211,8 +2211,8 @@ def _weighted_layer_norm_fwd_fp8_store_t_v2_tile(
 
 
 # N and n_blocks must not be specialized: with N % 16 == 0 specialization the
-# BLOCK_N=32 build contracts the variance arithmetic differently from the
-# v1 BLOCK_N=128 kernel (rstd differs); the unspecialized build is
+# BLOCK_N=32 build contracts the variance arithmetic differently (rstd is not
+# bitwise equal to the BLOCK_N=128 v1 kernel's); the unspecialized build is
 # bit-identical.
 @triton.jit(do_not_specialize=["N", "n_blocks"])
 def _weighted_layer_norm_fwd_fp8_store_t_v2(
@@ -2281,7 +2281,7 @@ def _weighted_layer_norm_fwd_fp8_store_t_v2(
 # validated geometry only (BLOCK_D = 512, no block_n/num_warps override);
 # anything else keeps the v1 kernel.
 _STORE_T_V2: bool = os.environ.get("DLRM_HSTU_FP8_BWD_STORE_T_V2", "0") == "1"
-# (BLOCK_N, num_warps) of the v2 kernel: bit-identical to the v1 (128, 16)
+# (BLOCK_N, num_warps) of the v2 kernel: bit-identical to the v1 kernel's (128, 16)
 # at D = 512; every BLOCK_N keeps the per-row reduction layout ([1, 8] x
 # [1, 64] lanes over the 512 features).
 _LN_FWD_STORE_T_V2_CONFIG = (32, 4)
@@ -2308,6 +2308,75 @@ def _log_store_t_v2_armed(device: torch.device, n: int, d: int, mp: int) -> None
     )
 
 
+# Largest storage (bytes) of the Triton AMD backend's "within 2 GiB" pointer
+# class (get_tensor_specialization: storage size <= 2**31 - 1).
+_TRITON_2GIB_CLASS_MAX = 2**31 - 1
+# store_y=False skipped-y scratch: row stride (bytes) of the discarded y rows. Any
+# multiple of 16 keeps stride_y's specialization ("divisible by 16", as the
+# production y's D = 512); 16 spreads the discarded rows over 16 * M + D bytes
+# (1/32 of y at D = 512) instead of M * D, and keeps
+# them off a single cache line (a stride of 0 would send every row to the same
+# D bytes). The kernel still issues every y store; they land in this scratch,
+# so the saving is fewer DRAM write-backs, not fewer store instructions.
+_SKIP_Y_ROW_STRIDE = 16
+
+
+def _store_t_v2_takes(
+    x: torch.Tensor, block_n: Optional[int], num_warps: Optional[int]
+) -> bool:
+    """Whether triton_weighted_layer_norm_fwd_fp8_store_t runs the v2 kernel."""
+    return (
+        _STORE_T_V2
+        and compute_BLOCK_D(x) == 512
+        and block_n is None
+        and num_warps is None
+    )
+
+
+def store_t_skip_y_decline_reason(
+    x: torch.Tensor, pad_to: int, tiled_xt: bool
+) -> Optional[Tuple[str, str]]:
+    """store_y=False check, on the host before the LayerNorm:
+    why triton_weighted_layer_norm_fwd_fp8_store_t(x, ..., pad_to=pad_to,
+    tiled_xt=tiled_xt, store_y=False) would NOT send y's bytes to the 1/32-size
+    discarded scratch with a step-tiled yT (the wrapper then writes and returns
+    the [M, D] y), or None when it will (the v2 kernel takes the call and yT is
+    [Mp / 128, 512, 128]). Mirrors the wrapper's own decisions; reads only
+    shapes and module flags (no tensor data, no sync). The details are constant
+    per condition (the decline line is printed once per kind and detail)."""
+    if x.dim() != 2:
+        return ("geometry", f"x is {x.dim()}-D (the store_t takes 2-D x)")
+    n, d = x.shape
+    if not _store_t_v2_takes(x, None, None):
+        return (
+            "store_t_v2_off",
+            "DLRM_HSTU_FP8_BWD_STORE_T_V2 off or D != 512 (only the v2 store_t "
+            "kernel call can write y into the discarded scratch)",
+        )
+    if n < 1:
+        return ("rows", "M=0")
+    if n * d > _TRITON_2GIB_CLASS_MAX:
+        # y [M, D] e4m3 would be a > 2 GiB storage: the skipped-y scratch (a
+        # smaller tensor) would then select another Triton binary.
+        return (
+            "y_class",
+            "M * D > 2**31 - 1 (y would be a > 2 GiB storage; the skipped-y "
+            "scratch must keep the production y's pointer class)",
+        )
+    if not tiled_xt:
+        return (
+            "layout",
+            "the store_t yT is not step-tiled (wgrad_ck.tiled_active is False)",
+        )
+    mp = (n + pad_to - 1) // pad_to * pad_to
+    if wgrad_ck.tiled_shape(d, mp) is None:
+        return (
+            "layout",
+            f"pad_to={pad_to} D={d}: no step-tiled yT for this geometry",
+        )
+    return None
+
+
 def triton_weighted_layer_norm_fwd_fp8_store_t(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -2318,7 +2387,8 @@ def triton_weighted_layer_norm_fwd_fp8_store_t(
     block_n: Optional[int] = None,
     num_warps: Optional[int] = None,
     tiled_xt: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    store_y: bool = True,
+) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     """Training forward LN -> (y_fp8 [N, D], mean, rstd, yT_fp8 [D, Mp]).
 
     y_fp8 / mean / rstd equal triton_weighted_layer_norm_fwd(x, weight, bias,
@@ -2330,6 +2400,20 @@ def triton_weighted_layer_norm_fwd_fp8_store_t(
     step-tiled, a 3-D [Mp / 128, D, 128] tensor (wgrad_ck "Step-tiled xT");
     y_fp8 / mean / rstd are unchanged. The v1 kernel, D != 512 or
     Mp % 128 != 0 decline it (row-major, logged once).
+    store_y=False (its one caller is the
+    targets-only forward after store_t_skip_y_decline_reason returned None):
+    on the v2 kernel with 1 <= M and M * D <= 2**31 - 1 no [M, D] y is
+    allocated and None is returned in its place. y's bytes are still WRITTEN:
+    the UNMODIFIED v2 kernel runs (the same compiled binary as a store_y=True
+    call: same pointer classes and stride specializations) with Y = a
+    dedicated 1/32-size scratch of 16 * M + D bytes and row stride
+    _SKIP_Y_ROW_STRIDE, so every y store lands in overlapping scratch rows
+    that nothing reads (fewer DRAM write-backs, not fewer stores). The scratch
+    is its own caching-allocator storage, never a view into yT, x or a pool
+    block. yT, mean and rstd are the same bytes (same binary, same inputs).
+    Elsewhere (v1 kernel, M = 0, or M * D > 2**31 - 1, where y's storage
+    would be in the other Triton pointer class) store_y is forced True: y is
+    written and returned.
     """
     assert x.dim() == 2
     x = switch_to_contiguous_if_needed(x)
@@ -2345,12 +2429,31 @@ def triton_weighted_layer_norm_fwd_fp8_store_t(
     # transpose): keep it at the D = 512 tuned size for wider features.
     BLOCK_N = max(16, min(block_n or cfg_n, 65536 // BLOCK_D))
     Mp = (N + pad_to - 1) // pad_to * pad_to
-    use_v2 = _STORE_T_V2 and BLOCK_D == 512 and block_n is None and num_warps is None
+    use_v2 = _store_t_v2_takes(x, block_n, num_warps)
     xt_shape = _xt_tiled_shape(
         tiled_xt, "store_t_v2" if use_v2 else "store_t", use_v2,
         "v1 kernel: STORE_T_V2 off or a non-v2 geometry", D, Mp, x.device,
     )
-    y = torch.empty((N, D), dtype=torch.float8_e4m3fn, device=x.device)
+    # store_y is forced True when y [N, D] would be a > 2 GiB
+    # storage (the scratch would select the other is_within_2gb binary).
+    skip_y = (
+        not store_y and use_v2 and Mp > 0 and N * D <= _TRITON_2GIB_CLASS_MAX
+    )
+    # skip_y: y's bytes are still written, into this dedicated 1/32-size
+    # scratch (16-byte aligned, <= 2 GiB: the production y's pointer class).
+    # A fresh torch.empty per call, never a view into yT, x or a
+    # pool block (overlapping row writes are harmless only where nothing reads).
+    y = torch.empty(
+        (_SKIP_Y_ROW_STRIDE * N + D,) if skip_y else (N, D),
+        dtype=torch.float8_e4m3fn,
+        device=x.device,
+    )
+    # The scratch is its own caching-allocator storage of exactly its size,
+    # not an fp8_tm_alloc pool view (those carry the 2**31-byte block storage).
+    assert not skip_y or (
+        y.storage_offset() == 0
+        and y.untyped_storage().nbytes() == y.numel() <= _TRITON_2GIB_CLASS_MAX
+    ), "skip_y scratch is not a dedicated <= 2 GiB storage"
     # DLRM_HSTU_FP8_TM_NONEXP: token-major wgrad operand from a non-expandable pool
     # (DLRM_HSTU_FP8_TM_NONEXP_XT=0: plain torch.empty; default 1 = the private pool).
     yT = fp8_tm_alloc.empty_xt(xt_shape or (D, Mp), torch.float8_e4m3fn, x.device)
@@ -2377,7 +2480,7 @@ def triton_weighted_layer_norm_fwd_fp8_store_t(
             D,
             eps,
             x.stride(0),
-            y.stride(0),
+            _SKIP_Y_ROW_STRIDE if skip_y else y.stride(0),
             yT.stride(0),
             float(inv_scale),
             n_blocks,
@@ -2392,7 +2495,7 @@ def triton_weighted_layer_norm_fwd_fp8_store_t(
             wgrad_ck.note_tiled_producer(
                 "store_t_v2", x.device, True, f"M={N} D={D} Mp={Mp}"
             )
-        return y, mean, rstd, yT
+        return (None if skip_y else y), mean, rstd, yT
     grid = (triton.cdiv(Mp, BLOCK_N),)
     _weighted_layer_norm_fwd_fp8_store_t[grid](
         x,
@@ -2449,10 +2552,12 @@ def _ln_bwd_tile_num(N: int, D: int, sms: int, is_swish: bool) -> int:
     The kernel runs num_warps=1 programs that each walk rows serially, so the
     number of in-flight programs per CU is what hides HBM latency. At
     BLOCK_D<=256 a row is only 512 B of bf16 per tensor, so sms*8 single-warp
-    programs leave the CU underused; the swish case there uses sms*32 (the
-    [tile_num, D] dw/db/dxsum partial buffers grow with the multiplier).
-    It is gated on IS_SWISH: the swish epilogue (sigmoid recompute) makes each
-    row latency-heavier. Plain LN, and D=512, keep sms*8.
+    programs leave the CU starved; the swish D<=256 case uses sms*32 (the
+    dw/db/dxsum finalize reads [tile_num, D] partials, so a larger multiplier
+    also needs larger partial buffers). It is gated on IS_SWISH: the swish
+    epilogue (sigmoid recompute) makes each row latency-heavier, whereas plain
+    LN at D=256 and both variants at D=512 stay at 8. Production
+    (hidden_dim=256, output_dim=512) only hits the swish/D=256 case.
 
     For a fixed BLOCK_N, dx does not depend on the grid (rows are independent)
     and is bit-identical. The autotuner (key BLOCK_D) may re-pick BLOCK_N on
@@ -2480,7 +2585,8 @@ def _wln_bwd_v2_enabled() -> bool:
 
 # Sub-gate (only consulted when v2 is on): DLRM_HSTU_FP8_WLN_BWD_V2_FAST_SIGMOID
 # (gin default on; absent = tl.sigmoid) computes the swish sigmoid as fast_dividef(1, 1 + exp(-z)).
-# dx can differ from tl.sigmoid by one bf16 ulp in rare elements.
+# dx can differ from the tl.sigmoid result by one bf16 ulp in a small fraction
+# of elements.
 _WLN_BWD_V2_FAST_SIGMOID: Optional[bool] = None
 
 
@@ -2495,23 +2601,23 @@ def _wln_bwd_v2_fast_sigmoid() -> bool:
 
 # DLRM_HSTU_FP8_WLN_BWD_POW2 (default OFF in code; the gin binding
 # apply_env_bootstrap.DLRM_HSTU_FP8_WLN_BWD_POW2 turns it on; "0" is the kill
-# switch and takes precedence over gin): when D ==
+# switch and wins over gin): when D ==
 # BLOCK_D (D a power of two: 256 and 512 at every production call), the v2
-# weighted-LN backward dx kernel (_weighted_layer_norm_bwd_dx_v2) forms c1/c2 as row_sum * (1.0 / BLOCK_D) instead of
+# weighted-LN backward dx kernel (_weighted_layer_norm_bwd_dx_v2,
+# every production launch) forms c1/c2 as row_sum * (1.0 / BLOCK_D) instead of
 # row_sum / D. 2^-k is exact in fp32, and x * 2^-k and x / 2^k are the same
 # real number, so the two correctly rounded results are equal bit for bit
 # (subnormal results included); the change only drops the two precise fp32
 # divides per row (D is a runtime int, so `/ D` compiles to the
 # v_div_scale/v_rcp/v_fma x5/v_div_fmas/v_div_fixup sequence). Same row sums,
 # same per-element formula, same config/grid: BITWISE (dx, dw, db, dxsum) on
-# gfx950 / Triton 3.6 at the production call sites; in the ISA the divide
-# sequences become plain v_mul/v_pk_mul by 2^-k and the per-element FMA count
-# is unchanged. Re-validate after a Triton/LLVM change: the multiply is
-# an FMA-contraction candidate where the divide was not. The v1 kernel
-# (DLRM_HSTU_FP8_WLN_BWD_V2=0 fallback) deliberately keeps `/ D`: the same
-# change there is not bitwise at its pinned D=512 SUM_DX config (BLOCK_N=1,
-# num_stages=3). Non-power-of-two D keeps
-# `/ D`. Read once, cached. Arming line (rank log): "armed OK:
+# gfx950 / Triton 3.6; in the ISA the divide sequences become plain
+# v_mul/v_pk_mul by 2^-k and the per-element FMA count is unchanged.
+# Re-validate after a Triton/LLVM change: the multiply is an
+# FMA-contraction candidate where the divide was not. The v1 kernel
+# (DLRM_HSTU_FP8_WLN_BWD_V2=0 fallback) keeps `/ D`: there the multiply is
+# not bitwise at its pinned D=512 SUM_DX config (BLOCK_N=1, num_stages=3).
+# Non-power-of-two D keeps `/ D`. Read once, cached. Arming line (rank log): "armed OK:
 # wln_bwd_pow2=1" (train_ranker.py).
 _WLN_BWD_POW2_ENABLED: Optional[bool] = None
 
@@ -2537,12 +2643,13 @@ def _wln_bwd_v2_config(
     """(tile multiplier, BLOCK_N, NUM_STAGES, CONTIG, num_warps, FAST_SIGMOID)
     for v2; the grid is min(sms * multiplier, cdiv(N, 4 * BLOCK_N)).
 
-    Configs for the three production shapes (N~2.36M, MI350X):
+    Configs for the three production shapes (MI350X):
       D=512 residual (no swish):  sms*8,  BLOCK_N=1, 2 stages
       D=512 SUM_DX (no swish):    sms*4,  BLOCK_N=4, 2 stages
       D=256 swish SUM_DX:         sms*32, BLOCK_N=1, 1 stage
     The non-swish non-SUM_DX config is shared by the residual and plain
-    calls so a fused residual never changes dw/db. Rows wider than 512 keep
+    calls so a fused residual never changes dw/db. CONTIG=False and
+    num_warps=1 at these shapes. Rows wider than 512 keep
     BLOCK_N=1 (register pressure) and add warps only past 2048 columns.
     """
     if BLOCK_D > 512:
@@ -2756,7 +2863,7 @@ def _wln_bwd_dx_partials(
 # (variant, weight dtype, path) logs once, so a run's log shows which path each
 # variant took. A FlyDSL import, compile or launch error latches the path off
 # for the process (_WLN_BWD_FLYDSL_BROKEN, one "[ln-bwd] flydsl DISABLED" line)
-# and every later call takes Triton.
+# and every later call takes Triton. Not an FP8 knob despite the prefix.
 _WLN_BWD_FLYDSL_ENABLED: Optional[bool] = None
 _WLN_BWD_FLYDSL_BROKEN: Optional[str] = None
 _WLN_BWD_FLYDSL_LOGGED: set = set()
@@ -2773,7 +2880,7 @@ def _wln_bwd_flydsl_enabled() -> bool:
 
 # DLRM_HSTU_FP8_WLN_BWD_FLYDSL_MSCALE (absent or "0" = off; needs
 # DLRM_HSTU_FP8_WLN_BWD_FLYDSL on as well): the layer-0 input-LayerNorm
-# backward that DLRM_HSTU_FP8_DROPOUT_MSCALE_FOLD folds the input dropout's
+# backward that DROPOUT_MSCALE_FOLD folds the input dropout's
 # backward into (_triton_weighted_layer_norm_bwd_mscale_impl: residual, bool
 # mask * scale epilogue) runs as the FlyDSL residual kernel with the same
 # epilogue (ops/flydsl/ln_bwd.py, mscale) instead of the Triton v2 mscale
@@ -2782,7 +2889,8 @@ def _wln_bwd_flydsl_enabled() -> bool:
 # posenc+dropout forward writes under DLRM_HSTU_FP8_DROPOUT_MASK_BITS
 # (FlyDSL kernel ..._mscaleb_..., bitwise the bool call). The packed mask is
 # only ever written where the Triton bits fold can take it
-# (wln_bwd_mscale_bits_ok), so every FlyDSL decline still has a fold.
+# (wln_bwd_mscale_bits_ok), so every FlyDSL decline still has a fold. Not an
+# FP8 knob despite the prefix.
 _WLN_BWD_FLYDSL_MSCALE_ENABLED: Optional[bool] = None
 
 
@@ -2907,9 +3015,9 @@ def flydsl_ln_bwd_would_take(
     is_swish: bool = False,
     sum_dx: bool = False,
 ) -> bool:
-    """True when the weighted-LayerNorm backward dispatch (switch
+    """True when the weighted-LayerNorm backward dispatch (FlyDSL path, switch
     DLRM_HSTU_FP8_WLN_BWD_FLYDSL) would run this call on FlyDSL. For callers that
-    batch several calls (e.g. a grouped preprocessor-tail backward) and
+    batch several calls (e.g. the grouped preprocessor-tail backward) and
     must defer to the FlyDSL path when it owns the call. Launches nothing, logs
     nothing and never latches; same checks as the dispatch."""
     return (
@@ -3050,8 +3158,7 @@ def _triton_weighted_layer_norm_bwd_impl(
                 (tile_num, D), dtype=torch.float32, device=x.device
             )
             _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
-        # The bias-grad fold (SUM_DX) is not plumbed through this entry point;
-        # the kernel gate stays off.
+        # The bias-grad fold (SUM_DX) is not used by this entry point.
         sum_dx = False
         dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
         dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
@@ -3405,10 +3512,9 @@ def _(
 # epilogue was validated bitwise against the bool one: BLOCK_D <= 512 with the
 # (BLOCK_N, NUM_STAGES, CONTIG, num_warps) the mscale launch uses there. In that
 # config the compiler keeps the row / column reduction layouts of the bool
-# kernel (TTGIR checked). Elsewhere it may not (e.g. BLOCK_D 1024,
-# 1 stage), so the producer keeps the bool
-# mask there (wln_bwd_mscale_bits_ok). Re-validate after a Triton or config
-# change.
+# kernel (checked in TTGIR). Elsewhere it may not (e.g. BLOCK_D 1024,
+# 1 stage), so the producer keeps the bool mask there
+# (wln_bwd_mscale_bits_ok). Re-validate after a Triton or config change.
 _MASK_BITS_FOLD_MAX_BLOCK_D = 512
 _MASK_BITS_FOLD_CFG = (1, 2, False, 1)
 
@@ -3563,12 +3669,12 @@ def wln_bwd_dxsum_path(
 ) -> str:
     """The path triton_weighted_layer_norm_bwd_dxsum(dy, x, weight, bias, mean,
     rstd, eps, BLOCK_D, is_swish) would take: "flydsl"
-    (DLRM_HSTU_FP8_WLN_BWD_FLYDSL),
-    "empty" (N == 0), else _wln_dxsum_triton_path's "v3" / "v2" / "v1".
+    (DLRM_HSTU_FP8_WLN_BWD_FLYDSL), "empty" (N == 0), else
+    _wln_dxsum_triton_path's "v3" / "v2" / "v1".
     Launches nothing, logs nothing and never latches (flydsl_ln_bwd_decline_
     reason). For callers that batch several calls into one kernel that is
-    bit-identical to one of these paths only (e.g. a Triton grouped kernel
-    matching v2). A host-side FlyDSL error inside the real call would still
+    bit-identical to one of these paths only (the preprocessor-tail Triton grouped
+    kernel: v2). A host-side FlyDSL error inside the real call would still
     move that call to Triton; a batching caller must handle that itself."""
     if (
         flydsl_ln_bwd_decline_reason(
@@ -3597,12 +3703,11 @@ def triton_weighted_layer_norm_bwd_dxsum(
     """The norm backward, additionally returning sum(dx, axis=0).
 
     A SEPARATE entry point from triton_weighted_layer_norm_bwd, which returns
-    a 3-tuple used at several call sites; this one returns a 4-tuple.
+    a 3-tuple; this one returns a 4-tuple.
 
-    The Linear feeding this norm needs the column sum of dx as its bias
-    gradient. It is available while dx is still in registers, so computing it
-    here avoids a standalone aten::sum that re-reads the whole [N, D] dx from
-    HBM.
+    The Linear feeding this norm needs sum(dx, axis=0) as its bias gradient.
+    Computing it here while dx is still in registers avoids a standalone
+    aten::sum that re-reads the whole [N, D] dx from HBM.
 
     NUMERICS: dxsum reduces the fp32 dx still in registers, whereas aten::sum
     reduces the bf16 dx after it was stored. This is the more accurate of the
@@ -3694,7 +3799,8 @@ def triton_weighted_layer_norm_bwd_dxsum(
         and _dwdbdx_pinned_128x8()
     ):
         # DLRM_HSTU_FP8_D256_V3: bit-exact two-phase finalize. Only with the
-        # v2 partials (DLRM_HSTU_FP8_WLN_BWD_V2).
+        # v2 partials, so DLRM_HSTU_FP8_WLN_BWD_V2=0 restores the
+        # v1 kernel list.
         nb = 128
         acc = torch.empty((3, nb, D), dtype=torch.float32, device=x.device)
         _layer_norm_bwd_dwdbdx_p1[(nb, triton.cdiv(D, 64))](
@@ -4233,8 +4339,7 @@ class SwishLayerNormFunction(torch.autograd.Function):
                 (tile_num, D), dtype=torch.float32, device=x.device
             )
             _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
-        # The bias-grad fold (SUM_DX) is not plumbed through this entry point;
-        # the kernel gate stays off.
+        # The bias-grad fold (SUM_DX) is not used by this entry point.
         sum_dx = False
         dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
         dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)

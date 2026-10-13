@@ -18,9 +18,10 @@ calls without changing any computed value.
 When: ``pregrow_before_run_start()`` runs in train_ranker.py during
 initialization, before INIT_STOP/RUN_START (like the C++ prebuild), so the
 mapping cost is outside the timed region. The pipeline's memcpy / data_dist
-streams do not exist yet at that point, so this module creates them (same
-priority torchrec uses), grows their pools, and the train pipeline adopts them
-in its constructor (``adopt_streams``). The eval pipeline keeps its own streams.
+streams do not exist yet at that point, so this module creates them (at the
+priority each pipeline will use: torchrec's -1, or the multi-node train
+priority for the train pair at 2+ nodes), grows their pools, and each pipeline
+adopts its pair by role in its constructor (``adopt_streams``).
 
 Env (forwarded by the launcher through the DLRM_HSTU_FP8_ prefix; the gin
 default is bound by apply_env_bootstrap.DLRM_HSTU_FP8_ALLOC_PREGROW):
@@ -38,7 +39,7 @@ import logging
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -59,9 +60,12 @@ _CONVERGE_SLACK = 1 << 30
 _CONVERGE_PASSES = 2
 
 _pregrown = False
-# Pre-grown (memcpy, data_dist) stream pairs, handed out in pipeline build
-# order: the train pipeline first, then the eval pipeline when eval_* keys are set.
+# Pre-grown (memcpy, data_dist) stream pairs: the train pair, then the eval
+# pair when eval_* keys are set. _pair_roles[i] names _side_streams[i];
+# adopt_streams() hands a pair to the pipeline of that role (the pairs can
+# differ in priority, so they are not interchangeable).
 _side_streams: List[Dict[str, Any]] = []
+_pair_roles: List[str] = []
 _n_pairs = 0
 _reporter_made = False
 
@@ -164,31 +168,99 @@ def _pool_stream(key: str) -> str:
     return key[: -len("_small")] if key.endswith("_small") else key
 
 
+def _pair_priorities() -> Tuple[int, int]:
+    """(train, eval) priorities for the pre-grown stream pairs.
+
+    Each pair is created at the priority its pipeline will ask for
+    (host_sync_free.train_pipe_stream_priority for the train pipeline, the
+    explicit override pipe_stream_priority for both), so the pipeline keeps the
+    adopted pair -- and its pre-grown pools -- instead of replacing it with
+    fresh, empty streams. Unset everywhere = torchrec's -1.
+    """
+    from generative_recommenders.dlrm_v4 import host_sync_free as _hsf
+
+    t = _hsf.train_pipe_stream_priority()
+    e = _hsf.pipe_stream_priority()
+    return (
+        _PIPE_STREAM_PRIORITY if t is None else t,
+        _PIPE_STREAM_PRIORITY if e is None else e,
+    )
+
+
+def guard_train_pair(main: Any, memcpy: Any, data_dist: Any) -> bool:
+    """Placement guard for a train pair created at the multi-node priority.
+
+    Returns True (and turns the multi-node train priority off for this
+    process) when either side stream shares the main stream's hardware queue:
+    in-order with the forward, the deferred input dist's host syncs would wait
+    behind it every step. Only the gin default is guarded; an explicit
+    DLRM_HSTU_FP8_PIPE_STREAM_PRIO override is left as asked.
+    """
+    from generative_recommenders.dlrm_v4 import host_sync_free as _hsf
+
+    if _hsf.pipe_stream_priority() is not None:
+        return False
+    res = {
+        name: _hsf.shares_hw_queue(main, st)
+        for name, st in (("memcpy", memcpy), ("data_dist", data_dist))
+    }
+    hits = [name for name, shared in res.items() if shared]
+    if hits:
+        _hsf.disable_train_pipe_priority(
+            "%s shares the main stream's hardware queue" % "+".join(hits)
+        )
+        return True
+    unknown = [name for name, shared in res.items() if shared is None]
+    if unknown:
+        # The probe could not run: fail closed rather than claim a placement
+        # that was never checked.
+        _hsf.disable_train_pipe_priority(
+            "placement unverified: the hw-queue probe could not run for %s"
+            % "+".join(unknown)
+        )
+        return True
+    logger.info(
+        "DLRMV4 multi-node side-stream priority placement check: train "
+        "memcpy/data_dist run beside main"
+    )
+    return False
+
+
 def pregrow_before_run_start() -> None:
     """Create the pipeline side streams and grow the named pools (once).
 
     Called during initialization, before INIT_STOP/RUN_START. Allocates and
     frees device memory only; touches no data.
     """
-    global _pregrown, _side_streams, _n_pairs
+    global _pregrown, _side_streams, _pair_roles, _n_pairs
     spec = _spec()
     if _pregrown or not spec or not torch.cuda.is_available():
         return
     _pregrown = True
     t0 = time.perf_counter()
     want = _parse_spec(spec)
+    train_prio, eval_prio = _pair_priorities()
     streams: Dict[str, Any] = {
         "main": torch.cuda.current_stream(),
-        "memcpy": torch.cuda.Stream(priority=_PIPE_STREAM_PRIORITY),
-        "data_dist": torch.cuda.Stream(priority=_PIPE_STREAM_PRIORITY),
+        "memcpy": torch.cuda.Stream(priority=train_prio),
+        "data_dist": torch.cuda.Stream(priority=train_prio),
     }
+    if train_prio != _PIPE_STREAM_PRIORITY and guard_train_pair(
+        streams["main"], streams["memcpy"], streams["data_dist"]
+    ):
+        # Fell back to -1 (a side stream shares main's hardware queue).
+        train_prio = _PIPE_STREAM_PRIORITY
+        streams["memcpy"] = torch.cuda.Stream(priority=train_prio)
+        streams["data_dist"] = torch.cuda.Stream(priority=train_prio)
     _side_streams = [{k: streams[k] for k in ("memcpy", "data_dist")}]
+    _pair_roles = ["train"]
     if any(k.startswith("eval_") for k in want):
         for k in ("eval_memcpy", "eval_data_dist"):
-            streams[k] = torch.cuda.Stream(priority=_PIPE_STREAM_PRIORITY)
+            streams[k] = torch.cuda.Stream(priority=eval_prio)
         _side_streams.append(
             {"memcpy": streams["eval_memcpy"], "data_dist": streams["eval_data_dist"]}
         )
+        _pair_roles.append("eval")
     _n_pairs = len(_side_streams)
     names = {int(st.cuda_stream): n for n, st in streams.items()}
     before = _per_stream_reserved(names)
@@ -346,12 +418,22 @@ def pregrow_before_run_start() -> None:
     )
 
 
-def adopt_streams(pipeline: Any) -> None:
-    """Hand the next pre-grown stream pair to a pipeline (train, then eval)."""
+def adopt_streams(pipeline: Any, role: Optional[str] = None) -> bool:
+    """Hand a pipeline its pre-grown stream pair; True if it was adopted.
+
+    ``role`` ("train" / "eval") picks the pair made for that pipeline; None
+    takes the next pair in build order (train first, then eval).
+    """
     if not _side_streams:
-        return
-    which = "train" if len(_side_streams) == _n_pairs else "eval"
-    s = _side_streams.pop(0)
+        return False
+    if role is None:
+        i = 0
+    elif role in _pair_roles:
+        i = _pair_roles.index(role)
+    else:
+        return False
+    which = _pair_roles.pop(i) if i < len(_pair_roles) else "train"
+    s = _side_streams.pop(i)
     mine = getattr(pipeline, "_memcpy_stream", None)
     dd = getattr(pipeline, "_data_dist_stream", None)
     if mine is None or dd is None or {mine.priority, dd.priority} != {_PIPE_STREAM_PRIORITY}:
@@ -364,10 +446,11 @@ def adopt_streams(pipeline: Any) -> None:
             getattr(dd, "priority", None),
             _PIPE_STREAM_PRIORITY,
         )
-        return
+        return False
     pipeline._memcpy_stream = s["memcpy"]
     pipeline._data_dist_stream = s["data_dist"]
     logger.info("armed OK: alloc pregrow streams adopted by the %s pipeline", which)
+    return True
 
 
 class GrowthReporter:

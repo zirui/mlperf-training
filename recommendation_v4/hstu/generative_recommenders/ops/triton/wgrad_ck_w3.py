@@ -16,7 +16,8 @@
 
 """Custom FP8 K=tokens out-projection weight gradient ("wgrad_ck" W3).
 
-DLRM_HSTU_FP8_BWD_WGRAD_CK_W3=1 (default off; read once at import). Independent of DLRM_HSTU_FP8_BWD_WGRAD_CK (W1 / W2, wgrad_ck.py): either
+DLRM_HSTU_FP8_BWD_WGRAD_CK_W3=1 (default off; read once at
+import). Independent of DLRM_HSTU_FP8_BWD_WGRAD_CK (W1 / W2, wgrad_ck.py): either
 can be on without the other.
 
 What: with the FP8 out-proj wgrad in NN mode (DLRM_HSTU_FP8_BWD_OUT_WGRAD=1,
@@ -92,6 +93,25 @@ first-call guard, `reference()` raises wgrad_ck.GuardDeferred: `run_w3` neither 
 this call if it is all-finite (no allocation-free fallback exists at the out-proj site: the bf16
 y is not recomputed in FP8 mode and the TN fallback needs the copy too), else latches as a
 rejected guard.
+
+21-split retile of the step-tiled entry:
+DLRM_HSTU_FP8_BWD_WGRAD_CK_W3_T256S=1 (default off; read once at import; effective only with
+DLRM_HSTU_FP8_BWD_WGRAD_CK_W3=1 AND DLRM_HSTU_FP8_BWD_WGRAD_CK_W3_TILED=1, else it prints
+"requested: wgrad_ck_w3_t256s=1 (INERT ...)" and changes nothing). A step-tiled dout_t is then read
+by the entry wgrad_ck_w3_t256s instead of wgrad_ck_w3_t: kernel wgrad_ck_w3_t256s_kernel<1536, 21, 2>
+(W1's 256 x 256 output tile, NSPLIT=21 token splits x 12 tiles = 252 WGs on 252 of the 256 CUs: 16
+XCD-local cohorts + 5 cohorts spilled over the leftover CUs, column-major tile order inside a spilled
+cohort) + wgrad_ck_w3_reduce<1536, 21>. Its fp32 partials [21, 512, 1536] (63 MiB) live in the same
+persistent per-(device, stream) workspace, which is allocated with the split count of the first entry
+that runs on that stream and grows to 21 splits on the first t256s call (a 16-split entry uses the
+first 16 splits of a larger workspace). Numerics: fp32-order, deterministic (bitwise run to run); NOT
+bitwise to wgrad_ck_w3_t: the same 128-token MFMA chunks, summed sequentially within a split, then a
+different fixed-order 21-way split sum. Own first-call guard per device (same hipBLASLt reference and
+tolerance; lines "... dout_t=step-tiled entry=wgrad_ck_w3_t256s rel=... -> armed" and "ARMED wgrad_ck
+w3 on cuda:<i> (dout_t step-tiled) entry=wgrad_ck_w3_t256s"); declines (which turn tiling off), the
+latch (which turns the whole W3 kernel off) and GuardDeferred behave exactly as for wgrad_ck_w3_t. A 2-D dout_t
+still runs the row-major entry wgrad_ck_w3. With the knob off nothing changes: the entry is bound at
+load but never launched.
 """
 
 import ctypes
@@ -108,12 +128,18 @@ _REQUESTED: bool = os.environ.get("DLRM_HSTU_FP8_BWD_WGRAD_CK_W3", "0") == "1"
 _TILED_REQUESTED: bool = (
     os.environ.get("DLRM_HSTU_FP8_BWD_WGRAD_CK_W3_TILED", "0") == "1"
 )
+# A step-tiled dout_t runs wgrad_ck_w3_t256s (inert without _CK_W3 + _TILED).
+_T256S_REQUESTED: bool = (
+    os.environ.get("DLRM_HSTU_FP8_BWD_WGRAD_CK_W3_T256S", "0") == "1"
+)
 
 _SOURCE: Path = Path(__file__).with_name("wgrad_tm_ck_w3.cu")
 _LIB_NAME: str = "libwgrad_ck_w3.so"
 _ENTRY: str = "wgrad_ck_w3"
 _ENTRY_T: str = "wgrad_ck_w3_t"  # step-tiled dout_t [ceil(M/128), 512, 128]
+_ENTRY_S: str = "wgrad_ck_w3_t256s"  # step-tiled dout_t, 256 x 256 tiles, 21 splits
 _NSPLIT: int = 16
+_NSPLIT_S: int = 21  # wgrad_ck_w3_t256s_nsplit()
 _KX: int = 512  # output rows (dout features)
 _N: int = 1536  # output columns (y8 features)
 _TOKEN_ALIGN: int = 16  # dout_t ldm granularity (16-token DMA chunks)
@@ -124,18 +150,23 @@ _SITE: str = "out_projection"
 _lock = threading.Lock()
 _fn: Optional[Callable[..., int]] = None
 _fn_t: Optional[Callable[..., int]] = None  # wgrad_ck_w3_t (step-tiled dout_t)
+_fn_s: Optional[Callable[..., int]] = None  # wgrad_ck_w3_t256s (step-tiled dout_t)
 _drain: Optional[Callable[[], int]] = None  # wgrad_ck_w3_drain_last_error
 _lib: Optional[ctypes.CDLL] = None
 _lib_path: Optional[Path] = None
 _broken: Optional[str] = None
 _override: Optional[bool] = None
 _tiled_override: Optional[bool] = None
+_t256s_override: Optional[bool] = None
 _armed: set = set()  # device indices that passed the guard
 _armed_t: set = set()  # device indices whose step-tiled entry passed its guard
+_armed_s: set = set()  # device indices whose wgrad_ck_w3_t256s entry passed its guard
 _tiled_ok: set = set()  # device indices tiled_active() checked (gfx950, library loaded)
-_workspaces: Dict[Tuple[int, int], torch.Tensor] = {}  # (device index, stream) -> [16, 512, 1536] fp32
+# (device index, stream) -> [nsplit, 512, 1536] fp32; nsplit = 16, or the largest split count of the
+# entries that ran there (21: wgrad_ck_w3_t256s); never shrinks
+_workspaces: Dict[Tuple[int, int], torch.Tensor] = {}
 _once: set = set()
-# Set by `run_w3` on the first decline of a step-tiled dout_t: the cast stops tiling (S3).
+# Set by `run_w3` on the first decline of a step-tiled dout_t: the cast stops tiling.
 _tiled_declined: Optional[str] = None
 
 
@@ -163,6 +194,16 @@ if _TILED_REQUESTED:
         "requested: wgrad_ck_w3_tiled=1"
         + ("" if _REQUESTED else " (INERT without DLRM_HSTU_FP8_BWD_WGRAD_CK_W3=1)")
     )
+if _T256S_REQUESTED:
+    log(
+        "requested: wgrad_ck_w3_t256s=1"
+        + (
+            ""
+            if (_REQUESTED and _TILED_REQUESTED)
+            else " (INERT without DLRM_HSTU_FP8_BWD_WGRAD_CK_W3=1 and "
+            "DLRM_HSTU_FP8_BWD_WGRAD_CK_W3_TILED=1)"
+        )
+    )
 
 
 def requested() -> bool:
@@ -181,6 +222,19 @@ def set_tiled_requested_for_testing(value: Optional[bool]) -> None:
     """Test-only: override the import-time tiled knob (None restores it)."""
     global _tiled_override
     _tiled_override = value
+
+
+def t256s_requested() -> bool:
+    """DLRM_HSTU_FP8_BWD_WGRAD_CK_W3_T256S (or its test-only override) AND
+    tiled_requested(): a step-tiled dout_t runs the entry wgrad_ck_w3_t256s."""
+    t256s = _T256S_REQUESTED if _t256s_override is None else _t256s_override
+    return t256s and tiled_requested()
+
+
+def set_t256s_requested_for_testing(value: Optional[bool]) -> None:
+    """Test-only: override the import-time t256s knob (None restores it)."""
+    global _t256s_override
+    _t256s_override = value
 
 
 def enabled() -> bool:
@@ -204,17 +258,19 @@ def reset_for_testing(unload: bool = False) -> None:
     unload=True also forgets the loaded library (the next call builds/loads again,
     e.g. after changing DLRM_HSTU_FP8_BWD_WGRAD_CK_HIPCC / _CACHE).
     """
-    global _broken, _fn, _fn_t, _drain, _lib, _lib_path, _tiled_declined
+    global _broken, _fn, _fn_t, _fn_s, _drain, _lib, _lib_path, _tiled_declined
     _broken = None
     _tiled_declined = None
     _armed.clear()
     _armed_t.clear()
+    _armed_s.clear()
     _tiled_ok.clear()
     _once.clear()
     if unload:
         with _lock:
             _fn = None
             _fn_t = None
+            _fn_s = None
             _drain = None
             _lib = None
             _lib_path = None
@@ -229,7 +285,7 @@ def _disable(reason: str) -> None:
 
 
 def _load() -> None:
-    global _fn, _fn_t, _drain, _lib, _lib_path
+    global _fn, _fn_t, _fn_s, _drain, _lib, _lib_path
     if _fn is not None:
         return
     with _lock:
@@ -239,12 +295,16 @@ def _load() -> None:
         lib = ctypes.CDLL(str(so))
         fn = wgrad_ck.bind_entry(lib, so, _ENTRY, _NSPLIT)
         fn_t = wgrad_ck.bind_entry(lib, so, _ENTRY_T, _NSPLIT)
+        # wgrad_ck_w3_t256s: bound (and its nsplit checked) at load, also before RUN_START by
+        # prebuild(); launched only when t256s_requested().
+        fn_s = wgrad_ck.bind_entry(lib, so, _ENTRY_S, _NSPLIT_S)
         drain = getattr(lib, f"{_ENTRY}_drain_last_error")
         drain.restype = ctypes.c_int
         drain.argtypes = []
         _lib_path = so
         _lib = lib
         _drain = drain
+        _fn_s = fn_s
         _fn_t = fn_t
         _fn = fn
 
@@ -274,6 +334,11 @@ def prebuild() -> bool:
     except Exception as error:
         _disable(f"{type(error).__name__}: {error}")
         return False
+    if t256s_requested():
+        _log_once(
+            "prebuild_t256s",
+            f"prebuild: {_ENTRY_S} bound (step-tiled dout_t, nsplit={_NSPLIT_S})",
+        )
     return True
 
 
@@ -339,19 +404,25 @@ def _launch(
     scale_d: torch.Tensor,
     m: int,
     index: int,
+    t256s: bool = False,
 ) -> torch.Tensor:
     tiled = dout_t.dim() == 3
-    fn, drain = (_fn_t if tiled else _fn), _drain
+    assert tiled or not t256s
+    fn = _fn_s if t256s else _fn_t if tiled else _fn
+    drain = _drain
     assert fn is not None and drain is not None
+    nsplit = _NSPLIT_S if t256s else _NSPLIT
     # step-tiled: the entry's `ldm` argument is the step stride 512*128 (checked by it)
     ldm = _KX * _KSTEP if tiled else int(dout_t.stride(0))
     with torch.cuda.device(index):
         stream = torch.cuda.current_stream(y8.device).cuda_stream
         key = (index, int(stream))
         workspace = _workspaces.get(key)
-        if workspace is None:
+        # sized by the entry's split count (16; 21 for t256s); a larger one
+        # is reused (each entry writes, then reduces, only its own first `nsplit` splits)
+        if workspace is None or int(workspace.shape[0]) < nsplit:
             workspace = torch.empty(
-                (_NSPLIT, _KX, _N), dtype=torch.float32, device=y8.device
+                (nsplit, _KX, _N), dtype=torch.float32, device=y8.device
             )
             _workspaces[key] = workspace
         # A stale HIP error an earlier call left on this thread (sticky last error)
@@ -387,7 +458,8 @@ def _launch(
         # call had left on this thread: not a launch failure.
         _log_stale(-rc)
     elif rc != 0:
-        raise RuntimeError(f"{_ENTRY} launch returned hip error {rc}")
+        entry = _ENTRY_S if t256s else _ENTRY
+        raise RuntimeError(f"{entry} launch returned hip error {rc}")
     return out
 
 
@@ -436,15 +508,23 @@ def run_w3(
     device = y8.device
     index = device.index if device.index is not None else torch.cuda.current_device()
     tiled = dout_t.dim() == 3
-    armed = _armed_t if tiled else _armed
+    # a step-tiled dout_t runs wgrad_ck_w3_t256s when its knob is on (with its own
+    # guard), else wgrad_ck_w3_t
+    t256s = tiled and t256s_requested()
+    armed = _armed_s if t256s else (_armed_t if tiled else _armed)
     layout = " dout_t=step-tiled" if tiled else ""
+    if t256s:
+        layout += f" entry={_ENTRY_S}"
     out: Optional[torch.Tensor] = None
     try:
         first = index not in armed
         if first:
             wgrad_ck._check_arch(device)
         _load()
-        out = _launch(y8, dout_t, scale_y, scale_d, m, index)
+        if t256s:
+            out = _launch(y8, dout_t, scale_y, scale_d, m, index, t256s=True)
+        else:
+            out = _launch(y8, dout_t, scale_y, scale_d, m, index)
         if first:
             rel, finite = wgrad_ck.guard_metrics(out, reference())
             line = (
@@ -463,6 +543,7 @@ def run_w3(
             log(
                 f"ARMED wgrad_ck w3 on cuda:{index}"
                 + (" (dout_t step-tiled)" if tiled else "")
+                + (f" entry={_ENTRY_S}" if t256s else "")
             )
         return out
     except wgrad_ck.GuardDeferred as error:

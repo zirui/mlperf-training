@@ -24,6 +24,7 @@ the full tensors are multi-GB.
 
 import functools
 import math
+import struct
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -515,7 +516,8 @@ def compile_hstu_bwd_dkdv(
     # so store 0 covers rows 0..7 and store 1 rows 8..15 of the wave.  Same
     # bytes at the same addresses: bitwise, dq kernel unchanged.
     ws_l128: bool = False,
-    # ws_l128t ($DLRM_HSTU_FP8_BWD_WS_LAYOUT=l128t, default off): the same full-128 B-row stores as ws_l128, but with NO lane
+    # ws_l128t ($DLRM_HSTU_FP8_BWD_WS_LAYOUT=l128t, default off): the same
+    # full-128 B-row stores as ws_l128, but with NO lane
     # exchange.  The four tr8 reads of the ws tile get per-lane addresses such
     # that receiver half h=1 (lanes l16 >= 8) is served the rows n + 16 that
     # ws_l128 moves over with DPP: read (q, p) uses row t8_n + 16*(l16 % 2)
@@ -688,7 +690,7 @@ def compile_hstu_bwd_dkdv(
     EPI_PK = epilogue == "reuse_pk"
     valu_set = {v for v in valu.split(",") if v}
     assert not (valu_set - {"undef", "rfl", "ilp", "nobr", "h16", "vf", "vf2",
-                         "msat", "vf3", "vf3s", "vf3p"}), (
+                         "msat", "vf3", "vf3s", "vf3p", "vf4"}), (
         f"unknown valu {valu!r}")
     VALU_UNDEF = "undef" in valu_set
     VALU_RFL = "rfl" in valu_set
@@ -731,6 +733,45 @@ def compile_hstu_bwd_dkdv(
     VALU_VF3 = ("vf3" in valu_set) or VALU_VF3S or VALU_VF3P
     assert not VALU_VF3 or (VALU_ILP and not (VALU_VF or VALU_H16)), (
         "vf3 needs valu ilp and excludes vf/vf2/h16")
+    # "vf4" (default OFF, DECLARED PRECISION CHANGE: the silu e4m3
+    #   cast is re-rounded on a shifted grid, dS stays ulp-level vs vf3p).
+    #   vf3p minus its x' multiply, 6 pk ops per element pair:
+    #   t = qk*c_t; e = exp2(t); d = fma(e, N/s, N/s); r = rcp(d) (= s*sig/N);
+    #   silu' = qk*r (= silu/(alpha*s)); om' = fma(r, -(alpha*s)*N, sas)
+    #   (= sas*(1-sig)); g = fma(silu', om', r) (= vf3p's g up to rounding);
+    #   ds = dp*g.  The uniform constants are packed (c_t, N/s) and
+    #   (-(alpha*s)*N, sas), each pair readfirstlane'd as one <2 x f32>.
+    #   silu' lacks alpha*s, so its e4m3 cast scale is re-centred by the pow2
+    #   sc = 2^ka, ka = round(log2(alpha*s)) (vf2's recipe: the cast scale
+    #   field is E8M0, pow2 only), and the dv epilogue (bf16 and e8)
+    #   multiplies by 1/(mu2_ssc*sc*mu2_osc)*(alpha*s) instead of
+    #   1/(mu2_ssc*mu2_osc) (one uniform factor, one multiply per element,
+    #   as without vf4).  sc is computed IN THE
+    #   KERNEL from the runtime qkv_scale (_vf4_cast_scale: integer ops on
+    #   the f32 alpha*s, once per workgroup, uniform), so mu2_ssc stays the
+    #   compile-time base scale and one build serves every qkv_scale.
+    VALU_VF4 = "vf4" in valu_set
+    assert not VALU_VF4 or (VALU_VF3P and F8B and MU2 == "k128"
+                            and not do_dyn), (
+        "vf4 needs vf3p and the f8b=all k128 path (no do_dyn)")
+    # vf4 needs msat: the silu' cast saturates in hardware, so the
+    # runtime cast scale needs no runtime clamp limit (VALU_MSAT is defined
+    # below; checked there).
+    VF4_TIE = False
+    if VALU_VF4:
+        # log2(mu2_ssc) as an int: the runtime cast operand 2^-(E+ka) and the
+        # undo factor stay normal f32 for |E| <= 50 and the launcher's guard
+        # 2^-50 <= alpha*qkv_scale <= 2^50 (|ka| <= 50).
+        VF4_ESSC = math.frexp(mu2_ssc)[1] - 1
+        assert 2.0 ** VF4_ESSC == mu2_ssc and abs(VF4_ESSC) <= 50, (
+            f"vf4 needs a power-of-two mu2_ssc within 2^-50..2^50, got "
+            f"{mu2_ssc}")
+        # alpha a half-integer power of two at f32 precision (e.g.
+        # 128^-0.5): then alpha*s is an exact tie of round(log2()) for every
+        # power-of-two s; the host formula (double log2, Python round) rounds
+        # it half-to-even, and _vf4_cast_scale does the same.
+        VF4_TIE = (struct.unpack("<I", struct.pack("<f", alpha))[0]
+                   & 0x7FFFFF) in (0x3504F3, 0x3504F4)
     assert not (VALU_H16 or VALU_VF) or VALU_ILP, "h16/vf need valu ilp"
     assert not (VALU_H16 and VALU_VF), "h16 and vf are exclusive"
     assert not VALU_H16 or (F8B and f8_sat), "h16 needs f8b + f8_sat"
@@ -745,6 +786,7 @@ def compile_hstu_bwd_dkdv(
     # mapped NaN to +448 (0x7e); msat propagates it as fp8 NaN (0xff).
     VALU_MSAT = "msat" in valu_set
     assert not VALU_MSAT or f8_sat, "valu msat needs f8_sat"
+    assert not VALU_VF4 or VALU_MSAT, "vf4 needs valu msat"
     assert not (VALU_MSAT and VALU_H16), "msat is untested with h16"
     SAT_HI = False if VALU_MSAT else ("hi" if f8_sat else False)
     SAT_BOTH = False if VALU_MSAT else ("both" if f8_sat else False)
@@ -1178,15 +1220,69 @@ def compile_hstu_bwd_dkdv(
     if lds_pad:
         allocator.ptr = allocator._align(allocator.ptr, 16) + lds_pad
 
+    # ---- valu "vf4": runtime pow2 re-centring of the silu' e4m3 cast ------
+    # sc = 2^ka, ka = round(log2(cx)), cx = f32(alpha) * qkv_scale (the f32
+    # alpha*s the vf3p/vf4 constants already use; a positive normal f32 under
+    # the launcher's guard).  Adding 0x800000 - 0x3504F4 to the bits of cx
+    # carries into the exponent field exactly when its mantissa is >= sqrt(2)
+    # (0x3504F4 is the smallest 23-bit fraction f with 1 + f/2^23 > sqrt(2);
+    # no f32 equals sqrt(2)*2^k, so round(log2(cx)) has no ties), and masking
+    # the sum to the exponent field gives the bits of 2^ka.  VF4_TIE (alpha a
+    # half-integer power of two) and s a power of two: alpha*s is an exact tie
+    # of the host round(log2(alpha*s)) (Python, half-to-even), so the
+    # exponent of cx is rounded to the odd biased value, i.e. ka to even (cx
+    # is f32(alpha)*s exactly there).  Then 0x7F000000 minus the bits of 2^ka
+    # is 2^-ka, and the cast operand (cvt_scalef32 divides by it) is
+    # 1/(mu2_ssc*sc) = 2^-(E+ka), E = log2(mu2_ssc): products of powers of
+    # two, exact.  Integer ops on uniform values, once per workgroup,
+    # readfirstlane'd to an SGPR (the cast reads it in place of a literal).
+    VF4_RND = 0x800000 - 0x3504F4
+
+    def _vf4_cast_scale(cx, s):
+        """(cast operand 1/(mu2_ssc*sc), dv undo factor), uniform SGPRs."""
+        from flydsl._mlir.dialects import arith as _ar
+
+        def _rfl(v):
+            vi = arith.bitcast(T.i32, arith.unwrap(v))
+            return arith.ArithValue(arith.bitcast(
+                T.f32, rocdl.readfirstlane(T.i32, arith.unwrap(vi))))
+
+        def _and(a, m):
+            return arith.ArithValue(_ar.AndIOp(
+                arith.unwrap(a), arith.unwrap(_i32(m))).result)
+        cb = arith.ArithValue(arith.bitcast(T.i32, arith.unwrap(cx)))
+        scb = _and(cb + _i32(VF4_RND), 0x7F800000)           # bits of 2^ka
+        if VF4_TIE:
+            sb = arith.ArithValue(arith.bitcast(T.i32, arith.unwrap(s)))
+            tie = arith.cmpi(arith.CmpIPredicate.eq,
+                             arith.unwrap(_and(sb, 0x7FFFFF)),
+                             arith.unwrap(_i32(0)))
+            odd = _and(arith.ArithValue(_ar.OrIOp(
+                arith.unwrap(cb), arith.unwrap(_i32(0x800000))).result),
+                0x7F800000)
+            scb = arith.ArithValue(arith.select(tie, arith.unwrap(odd),
+                                                arith.unwrap(scb)))
+        isc = arith.ArithValue(arith.bitcast(T.f32, arith.unwrap(
+            arith.ArithValue(_i32(0x7F000000)) - scb)))      # 2^-ka
+        sop = isc * _f32(1.0 / mu2_ssc)                      # 1/(mu2_ssc*sc)
+        # dv undo factor 1/(mu2_ssc*sc*mu2_osc) * (alpha*s): a pow2
+        # constant times f32(alpha)*s.  Formed here
+        # and kept in an SGPR, so the epilogues do not need alpha*s in a VGPR
+        # across the m loop.
+        u = sop if mu2_osc == 1.0 else sop * _f32(1.0 / mu2_osc)
+        return _rfl(sop), _rfl(u * cx)
+
     def _e8_epilogue(res_dv, res_dk, plast, e8, n0, wave, grp, l16, l4, tid,
                      head, seq_start, seq_len, kt8_lds,
                      dk_input_scale, value_input_scale, score_alpha_scale,
-                     inv_s_do, XR_B):
+                     inv_s_do, XR_B, vf4_undo=None):
         """e8emit="only": the dk/dv epilogue writing e5m2 into the
         sink's dz8 instead of BF16 dk/dv, plus the amax/colsum partials.
 
         Lane (l4, l16) of wave (grp, wave) holds res_*[nt*NDO + ds][i] =
         row n0 + 32*wave + 16*nt + 4*l4 + i, col 64*grp + 16*ds + l16.
+        vf4_undo (valu vf4 only): the dv undo factor
+        1/(mu2_ssc*sc*mu2_osc)*(alpha*s) (emit_body's prologue, uniform).
         """
         from flydsl._mlir.dialects import arith as _ar
         DZ8_, PAM_, PCS_, inv_v, prow0_v = e8
@@ -1202,6 +1298,11 @@ def compile_hstu_bwd_dkdv(
         inv = arith.ArithValue(inv_v)
         inv2 = vector.from_elements(v2f, [arith.unwrap(inv)] * 2)
         prow = arith.ArithValue(prow0_v) + arith.ArithValue(n0) // _i32(BN)
+        if VALU_VF4:
+            # vf4: the silu' cast scale lacks alpha*s; fold it into the
+            # uniform undo factor 1/(mu2_ssc*sc*mu2_osc)*(alpha*s) (exact:
+            # pow2 * f32), as in the bf16 epilogue.
+            dv_undo_vf4 = vf4_undo
 
         def _vals(nt, ds):
             """dv/dk f32 values: the bf16 epilogue's op sequence verbatim."""
@@ -1214,7 +1315,8 @@ def compile_hstu_bwd_dkdv(
                     dynamic_position=[])) * _f32(alpha)
                 if MU2 == "k128":
                     dvv = arith.unwrap(arith.ArithValue(dvv)
-                                       * _f32(1.0 / (mu2_ssc * mu2_osc)))
+                                       * (dv_undo_vf4 if VALU_VF4 else
+                                          _f32(1.0 / (mu2_ssc * mu2_osc))))
                     if do_dyn:
                         dvv = arith.unwrap(arith.ArithValue(dvv) * inv_s_do)
                         dkv = arith.ArithValue(dkv) * inv_s_do
@@ -1629,6 +1731,9 @@ def compile_hstu_bwd_dkdv(
         # once per kernel (LLVM keeps them in SGPR/VGPR pairs that
         # v_pk_*_f32 read directly).
         V2F = T.vec(2, T.f32)
+        # valu vf4: the runtime silu' cast operand and dv undo factor (set
+        # below).
+        vf4_sop = vf4_undo = None
         if EPI_PK:
             def _splat2(v):
                 v = arith.unwrap(v)
@@ -1666,6 +1771,26 @@ def compile_hstu_bwd_dkdv(
                     pk_cx2 = vector.shuffle(_s0, _s0, [1, 1])
                     pk_k2 = vector.shuffle(_s1, _s1, [0, 0])
                     pk_nn2 = vector.shuffle(_s1, _s1, [1, 1])
+                    if VALU_VF4:
+                        # vf4: vf3p's packing with the (N/s, .) pair's high
+                        # half = -(alpha*s)*N; the om' addend sas comes from
+                        # the VGPR-pair splat pk_sas2 (constant bus 1, as
+                        # vf3p's s).  Reading both halves of ONE SGPR pair in
+                        # the om' fma is rejected by LLVM: "VOP* instruction
+                        # violates constant bus restriction".
+                        _ncxn = (arith.ArithValue(_cx) * arith.ArithValue(_nf)
+                                 * _f32(-1.0))
+                        _p1 = vector.from_elements(
+                            V2F, [arith.unwrap(_kk), arith.unwrap(_ncxn)])
+                        _s1 = rocdl.readfirstlane(V2F, arith.unwrap(_p1))
+                        pk_k2 = vector.shuffle(_s1, _s1, [0, 0])
+                        pk_ncxn2 = vector.shuffle(_s1, _s1, [1, 1])
+                        pk_sasc2 = pk_sas2
+                        # The silu' cast operand 1/(mu2_ssc*sc) from the
+                        # runtime alpha*s, uniform, once: one build serves
+                        # every qkv_scale.
+                        vf4_sop, vf4_undo = _vf4_cast_scale(
+                            _cx, value_input_scale)
             if VALU_VF2:
                 pk_nsas2 = _splat2(score_alpha_scale * _f32(-1.0))
             if VALU_VF and not VALU_VF2:
@@ -1784,8 +1909,12 @@ def compile_hstu_bwd_dkdv(
                 return mn(x, hi)
             return mn(mx(x, arith.unwrap(_f32(-lim))), hi)
 
-        def pk4_from_f32(v4f32, scale, sat=False):
-            """4 f32 -> one dword of 4 fp8, in element order."""
+        def pk4_from_f32(v4f32, scale, sat=False, rt=None):
+            """4 f32 -> one dword of 4 fp8, in element order.
+
+            rt (valu vf4, the silu' casts only): the cast operand as a
+            runtime uniform value; it replaces the compile-time 1/scale
+            (see _vf4_cast_scale; vf4 needs msat, so sat is off)."""
             f = (rocdl_raw.cvt_scalef32_pk_bf8_f32 if MU2_BF8
                  else rocdl_raw.cvt_scalef32_pk_fp8_f32)
             if VALU_UNDEF:
@@ -1811,7 +1940,11 @@ def compile_hstu_bwd_dkdv(
                         h2 = _ar.MinNumFOp(h2, arith.unwrap(hi_)).result
                     acc = _res(fh(T.vec(2, T.i16), acc, h2, sch, half))
                 return acc
-            sc = _cvt_sc(scale)
+            if rt is None:
+                sc = _cvt_sc(scale)
+            else:
+                assert not MU2_BF8 and not sat
+                sc = arith.unwrap(rt)
             lim = (57344.0 if MU2_BF8 else 448.0) / scale
             for half in range_constexpr(2):
                 e0 = vector.extract(v4f32, static_position=[2 * half],
@@ -2477,7 +2610,7 @@ def compile_hstu_bwd_dkdv(
                         t2s = [arith.mulf(q2, pk_c1) for q2 in q2s]
                         if VALU_H16:
                             x2s = [arith.mulf(q2, pk_sas2) for q2 in q2s]
-                        if VALU_VF3:
+                        if VALU_VF3 and not VALU_VF4:
                             x2s = [arith.mulf(q2, pk_cx2) for q2 in q2s]
                     else:
                         x2s = [arith.mulf(vector.shuffle(qk[nt][ms],
@@ -2515,6 +2648,21 @@ def compile_hstu_bwd_dkdv(
                                              arith.unwrap(sg))
                                for u, om, sg in zip(u2s, oms2s, sh)]
                         ds2s = [arith.mulf(d_, g_) for d_, g_ in zip(dh, g2s)]
+                    elif VALU_VF4:
+                        # sig2s holds r = s*sig/N here.  silu' = qk*r =
+                        # silu/(alpha*s) (the cast scale and the dv epilogue
+                        # carry alpha*s); om' = sas - (alpha*s*N)*r =
+                        # sas*(1-sig); g = silu'*om' + r = vf3p's s*gc.
+                        silu2s = [arith.mulf(q2, r_) for q2, r_ in zip(q2s, sig2s)]
+                        om2s = [llvm.intr_fma(arith.unwrap(r_),
+                                              arith.unwrap(pk_ncxn2),
+                                              arith.unwrap(pk_sasc2))
+                                for r_ in sig2s]
+                        gc2s = [llvm.intr_fma(arith.unwrap(sl),
+                                              arith.unwrap(om),
+                                              arith.unwrap(r_))
+                                for sl, om, r_ in zip(silu2s, om2s, sig2s)]
+                        ds2s = [arith.mulf(p2, gc) for p2, gc in zip(p2s, gc2s)]
                     elif VALU_VF3:
                         # sig2s holds r = s*sig/N here.
                         silu2s = [arith.mulf(x2, r_) for x2, r_ in zip(x2s, sig2s)]
@@ -2719,7 +2867,7 @@ def compile_hstu_bwd_dkdv(
             s8, d8 = [], []
             for nt in range_constexpr(NT):
                 s8.append([pk4_from_f32(silu32[nt][ms], mu2_ssc,
-                                        SAT_HI)
+                                        SAT_HI, rt=vf4_sop)
                            for ms in range_constexpr(MSTEP)])
                 d8.append([pk4_from_f32(ds32[nt][ms], mu2_dsc,
                                         SAT_BOTH)
@@ -3643,7 +3791,7 @@ def compile_hstu_bwd_dkdv(
                         # of parity pprev are stable from B1(k-1) to W(k+1).
                         ms_pre["ob0"] = ms_bop(pprev, 0)
                     s8 = [[pk4_from_f32(s32[ms], mu2_ssc,
-                                        SAT_HI)
+                                        SAT_HI, rt=vf4_sop)
                            for ms in range_constexpr(MSTEP)]]
                     d8 = [[pk4_from_f32(d32[ms], mu2_dsc,
                                         SAT_BOTH)
@@ -4099,11 +4247,14 @@ def compile_hstu_bwd_dkdv(
             _e8_epilogue(res_dv, res_dk, plast, e8, n0, wave, grp, l16, l4,
                          tid, head, seq_start, seq_len, kt8_lds,
                          dk_input_scale, value_input_scale,
-                         score_alpha_scale, inv_s_do, XR_B)
+                         score_alpha_scale, inv_s_do, XR_B, vf4_undo=vf4_undo)
             return
         # ---- epilogue -------------------------------------------------------
         n_out_base = n0 + wave * _i32(16 * NT) + l4 * _i32(4)
         NDO = NSTEP // 2 if MSPLIT else NSTEP  # d tiles stored per wave
+        if VALU_VF4:
+            # uniform, from the prologue: 1/(mu2_ssc*sc*mu2_osc) * alpha*s
+            dv_undo_vf4 = vf4_undo
         for nt, ds in [(a, b) for a in range(NT) for b in range(NDO)]:
             d_idx = l16 + _i32(16 * ds)
             if MSPLIT:
@@ -4131,9 +4282,11 @@ def compile_hstu_bwd_dkdv(
                     if MU2 == "k128":
                         # Undo the power-of-two pre-scales the fp8 casts folded
                         # in.  Both are exact, so this is a pure exponent shift.
+                        # vf4: alpha*s rides in the same uniform factor.
                         dvv = arith.unwrap(
                             arith.ArithValue(dvv)
-                            * _f32(1.0 / (mu2_ssc * mu2_osc)))
+                            * (dv_undo_vf4 if VALU_VF4
+                               else _f32(1.0 / (mu2_ssc * mu2_osc))))
                         if do_dyn:
                             dvv = arith.unwrap(
                                 arith.ArithValue(dvv) * inv_s_do)

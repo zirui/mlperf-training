@@ -45,7 +45,7 @@ logger: logging.Logger = logging.getLogger("dlrmv4_dataset")
 # KJT per sample + collate_fn. Batches are bit-for-bit identical. Read once
 # per process; forked DataLoader workers inherit the cached value. This is the
 # train pools' switch (and that of every loader that is not an eval loader);
-# yambda_5b.gin sets it through configure_fast_batch.
+# yambda_5b.gin sets it (gin default 1) through configure_fast_batch.
 _FAST_BATCH: Optional[bool] = None
 
 # $DL_FAST_BATCH_EVAL: the eval loaders' own switch, so the eval passes can use

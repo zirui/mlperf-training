@@ -26,7 +26,10 @@ NEVER CALLED: try_flydsl_* (counters, _max_num_targets memo), any autograd
 Function, bwd_fp8.quantize_gradient / output_projection_dgrad (site state),
 calibrate_scale_buffer (all-reduce), the *_preq scaled-GEMM wrappers (weight /
 scale caches), triton_fp8._get_weight_shadow (the weight-shadow cache),
-install_for_tokens, seed_max_num_targets, module forwards.
+install_for_tokens, seed_max_num_targets, module forwards, the dkdv-e5m2 helpers of
+triton_hstu_preprocess_and_attention (_dkdv_e5m2_arm / _engaged / _prequant /
+_projection_backward: counters, log sets, latch) and
+bwd_fp8.producer_fp8t_inv_scale / producer_inv_scale (scale epochs).
 
 Knobs (all read here, at call time):
   FP8_WARMUP=0|1|2          0 off, 1 FP8-switch tier, 2 also the bf16
@@ -41,6 +44,9 @@ Knobs (all read here, at call time):
                             digest of the FP8 modules' globals before vs after.
   FP8_WARMUP_QUIET=1        silence fd 2 (Triton UserWarnings) during items.
   FP8_WARMUP_N11=1          also warm the c=11 N class (N=2000) in F2.
+  DLRM_HSTU_FP8_WARMUP_F2E=0
+                            skip item F2e (absent or "1" = run it; gin binds
+                            it through apply_env_bootstrap).
 
 MEMORY. Every tensor the items allocate is released before this returns (torch
 reserved memory is back at its pre-warmup value after empty_cache()). The items
@@ -90,6 +96,19 @@ digested before and after; any difference outside the loaded-library handles
 is a guard failure ("module globals"). Every item runs with Python stdout
 captured, so arming lines the production wrappers print are dropped here and
 print at the real first use.
+DKDV E5M2 (item F2e). With
+DLRM_HSTU_FP8_BWD_DKDV_E5M2=1 every engaged ordinary-layer backward hands the
+FlyDSL backward a DkdvE5m2Sink, which compiles a second bwd_dkdv build (F2's
+compile key plus e8emit="only") at the first engaged call, after the per-layer
+scale warm-up, inside the timed region. F2e makes F2's call with the sinks of
+an engaged call (the E1 sink and, where F2q runs, the dq sink adopting the same
+dz8), then the cast and finishes the engaged call runs after it (on the joint
+path: no cast, the dq sink's finish_q and the E1 finish). It runs only
+when the knob is "1" at warmup time (tpa._dkdv_e5m2_requested, after the env
+bootstrap), under F2's preconditions, for F2's N list. Of tpa only its env
+predicates are read; both sinks are local objects. Its ok line prints on every
+rank, with the synchronized backward time (the e8 compile on a cold FlyDSL
+cache) and the number of new compile_hstu_bwd_dkdv builds.
 """
 
 import collections
@@ -220,6 +239,8 @@ _JIT_KERNELS_S11: Tuple[Tuple[str, str], ...] = (
     ("generative_recommenders.ops.triton.triton_layer_norm",
      "_weighted_layer_norm_fwd_fp8_store_t_v2"),
     ("generative_recommenders.ops.triton.hstu_delta_bwd_e5m2", "_hstu_attn_delta_bwd_e5m2_v2"),
+    # DLRM_HSTU_FP8_ATTN_INTGLUE (default off): F2/F2q compile it when armed.
+    ("generative_recommenders.ops.flydsl.hstu_dq_split", "_intglue_kernel"),
     ("generative_recommenders.ops.triton.hstu_delta_bwd_e5m2",
      "_hstu_attn_delta_bwd_e5m2_lpt_perm"),
     ("generative_recommenders.ops.triton.bwd_fp8", "_quantize_amax_colsum_v2_kernel"),
@@ -234,6 +255,8 @@ _JIT_KERNELS_S11: Tuple[Tuple[str, str], ...] = (
     ("generative_recommenders.ops.flydsl.hstu_dq_split", "_dq_bc_bounds_kernel"),
     ("generative_recommenders.ops.triton.triton_hstu_linear", "_ln_mul_dropout_fwd_rng_v3"),
     ("generative_recommenders.ops.triton.triton_hstu_linear", "_ln_mul_dropout_fwd_maskgen"),
+    # DLRM_HSTU_FP8_MASKGEN_PK (L4 reaches it through the production wrapper)
+    ("generative_recommenders.ops.triton.triton_hstu_linear", "_ln_mul_dropout_fwd_maskgen_pk"),
 )
 
 # Autotuned kernels this warmup can reach. Any key it ADDS is popped afterwards
@@ -243,6 +266,18 @@ _AUTOTUNED: Tuple[Tuple[str, str], ...] = (
     ("generative_recommenders.ops.triton.triton_hstu_attention", "_hstu_attn_fwd"),
     ("generative_recommenders.ops.triton.triton_layer_norm", "_weighted_layer_norm_fwd"),
     ("generative_recommenders.ops.triton.triton_hstu_linear", "_ln_mul_dropout_fwd_rng"),
+)
+
+# DKDV_E5M2 first uses (item F2e): the E1 sink's prefix and finalize kernels
+# and the casts of the E1 paths off the joint path. Counted only when the
+# module is already loaded (sys.modules, no import for the census), so a
+# warmup with E1 off does not count them.
+_JIT_KERNELS_S13: Tuple[Tuple[str, str], ...] = (
+    ("generative_recommenders.ops.flydsl.hstu_dkdv_e5m2", "_e8_pfx_kernel"),
+    ("generative_recommenders.ops.flydsl.hstu_dkdv_e5m2", "_e8_fin_kernel"),
+    ("generative_recommenders.ops.triton.hstu_dq_e5m2",
+     "_quantize_amax_colsum_skipn_kernel"),
+    ("generative_recommenders.ops.triton.bwd_fp8", "_quantize_amax_colsum_sel_kernel"),
 )
 
 
@@ -299,6 +334,12 @@ def _jit_total() -> int:
             jit_fn = _unwrap_jit(_get_kernel(mod_name, attr))
         except Exception:
             continue
+        n = _jit_cache_size(jit_fn) if jit_fn is not None else -1
+        if n > 0:
+            total += n
+    for mod_name, attr in _JIT_KERNELS_S13:
+        mod = sys.modules.get(mod_name)
+        jit_fn = _unwrap_jit(getattr(mod, attr, None)) if mod is not None else None
         n = _jit_cache_size(jit_fn) if jit_fn is not None else -1
         if n > 0:
             total += n
@@ -407,6 +448,9 @@ _MHA_SETS = (
     # DLRM_HSTU_FP8_FWD_PV armed-line / declined once-latch
     # (default off; F1 reaches fp8_fwd_pv_config through _fp8_fwd_config).
     "_fp8_fwd_pv_logged",
+    # DLRM_HSTU_FP8_ATTN_INTGLUE armed / declined once-latch (default
+    # off; F2/F2q reach it through the dq-split backward).
+    "_ATTN_INTGLUE_LOGGED",
 )
 _MHA_DICTS = ("_e1_bwd_census",)
 _MHA_SCALARS = ("_backward_calls", "_forward_calls", "_fp8_forward_calls",
@@ -908,13 +952,17 @@ class _Runner:
             logger.info("%s item=%s %s skip(reason=%s)", _TAG, tag, name, reason)
 
     def run(self, tag: str, name: str, detail: str,
-            fn: Callable[[], None]) -> None:
+            fn: Callable[[], Optional[str]], all_ranks: bool = False) -> None:
+        """Run one item. A str returned by `fn` is appended to its ok line;
+        `all_ranks` prints that line on every rank (tagged rank=R) instead of
+        rank 0 only (FAIL lines always print on every rank)."""
         if tag.lower() in self.skipset or name.lower() in self.skipset:
             self.skip(tag, name, "FP8_WARMUP_SKIP")
             return
         jit0 = _jit_total()
         t0 = time.perf_counter()
         captured = io.StringIO()
+        extra: Optional[str] = None
         try:
             self.bufs.reset()
             if self.quiet:
@@ -924,7 +972,7 @@ class _Runner:
             # call (ARMED store_t_v2/vkp_v2/u_dp, FWD_PIPE, BM16, maskgen, ...);
             # their latches are restored, so they print at the real first use.
             with _quiet_stderr(self.quiet), contextlib.redirect_stdout(captured):
-                fn()
+                extra = fn()
                 # Attribute an async device fault to the item that caused it.
                 torch.cuda.synchronize(self.device)
         except Exception as error:
@@ -944,9 +992,11 @@ class _Runner:
             self.jit_new += new
         self.ok += 1
         self.tags[tag] = self.tags.get(tag, 0) + 1
-        if self.rank0:
-            logger.info("%s item=%s %s %s ok t=%.2fs jit_new=%d", _TAG, tag, name,
-                        detail, time.perf_counter() - t0, new)
+        if self.rank0 or all_ranks:
+            logger.info("%s item=%s %s %s ok t=%.2fs jit_new=%d%s%s", _TAG, tag,
+                        name, detail, time.perf_counter() - t0, new,
+                        f" {extra}" if isinstance(extra, str) and extra else "",
+                        f" rank={_rank()}" if all_ranks else "")
 
 
 # ----------------------------------------------------------------------------
@@ -1249,6 +1299,162 @@ def _warm_items(r: _Runner, model: torch.nn.Module, B: int, tier: int,
                     (q_lo, q_lo + H * Dq))
 
             r.run("F2q", "flydsl_bwd_dq_e5m2", f"N={N} store=big", f2q)
+
+        # ---- F2e: e8 build of the same backward ------------------------------
+        # DLRM_HSTU_FP8_BWD_DKDV_E5M2=1 (the predicate tpa
+        # reads, after the env bootstrap): every engaged ordinary-layer call
+        # hands this backward a DkdvE5m2Sink and its config gains
+        # e8emit="only", a SECOND compile_hstu_bwd_dkdv build (lru_cached on
+        # its arguments; c = ceil(log2 N) enters through mu2_ssc/mu2_dsc as in
+        # F2, so N=2992 and 4096 share one build and N11 adds the c=11 one).
+        # Without this item it compiles at the first engaged call, after the
+        # per-layer scale warm-up, inside the timed region. F2e is F2's call
+        # with the sinks of an engaged call (tpa backward): the E1 sink over a
+        # dz8 [roundup(T, uvqk_tm_pad), 4*H*D] (tpa._dkdv_e5m2_arm; the >2 GiB
+        # class, as F2q's) and, where F2q runs, the dq sink adopting that dz8
+        # (pad_zeroed=True). Then what tpa._dkdv_e5m2_prequant runs: the cast
+        # of the columns no producer wrote (joint path: none, u comes
+        # from B1a, q from the dq sink, v|k from E1; dq sink without B1a: u;
+        # B1a without the dq sink: q; neither: u|q; a cast also runs at the odd
+        # row class T+1, as F2q's), the dq sink's finish_q (_dq8_fin) and the
+        # E1 finish (_e8_fin); _e8_pfx runs in the launch.
+        # Synthetic zeros and a ones(1) scale; both sinks are local objects
+        # and no tpa helper runs (only its env predicates are read), so its
+        # E1 counters, log/latch sets and the per-layer scale epochs are
+        # untouched (production prints its E1 ARMED/engaged lines at the
+        # first engaged call); the mha latches and the dq-split workspace
+        # are put back by _Guards as for F2. A sink
+        # decline raises (FAIL line; the run continues). The ok line prints
+        # on every rank: bwd= the synchronized attention backward (the e8
+        # compile when the FlyDSL cache is cold), fin= the cast and finishes,
+        # e8_builds_new= compile_hstu_bwd_dkdv cache misses during the call.
+        tag_e, name_e = "F2e", "flydsl_bwd_full_fp8_e8"
+        b1a = bool(_call(bwd_fp8, "du_producer_enabled", False))
+        joint = dq_sink_reason is None
+
+        def e1_layout_ok() -> bool:
+            # tpa._dkdv_e5m2_arm's layout checks, on metadata only.
+            try:
+                uw = attn_l._uvqk_weight
+                bn = int(getattr(bwd_fp8, "_COLSUM_BLOCK_N", 256))
+                return (Dq == Dv and W_uvqk == 4 * H * Dv and (H * Dv) % bn == 0
+                        and uw.dim() == 2 and int(uw.shape[1]) == W_uvqk)
+            except Exception:
+                return False
+
+        if os.environ.get("DLRM_HSTU_FP8_WARMUP_F2E", "1").strip() == "0":
+            # Kill switch of the gin binding apply_env_bootstrap.
+            # DLRM_HSTU_FP8_WARMUP_F2E (absent or "1" = run, the code default).
+            r.skip(tag_e, name_e, "DLRM_HSTU_FP8_WARMUP_F2E=0")
+        elif not bool(_call(tpa, "_dkdv_e5m2_requested", False)):
+            r.skip(tag_e, name_e, "DLRM_HSTU_FP8_BWD_DKDV_E5M2 off")
+        elif grad_dtype is None or not (
+                uvqk_fp8t and _call(bwd_fp8, "uvqk_fp8_backward_enabled", False)):
+            r.skip(tag_e, name_e, "no FP8 uvqk backward with the fp8t wgrad")
+        elif not e1_layout_ok():
+            r.skip(tag_e, name_e, "duvqk layout (the E1 arm declines it)")
+        elif bool(_call(tpa, "_dq_sink_diagnostics_on", False)):
+            r.skip(tag_e, name_e, "FlyDSL backward diagnostics on")
+        else:
+            path = ("b1a_" if b1a else "") + ("joint" if joint else "solo")
+
+            def dkdv_builds() -> int:
+                # compile_hstu_bwd_dkdv's lru_cache misses (read only).
+                try:
+                    build = getattr(getattr(mha, "_kernel", None),
+                                    "compile_hstu_bwd_dkdv", None)
+                    return int(build.cache_info().misses)
+                except Exception:
+                    return -1
+
+            for N in n_list:
+                # so: bound at definition (this function deletes it at the end).
+                def f2e(N: int = N, so: torch.Tensor = so) -> str:
+                    from generative_recommenders.ops.flydsl.hstu_dkdv_e5m2 import (
+                        DkdvE5m2Sink,
+                    )
+                    from generative_recommenders.ops.triton import hstu_dq_e5m2 as dqe
+
+                    hd = H * Dv
+                    mha.require_flydsl()
+                    with _big_dq_split_workspace(dev):
+                        q8, k8, v8 = vqk8(True)
+                        duvqk = bufs.act((T, W_uvqk), bf16, True)
+                        _du, dv, dq, dk = duvqk.split([hd, hd, H * Dq, H * Dq], 1)
+                        dout = bufs.act((T, H, Dv), bf16)
+                        rows_out = (T + tm_pad - 1) // tm_pad * tm_pad
+                        dz8 = bufs.act((rows_out, W_uvqk), grad_dtype, True)
+                        if rows_out > T:
+                            dz8[T:].zero_()  # tpa: the pad rows zeroed once
+                        one = torch.ones(1, dtype=f32, device=dev)
+                        e8s = DkdvE5m2Sink(dz8, one, decode_scale=one)
+                        sinks: Dict[str, Any] = {"dkdv_fp8_sink": e8s}
+                        dqs = None
+                        if joint:
+                            dqs = dqe.DqE5m2Sink(
+                                rows=T, width=W_uvqk, q_cols=(q_lo, q_lo + H * Dq),
+                                inv_scale=one, cast_scale=one, pad=tm_pad,
+                                grad_dtype=grad_dtype, limit=grad_limit,
+                                device=dev, dz8=dz8, pad_zeroed=True)
+                            sinks["dq_fp8_sink"] = dqs
+                        n0 = dkdv_builds()
+                        torch.cuda.synchronize(dev)
+                        t0 = time.perf_counter()
+                        mha.flydsl_hstu_attention_bwd(
+                            dout, q8, k8, v8, so, N, alpha,
+                            out=(dq.view(T, H, Dq), dk.view(T, H, Dq), dv.view(T, H, Dv)),
+                            qkv_scale=s, **sinks,
+                        )
+                        torch.cuda.synchronize(dev)
+                        t_bwd = time.perf_counter() - t0
+                        n1 = dkdv_builds()
+                        if e8s.declined is not None or not e8s.filled:
+                            raise RuntimeError(
+                                f"E1 sink not engaged (declined={e8s.declined})")
+                        dq_note = ""
+                        if dqs is not None and not dqs.filled:
+                            # tpa: the engaged call continues without it.
+                            dq_note = f" dq_sink=unused({dqs.declined})"
+                            dqs = None
+                        # The cast tpa._dkdv_e5m2_prequant runs before the
+                        # finishes: none with the dq sink AND B1a (the
+                        # joint path); u with the dq sink only; q with B1a
+                        # only; u|q (keep-list kernel) with neither.
+                        has_cast = dqs is None or not b1a
+
+                        def cast(value: torch.Tensor, out: torch.Tensor) -> None:
+                            if dqs is not None:
+                                dqe.quantize_amax_colsum_skip(
+                                    value, one, out, (hd, 4 * hd))
+                            elif b1a:
+                                dqe.quantize_amax_colsum_skip(
+                                    value, one, out, [(0, 2 * hd), (3 * hd, 4 * hd)])
+                            else:
+                                bwd_fp8.quantize_amax_colsum_select(
+                                    value, one, out, group_cols=hd)
+
+                        t0 = time.perf_counter()
+                        if has_cast:
+                            cast(duvqk, dz8)
+                        if dqs is not None:
+                            dqs.finish_q()
+                        e8s.finish()
+                        torch.cuda.synchronize(dev)
+                        t_fin = time.perf_counter() - t0
+                    if has_cast:
+                        # The same cast at the odd row class (F2q's rule: Triton
+                        # specializes its row-count arguments on % 16; T+1 is
+                        # odd, the class most production row counts are in,
+                        # T = 2B the % 16 class when B % 8 == 0).
+                        rows = T + 1
+                        rows_o = (rows + tm_pad - 1) // tm_pad * tm_pad
+                        cast(bufs.act((rows, W_uvqk), bf16, True),
+                             bufs.act((rows_o, W_uvqk), grad_dtype, True))
+                    return (f"bwd={t_bwd:.2f}s fin={t_fin:.2f}s e8_builds_new="
+                            f"{n1 - n0 if min(n0, n1) >= 0 else -1}{dq_note}")
+
+                r.run(tag_e, name_e, f"N={N} store=big path={path}", f2e,
+                      all_ranks=True)
 
     # ---- T1/T2: targets-only delta attention, e4m3 V/K --------------------
     # DELTA_FWD_BM16 (T1, read per call, latch restored) and
@@ -1803,6 +2009,13 @@ def _warm_items(r: _Runner, model: torch.nn.Module, B: int, tier: int,
     elif ol is None:
         r.skip("L4", "ln_mul_dropout_fp8", "no main layer with recompute_y")
     else:
+        # MGPK layer list (DLRM_HSTU_FP8_MASKGEN_PK_LAYERS): L4's calls must be
+        # untagged (-1) so that, with a list, they run both maskgen kernels and
+        # compile both here. A tag left by an earlier STU forward would narrow
+        # that to one kernel; the scalar snapshot above restores the tag.
+        _thl = sys.modules.get(_P_TRITON + "triton_hstu_linear")
+        if _thl is not None and hasattr(_thl, "set_lnmd_layer_tag"):
+            _thl.set_lnmd_layer_tag(-1)
         lnmd_loop("L4", "ln_mul_dropout_fp8", True,
                   [(Tp, big) for Tp in (T, T + 1) for big in stores]
                   + [(Tp, False) for Tp in big_rows])

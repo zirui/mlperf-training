@@ -42,6 +42,7 @@ import triton
 from generative_recommenders.common import HammerKernel
 from generative_recommenders.ops.layer_norm import LayerNorm, SwishLayerNorm
 from generative_recommenders.ops.triton import preproc_fp8_snr
+from generative_recommenders.ops.triton import triton_ec_dgrad_segreduce as _xs
 from generative_recommenders.ops.triton.triton_layer_norm import (
     _weighted_layer_norm_fwd,
     compute_BLOCK_D,
@@ -52,6 +53,8 @@ from generative_recommenders.ops.triton.triton_layer_norm import (
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+_IX_ATTR: str = "_dlrmv4_ec_indexed_l1"  # ops/ec_indexed_l1.IX_ATTR (literal)
 
 
 def _norm_fwd(
@@ -110,6 +113,44 @@ def _norm_fwd(
     return y, mean, rstd
 
 
+def linear_fwd(
+    x: torch.Tensor, lin_w: torch.Tensor, lin_b: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(x_c, lin_w_c, lin_b_c, h) of _LinearNormFunction.forward's Linear.
+
+    Factored out unchanged so the action prefill (modules/action_prefill.py)
+    issues literally the same ops; x must already be contiguous. Called with
+    grad disabled (inside Function.forward, or under no_grad by the prefill).
+    """
+    # AUTOCAST. The shipped nn.Sequential runs its Linear under autocast, so
+    # F.linear's operands are cast to the autocast dtype and it is the CAST
+    # weight that AddmmBackward0 saves and later uses for dgrad. A custom
+    # Function is handed the RAW arguments instead, and backward() runs with
+    # autocast DISABLED -- so saving the fp32 Parameter here and meeting it
+    # with a bf16 dh in backward is a mismatch ATen refuses outright:
+    #     expected mat1 and mat2 to have the same dtype: BFloat16 != float
+    #
+    # Casting HERE rather than in backward is what makes this both legal and
+    # numerically identical to the path it replaces: the forward matmul then
+    # runs at exactly the precision the shipped path used, and backward
+    # reuses those same cast tensors instead of inventing a new precision.
+    #
+    # norm_w/norm_b are deliberately NOT cast. The Triton norm loads them
+    # and promotes to fp32 internally, exactly as it does for the shipped
+    # module, and casting them here would change the norm's numerics rather
+    # than preserve them.
+    dev = x.device.type
+    if torch.is_autocast_enabled(dev):
+        amp_dtype = torch.get_autocast_dtype(dev)
+        x_c = x.to(amp_dtype)
+        lin_w_c = lin_w.to(amp_dtype)
+        lin_b_c = lin_b.to(amp_dtype)
+    else:
+        x_c, lin_w_c, lin_b_c = x, lin_w, lin_b
+    h = torch.addmm(lin_b_c, x_c, lin_w_c.t())
+    return x_c, lin_w_c, lin_b_c, h
+
+
 class _LinearNormFunction(torch.autograd.Function):
     """y = Norm(x @ lin_w.T + lin_b), with lin_b's gradient folded into Norm's bwd.
 
@@ -132,34 +173,23 @@ class _LinearNormFunction(torch.autograd.Function):
         eps: float,
         is_swish: bool,
         residual: Optional[torch.Tensor] = None,
+        # pyre-ignore[2]: modules/action_prefill.py PrefilledLinear, or None
+        prefilled=None,
+        ex2b_rec: Optional["_xs.PortRecord"] = None,
+        ex2b_port: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = x.contiguous()
-        # AUTOCAST. The shipped nn.Sequential runs its Linear under autocast, so
-        # F.linear's operands are cast to the autocast dtype and it is the CAST
-        # weight that AddmmBackward0 saves and later uses for dgrad. A custom
-        # Function is handed the RAW arguments instead, and backward() runs with
-        # autocast DISABLED -- so saving the fp32 Parameter here and meeting it
-        # with a bf16 dh in backward is a mismatch ATen refuses outright:
-        #     expected mat1 and mat2 to have the same dtype: BFloat16 != float
-        #
-        # Casting HERE rather than in backward is what makes this both legal and
-        # numerically identical to the path it replaces: the forward matmul then
-        # runs at exactly the precision the shipped path used, and backward
-        # reuses those same cast tensors instead of inventing a new precision.
-        #
-        # norm_w/norm_b are deliberately NOT cast. The Triton norm loads them
-        # and promotes to fp32 internally, exactly as it does for the shipped
-        # module, and casting them here would change the norm's numerics rather
-        # than preserve them.
-        dev = x.device.type
-        if torch.is_autocast_enabled(dev):
-            amp_dtype = torch.get_autocast_dtype(dev)
-            x_c = x.to(amp_dtype)
-            lin_w_c = lin_w.to(amp_dtype)
-            lin_b_c = lin_b.to(amp_dtype)
+        # DLRM_HSTU_FP8_ACTION_PREFILL (modules/action_prefill.py): this pair's
+        # casts and addmm may already have run -- linear_fwd() on the same
+        # operands under the same autocast state -- inside the forward
+        # all-to-all window. Reuse them: everything saved for backward then
+        # holds the same values as when computed here, so backward() is
+        # unchanged. take() returns None on any mismatch -> recompute here.
+        got = None if prefilled is None else prefilled.take(x, lin_w, lin_b)
+        if got is not None:
+            x_c, lin_w_c, lin_b_c, h = got
         else:
-            x_c, lin_w_c, lin_b_c = x, lin_w, lin_b
-        h = torch.addmm(lin_b_c, x_c, lin_w_c.t())
+            x_c, lin_w_c, lin_b_c, h = linear_fwd(x, lin_w, lin_b)
         # F2. `residual` is added INSIDE the norm's epilogue instead of by a
         # separate [M, D] read-modify-write against HBM immediately afterwards.
         #
@@ -188,6 +218,10 @@ class _LinearNormFunction(torch.autograd.Function):
         # x is saved for the Linear's wgrad. So this ctx holds no more
         # activation memory than Addmm + Norm already held separately.
         ctx.save_for_backward(x_c, lin_w_c, lin_b_c, h, norm_w, norm_b, mean, rstd)
+        # E-X2b (ops/triton/triton_ec_dgrad_segreduce.py, default off): pair 0
+        # of the content/additional MLP got x's EC dh port from claim(); bind
+        # hands the saved bf16 W1 to the EC backward. Saves are unchanged.
+        ctx.ex2b = None if ex2b_port is None else _xs.bind(ex2b_rec, x_c, lin_w_c)
         # Gradients must be returned in the dtype of the ORIGINAL inputs, not of
         # the cast copies -- AccumulateGrad writes into the fp32 Parameter.
         ctx.grad_dtypes = (x.dtype, lin_w.dtype, lin_b.dtype)
@@ -216,11 +250,7 @@ class _LinearNormFunction(torch.autograd.Function):
     # pyre-ignore[14]
     def backward(  # pyre-ignore[3]
         ctx, dy: torch.Tensor
-    ) -> Tuple[
-        Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor],
-        Optional[torch.Tensor], Optional[torch.Tensor], None, None,
-        Optional[torch.Tensor],
-    ]:
+    ) -> Tuple[Optional[torch.Tensor], ...]:
         x, lin_w, lin_b, h, norm_w, norm_b, mean, rstd = ctx.saved_tensors
         dh, dnorm_w, dnorm_b, dh_colsum = triton_weighted_layer_norm_bwd_dxsum(
             dy=dy.contiguous(),
@@ -234,7 +264,10 @@ class _LinearNormFunction(torch.autograd.Function):
             is_swish=ctx.is_swish,
         )
         needs = ctx.needs_input_grad
-        dx = dh @ lin_w if needs[0] else None
+        # E-X2b: dh leaves through the EC port and the EC backward computes
+        # dX fused with its segment reduce (route); else dX exactly as shipped.
+        routed = ctx.ex2b is not None and _xs.route(ctx, ctx.ex2b, dh, len(needs) - 1)
+        dx = dh @ lin_w if needs[0] and not routed else None
         dlin_w = dh.t() @ x if needs[1] else None
         # The Linear's bias gradient comes from
         # the norm backward's register-resident reduction, so the standalone
@@ -277,7 +310,7 @@ class _LinearNormFunction(torch.autograd.Function):
         ) -> Optional[torch.Tensor]:
             return None if g is None else g.to(dt)
 
-        return (
+        out = (
             _match(dx, x_dt),
             _match(dlin_w, w_dt),
             _match(dlin_b, b_dt),
@@ -292,7 +325,14 @@ class _LinearNormFunction(torch.autograd.Function):
             # but the Function must not fabricate a gradient for one that
             # doesn't).
             _match(dy, ctx.residual_dtype) if needs[7] else None,
+            # `prefilled` (not a tensor). A trailing None is dropped by autograd
+            # when the caller passed only the first eight arguments.
+            None,
+            None,  # ex2b_rec
+            dh if routed else None,  # ex2b_port: E-X2b's dh
         )
+        # 8-argument callers (the grouped tail's last pairs) get 8 grads.
+        return out[: len(needs)]
 
 
 class FusedLinearNormMLP(torch.nn.Sequential):
@@ -354,7 +394,7 @@ class FusedLinearNormMLP(torch.nn.Sequential):
             logger.warning(
                 "fuse_linear_norm INERT -- _can_fuse declined (enabled=%s "
                 "cuda=%s dim=%d children=%d); this container ran the shipped "
-                "nn.Sequential path unfused",
+                "nn.Sequential path",
                 self._f1_enabled, x.is_cuda, x.dim(), len(list(self)),
             )
 
@@ -374,6 +414,12 @@ class FusedLinearNormMLP(torch.nn.Sequential):
         fallback in the mechanism, not in the semantics: the value is identical
         either way.
         """
+        # Indexed-X (ops/ec_indexed_l1.py, default off): an EC placeholder reaching this container (grouped tail
+        # declined or off) is rebuilt into the exact member output first; _LinearNormFunction is unchanged.
+        if isinstance(x, torch.Tensor) and getattr(x, _IX_ATTR, None) is not None:
+            from generative_recommenders.ops import ec_indexed_l1 as _ixp
+
+            x = _ixp.rebuild(x, "FusedLinearNormMLP")
         can = self._can_fuse(x)
         if not self._f1_reported:
             self._report_once(can, x)
@@ -383,6 +429,8 @@ class FusedLinearNormMLP(torch.nn.Sequential):
         pairs = self._pairs()
         last = len(pairs) - 1
         for i, (lin, norm) in enumerate(pairs):
+            # E-X2b: pair 0 may take x's EC dh port (None, None when off).
+            rec, port = _xs.claim(x, lin.weight) if i == 0 else (None, None)
             x = _LinearNormFunction.apply(
                 x,
                 lin.weight,
@@ -392,5 +440,60 @@ class FusedLinearNormMLP(torch.nn.Sequential):
                 norm._eps,
                 isinstance(norm, SwishLayerNorm),
                 residual if i == last else None,
+                None,  # prefilled: never here
+                rec,
+                port,
             )
         return x
+
+    # forward() cut before its last (Linear, Norm) pair, for the action prefill
+    # (modules/action_prefill.py): forward_head(x) issues every pair but the
+    # last, forward_tail(...) the last one later. The two together issue the
+    # ops forward(x, residual) issues, in the same order, on the same values.
+    def forward_head(self, x: torch.Tensor) -> Tuple[torch.Tensor, bool]:
+        """(output of all pairs but the last, whether they took the fused path)."""
+        can = self._can_fuse(x)
+        if not self._f1_reported:
+            self._report_once(can, x)
+        if not can:
+            for m in list(self)[:-2]:
+                x = m(x)
+            return x, False
+        for lin, norm in self._pairs()[:-1]:
+            x = _LinearNormFunction.apply(
+                x,
+                lin.weight,
+                lin.bias,
+                norm.weight,
+                norm.bias,
+                norm._eps,
+                isinstance(norm, SwishLayerNorm),
+                None,
+            )
+        return x, True
+
+    def forward_tail(
+        self,
+        x: torch.Tensor,
+        fused: bool,
+        residual: Optional[torch.Tensor] = None,
+        # pyre-ignore[2]: modules/action_prefill.py PrefilledLinear, or None
+        prefilled=None,
+    ) -> torch.Tensor:
+        """The last pair of forward(); `fused` is forward_head's second value."""
+        if not fused:
+            for m in list(self)[-2:]:
+                x = m(x)
+            return x if residual is None else x + residual
+        lin, norm = self._pairs()[-1]
+        return _LinearNormFunction.apply(
+            x,
+            lin.weight,
+            lin.bias,
+            norm.weight,
+            norm.bias,
+            norm._eps,
+            isinstance(norm, SwishLayerNorm),
+            residual,
+            prefilled,
+        )

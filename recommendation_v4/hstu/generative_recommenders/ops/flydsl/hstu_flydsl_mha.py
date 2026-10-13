@@ -73,6 +73,9 @@ from generative_recommenders.ops.triton.triton_hstu_attention import (
     triton_hstu_attention_bwd,
     triton_hstu_attention_fwd,
 )
+# dO8 hook (contract version: hstu_do8_registry.CONTRACT): torch +
+# stdlib only.
+from generative_recommenders.ops.flydsl import hstu_do8_registry
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -650,7 +653,8 @@ def _dq_split_order(N: int) -> str:
 
 
 def _dq_split_ld():
-    """$DLRM_HSTU_FP8_DQ_SPLIT_LD (default unset = {}): cache policy of the dq-split kernel's ws loads (read exactly once).
+    """$DLRM_HSTU_FP8_DQ_SPLIT_LD (default unset = {}): cache policy of the
+    dq-split kernel's ws loads (read exactly once).
     Comma list of a Triton cache_modifier (.ca|.cg|.cv|.cs) and/or an
     eviction_policy (evict_first|evict_last).  Same bytes loaded: bitwise."""
     v = os.environ.get("DLRM_HSTU_FP8_DQ_SPLIT_LD", "").strip().lower()
@@ -671,7 +675,8 @@ _DQ_SPLIT_SCHED_LOGGED = set()
 def _dq_split_sched() -> str:
     """XCD-balanced dq-split schedule ($DLRM_HSTU_FP8_BWD_DQ_SPLIT_SCHED,
     default OFF = ""): "il" interleaves (b, h) units over the 8 XCDs instead of
-    giving each XCD a contiguous batch slice; "lpt" also walks them longest sequence first.  Bitwise dq."""
+    giving each XCD a contiguous batch slice; "lpt" also walks them longest
+    sequence first.  Bitwise dq."""
     v = os.environ.get("DLRM_HSTU_FP8_BWD_DQ_SPLIT_SCHED", "").strip().lower()
     if v in ("", "0", "off", "none"):
         return ""
@@ -724,6 +729,44 @@ def _dq_split_opt() -> dict:
     return o
 
 
+# intglue ($DLRM_HSTU_FP8_ATTN_INTGLUE, read per call; code default
+# OFF: absent or "0" runs the stock `seq_offsets.to(torch.int32)` +
+# hstu_dq_split.build_workspace).  On a dq-split call the int32 seq offsets
+# (cu) and the ds workspace's tile-prefix header come from ONE Triton launch
+# (hstu_dq_split.build_workspace_intglue) instead of 10 tiny torch kernels
+# (to, sub, add, floor_divide, fill, mul, add, mul, cumsum, copy).  Index
+# bookkeeping only, the same int32 values (bitwise); no memo, no state across
+# calls.  Other calls are unchanged.  Arming / declined lines are latched
+# once per process in _ATTN_INTGLUE_LOGGED (restored by fp8_warmup, so the
+# armed line prints at the first real backward, not inside the warmup).
+_ATTN_INTGLUE_LOGGED = set()
+
+
+def _attn_intglue_reason(seq_offsets: torch.Tensor) -> Optional[str]:
+    """None when this dq-split call takes the fused int glue, else why not
+    ("off" when the knob is off: the default path, nothing logged)."""
+    raw = os.environ.get("DLRM_HSTU_FP8_ATTN_INTGLUE", "").strip().lower()
+    if raw not in ("1", "true", "on", "yes"):
+        return "off"
+    from generative_recommenders.ops.flydsl import hstu_dq_split
+    why = hstu_dq_split.intglue_unsupported_reason(seq_offsets)
+    tag = ("armed",) if why is None else ("declined", why)
+    if tag not in _ATTN_INTGLUE_LOGGED:
+        _ATTN_INTGLUE_LOGGED.add(tag)
+        if why is None:
+            logger.warning(
+                "[hstu-attn] DLRM_HSTU_FP8_ATTN_INTGLUE=%s armed: dq-split "
+                "backward int glue (cu int32 + ds workspace tile-prefix "
+                "header) in one Triton launch per call (_intglue_kernel), "
+                "replacing 10 torch kernels; bitwise (debug check: "
+                "DLRM_HSTU_FP8_ATTN_INTGLUE_CHECK=1)", raw)
+        else:
+            logger.warning(
+                "[hstu-attn] DLRM_HSTU_FP8_ATTN_INTGLUE=%s declined on a "
+                "dq-split call (%s); stock int glue for such calls", raw, why)
+    return why
+
+
 # vf3p guard: the token is added only when 0 < qkv_scale <= this
 # bound (one host float compare per armed call).  It keeps the regions where
 # the reassociated chain can differ from the default by more than one e4m3
@@ -731,10 +774,107 @@ def _dq_split_opt() -> dict:
 _VF3P_QKV_SCALE_MAX = 0.25
 
 
+# vf4 range guard on alpha*qkv_scale (on top of vf3p's guard):
+# keeps the kernel's runtime 2**round(log2(alpha*s)) and the cast and undo
+# scales it derives normal f32 (|ka| <= 50; the kernel asserts
+# |log2 mu2_ssc| <= 50, the launcher checks it first).
+_VF4_ALPHA_S_MIN = 2.0 ** -50
+_VF4_ALPHA_S_MAX = 2.0 ** 50
+
+
+def _vf4_kernel_ka(alpha: float, qkv_scale: float) -> int:
+    """The ka the vf4 kernel computes (hstu_bwd_dkdv._vf4_cast_scale), on
+    the host: cx = f32(f32(alpha) * f32(qkv_scale)) (the f32 product of two
+    f32 values is exact in a double, so one rounding to f32 is IEEE f32
+    multiplication), then the exponent of cx plus 1 when its mantissa is >=
+    sqrt(2) (fraction field >= 0x3504F4), which is round(log2(cx)) for every
+    positive normal f32 cx (no f32 ties exist); except that for alpha a
+    half-integer power of two (f32 fraction 0x3504F3/0x3504F4) and qkv_scale
+    a power of two, an exact tie of round(log2(alpha*qkv_scale)), ka is the
+    even neighbour (Python round).  For the arming log line and tests only;
+    the kernel does not read it."""
+    import struct
+
+    def bits(x: float) -> int:
+        return struct.unpack("<I", struct.pack("<f", float(x)))[0]
+
+    def f32(x: float) -> float:
+        return struct.unpack("<f", struct.pack("<f", float(x)))[0]
+
+    b = bits(f32(f32(alpha) * f32(qkv_scale)))
+    if (bits(alpha) & 0x7FFFFF) in (0x3504F3, 0x3504F4) \
+            and bits(qkv_scale) & 0x7FFFFF == 0:
+        return (((b | 0x800000) & 0x7F800000) >> 23) - 127
+    return (((b + 0x4AFB0C) & 0x7F800000) >> 23) - 127
+
+
+def _bwd_vf4_tokens(vs: set, config: dict, alpha: float,
+                    qkv_scale: Optional[float]) -> set:
+    """vf4 ($DLRM_HSTU_FP8_BWD_VF4, read per call; code
+    default OFF, the gin binding is True: DECLARED PRECISION CHANGE, a
+    pre-set "0" is the kill switch): add the VALU token "vf4" (vf3p minus
+    the x' multiply: silu' = qk*r = silu/(alpha*s), 6 pk ops per element
+    pair; dS ulp-level vs vf3p, silu re-rounded on a shifted e4m3 grid).
+    The token
+    "vf4" in $DLRM_HSTU_FP8_BWD_VALU arms it too (the guard still
+    applies).  Needs vf3p and msat in the effective set, the f8b=all k128 path,
+    0 < qkv_scale <= _VF3P_QKV_SCALE_MAX, _VF4_ALPHA_S_MIN <= alpha*qkv_scale
+    <= _VF4_ALPHA_S_MAX and |log2 mu2_ssc| <= 50 (host float compares); a
+    call that cannot take it runs without vf4 and logs one "ignored" line
+    per reason.  The kernel re-centres the silu' e4m3 cast scale by
+    sc = 2**round(log2(alpha*s)) from the RUNTIME qkv_scale it already
+    receives (vf2's recipe: cvt_scalef32's scale field is E8M0, pow2 only)
+    and its dv epilogue multiplies by 1/(mu2_ssc*sc*mu2_osc)*(alpha*s), so
+    the residual alpha*s/sc in [2**-0.5, 2**0.5] is applied exactly in f32.
+    config is NOT changed: the token is the only compile-key change, one
+    build for every qkv_scale."""
+    raw = os.environ.get("DLRM_HSTU_FP8_BWD_VF4", "").strip().lower()
+    want = raw in ("1", "true", "on", "yes") or "vf4" in vs
+    vs = set(vs) - {"vf4"}
+    if not want:
+        return vs
+    if "vf3p" not in vs:
+        why = "needs vf3p in the effective VALU set (valu=%s)" % (
+            ",".join(sorted(vs)) or "<none>")
+    elif "msat" not in vs:
+        why = "needs VALU msat (valu=%s)" % ",".join(sorted(vs))
+    elif config.get("f8b") != "all" or config.get("mu2") != "k128":
+        why = "needs the f8b=all mu2=k128 path"
+    elif not (qkv_scale is not None
+              and 0.0 < float(qkv_scale) <= _VF3P_QKV_SCALE_MAX):
+        why = "qkv_scale outside 0 < qkv_scale <= %g" % _VF3P_QKV_SCALE_MAX
+    elif not (_VF4_ALPHA_S_MIN <= float(alpha) * float(qkv_scale)
+              <= _VF4_ALPHA_S_MAX):
+        why = "alpha*qkv_scale outside 2^-50..2^50"
+    elif abs(math.frexp(float(config["mu2_ssc"]))[1] - 1) > 50:
+        why = "mu2_ssc outside 2^-50..2^50"
+    else:
+        vs = vs | {"vf4"}
+        if ("vf4", ",".join(sorted(vs))) not in _logged_layouts:
+            _logged_layouts.add(("vf4", ",".join(sorted(vs))))
+            ka = _vf4_kernel_ka(alpha, qkv_scale)
+            logger.warning(
+                "[hstu-attn] DLRM_HSTU_FP8_BWD_VF4=%s armed: bwd_dkdv VALU "
+                "token vf4 added (valu=%s); silu e4m3 cast scale re-centred "
+                "in the kernel by 2^round(log2(alpha*qkv_scale)) from the "
+                "runtime qkv_scale, one build for every qkv_scale (first "
+                "call: qkv_scale=%.6g ka=%d, cast scale 2^%d)",
+                raw or "token", ",".join(sorted(vs)), float(qkv_scale), ka,
+                int(math.frexp(float(config["mu2_ssc"]))[1] - 1) + ka)
+        return vs
+    if ("vf4_ignored", why) not in _logged_layouts:
+        _logged_layouts.add(("vf4_ignored", why))
+        logger.warning(
+            "[hstu-attn] DLRM_HSTU_FP8_BWD_VF4=%s ignored: %s", raw or "token",
+            why)
+    return vs
+
+
 def _bwd_vf3p_tokens(vs: set, off_reason: str = "",
                      qkv_scale: Optional[float] = None) -> set:
-    """$DLRM_HSTU_FP8_BWD_VF3P (read per call; code default OFF, gin binding
-    False, a pre-set "0" is the kill switch): add the VALU token "vf3p" (compile_hstu_bwd_dkdv(
+    """$DLRM_HSTU_FP8_BWD_VF3P (read per call; code default
+    OFF, the gin binding is True, a pre-set "0" is
+    the kill switch): add the VALU token "vf3p" (compile_hstu_bwd_dkdv(
     valu=): the act chain by f32 reassociation at the default cast scales)
     to the effective token set of a dq-split call.  It needs "ilp", excludes
     vf/vf2/h16/vf3/vf3s and needs 0 < qkv_scale <= _VF3P_QKV_SCALE_MAX (no
@@ -771,6 +911,105 @@ def _bwd_vf3p_tokens(vs: set, off_reason: str = "",
             "[hstu-attn] DLRM_HSTU_FP8_BWD_VF3P=%s ignored: %s; default act "
             "chain", raw, why)
     return vs
+
+
+# ---------------------------------------------------------------------------
+# dO8 hook (hstu_do8_registry). The C8 do_blk predicate is
+# shared by the backward branch in flydsl_hstu_attention_bwd and by
+# c8_do_blk_planned, the attention forward's dO8 site gate, so the two
+# cannot drift apart.
+
+
+def _c8_blk_ok(config, heads, dim) -> bool:
+    """do_blk's K-block <-> token-group identity needs BM=64 and BN % 128 == 0
+    (kernel assert), and quantize_do_e4m3_blk needs power-of-two H and H*D."""
+    return (int(config.get("BM", 64)) == 64
+            and int(config.get("BN", 128)) % 128 == 0
+            and heads > 0 and heads & (heads - 1) == 0
+            and (heads * dim) & (heads * dim - 1) == 0)
+
+
+def _c8_do_blk_selected(f8b_full, fp8_mfma, input_fp8, q_bf16, config,
+                        blk_ok) -> bool:
+    """The C8 branch condition of flydsl_hstu_attention_bwd: the full-fp8
+    backward with the block-scaled e4m3 dO of quantize_do_e4m3_blk."""
+    return bool(f8b_full and fp8_mfma == "k128" and input_fp8 and not q_bf16
+                and config.get("fused") and config.get("dq16") == "bf16p"
+                and blk_ok)
+
+
+def _targets_max_known(num_targets) -> bool:
+    """True when _max_num_targets(num_targets) answers from its memo, i.e.
+    without a device-to-host sync."""
+    cached, version, _ = _targets_max_memo
+    return cached is num_targets and version == num_targets._version
+
+
+def c8_do_blk_planned(
+    *, q, k, v, out, num_targets, max_attn_len, contextual_seq_len,
+    num_softmax_heads: int = 0, qkv_scale: float = 1.0,
+) -> bool:
+    """Will this attention call's FlyDSL backward quantize dO on the C8 do_blk
+    path? The forward-time gate of the dO8 site (hstu_do8_registry).
+
+    The backward's own predicates through the backward's own functions, on the
+    forward's q/k/v (the backward reloads or recomputes exactly these e4m3
+    tensors) with `out` standing in for dout (autograd hands the backward a
+    gradient of out's dtype and shape):
+      try_flydsl_attention_bwd: flydsl_selected(); a usable host
+        (unsupported_hardware_reason() / _load_kernel(), never raising here);
+        unsupported_shape_reason(q, k, v, out, num_targets, ...);
+      flydsl_hstu_attention_bwd: bwd_full_fp8_enabled() and
+        check_removed_c8_knobs(); e4m3 q AND k (input_fp8 and not q_bf16);
+        qkv_scale > 0; fp8_mfma == "k128" (bwd_qk_mfma_mode() fp8 or
+        fp8_strict); _c8_do_blk_selected(...) on kernel.SHIPPED with
+        _c8_blk_ok(...).
+    It never syncs: a num_targets max that is not memoized yet answers False
+    (no site; the backward runs the quantizer). The full-length layer only:
+    q/k/v/out must share the token count (the targets-only Function, with its
+    compact q, never calls this and never reaches this backward). The
+    DLRM_HSTU_FP8_BWD_FULL_HYBRID diagnostic answers False (it runs both
+    kernels). Known only in the backward, and caught there by
+    hstu_do8_registry.take() / discard() with a counter: env changes between
+    forward and backward, and a dO that is not the producer's dx (autograd
+    accumulation, a hook, a non-contiguous gradient). Any exception: False.
+    """
+    try:
+        if not flydsl_selected() or not bwd_full_fp8_enabled():
+            return False
+        if os.environ.get("DLRM_HSTU_FP8_BWD_FULL_HYBRID", ""):
+            return False
+        check_removed_c8_knobs()
+        if not _host_ok and (unsupported_hardware_reason() is not None
+                             or _load_kernel() is None):
+            return False
+        kernel = _load_kernel()
+        if kernel is None:
+            return False
+        input_fp8 = FP8_E4M3 is not None and k.dtype is FP8_E4M3
+        q_bf16 = input_fp8 and q.dtype is torch.bfloat16
+        if not input_fp8 or q_bf16 or not (qkv_scale > 0.0):
+            return False
+        if (out is None or out.dtype is not torch.bfloat16 or out.dim() != 3
+                or tuple(out.shape) != tuple(v.shape)
+                or not (q.shape[0] == k.shape[0] == v.shape[0]
+                        == out.shape[0])):
+            return False
+        if num_targets is not None and not _targets_max_known(num_targets):
+            return False
+        if unsupported_shape_reason(
+            q, k, v, out, num_targets, max_attn_len, contextual_seq_len,
+            num_softmax_heads,
+        ) is not None:
+            return False
+        fp8_mfma = ("k128" if bwd_qk_mfma_mode() in ("fp8", "fp8_strict")
+                    else "")
+        config = kernel.SHIPPED
+        heads, dim = q.shape[1], q.shape[2]
+        return _c8_do_blk_selected(True, fp8_mfma, input_fp8, q_bf16, config,
+                                   _c8_blk_ok(config, heads, dim))
+    except Exception:  # noqa: BLE001 - a site gate never breaks a forward
+        return False
 
 
 def flydsl_hstu_attention_bwd(
@@ -881,8 +1120,8 @@ def flydsl_hstu_attention_bwd(
         rs_q = rs_in
     # dq split ($DLRM_HSTU_FP8_BWD_DQ_SPLIT=1, default OFF): dq is computed
     # by hstu_dq_split from a stored e4m3 ds workspace with plain stores, so
-    # the zero-fill below is deferred until the full-fp8 path is known not to
-    # take it.  Unset = dq is zeroed here.
+    # the zero-fill below is deferred until the C8 path is known not to take
+    # it.  Unset = dq is zeroed here.
     _dqs_req = os.environ.get("DLRM_HSTU_FP8_BWD_DQ_SPLIT", "").strip().lower() \
         in ("1", "true", "on", "yes")
     if rs_out is None:
@@ -961,13 +1200,10 @@ def flydsl_hstu_attention_bwd(
         check_removed_c8_knobs()
     # do_blk's K-block <-> token-group identity needs BM=64 and BN % 128 == 0
     # (kernel assert), and quantize_do_e4m3_blk needs power-of-two H and H*D.
-    _blk_ok = (int(config.get("BM", 64)) == 64
-               and int(config.get("BN", 128)) % 128 == 0
-               and heads > 0 and heads & (heads - 1) == 0
-               and (heads * dim) & (heads * dim - 1) == 0)
-    if f8b_full and fp8_mfma == "k128" and input_fp8 and not q_bf16 \
-            and config.get("fused") and config.get("dq16") == "bf16p" \
-            and _blk_ok:
+    # The same predicates, shared with c8_do_blk_planned.
+    _blk_ok = _c8_blk_ok(config, heads, dim)
+    if _c8_do_blk_selected(f8b_full, fp8_mfma, input_fp8, q_bf16, config,
+                           _blk_ok):
         # silu and ds both carry the kernel's 1/N, so their e4m3 pre-scales
         # are N-RELATIVE: 2**(K + ceil(log2 N)) puts silu*N (resp. ds*N with
         # normalized dO) times 2**K..2**(K+1) on the e4m3 grid, and only one
@@ -1001,7 +1237,17 @@ def flydsl_hstu_attention_bwd(
         # One pow2 dO scale per (sequence, head, MX token group); do_scale is
         # E8 [T, H] uint8 (127 - e_g), undone inside the kernel's out-gemm
         # MFMAs (no epilogue rescale).
-        dout, do_scale = quantize_do_e4m3_blk(dout, seq_offsets, N)
+        # dO8 hook (hstu_do8_registry): when the d(attn) producer
+        # already emitted these exact bytes for this dO (a record bound to
+        # dout, every check passing) they are taken; otherwise -- no record,
+        # a failed check, the knob off, a second take -- the quantizer runs.
+        # dout_orig stays the bf16 dO.
+        _do8 = hstu_do8_registry.take(dout, seq_offsets, N)
+        if _do8 is None:
+            dout, do_scale = quantize_do_e4m3_blk(dout, seq_offsets, N)
+        else:
+            dout, do_scale = _do8
+        _do8 = None
     elif f8b_full:
         # Two once-keys: the expected calibration-step skips (bf16 q/k) must
         # not hide a later block-dO shape fallback, which silently drops a
@@ -1018,6 +1264,10 @@ def flydsl_hstu_attention_bwd(
                 fp8_mfma or "bf16", input_fp8, q_bf16, _blk_ok, heads, dim,
                 config.get("BM", 64), config.get("BN", 128),
             )
+    if do_scale is None:
+        # No C8 dO quantization on this call, so a pending dO8
+        # record bound to dout is released here, not pinned.
+        hstu_do8_registry.discard(dout, "not_c8")
     # silu/grad-coefficient epilogue form.
     # $DLRM_HSTU_FP8_BWD_EPILOGUE = legacy (default when absent) | reuse
     # (gin: apply_env_bootstrap.DLRM_HSTU_FP8_BWD_EPILOGUE).
@@ -1094,7 +1344,7 @@ def flydsl_hstu_attention_bwd(
             if _t in ("1", "on", "true", "yes"):
                 _vs |= {"undef", "rfl"}
             elif _t in ("undef", "rfl", "ilp", "nobr", "h16", "vf", "vf2",
-                        "msat", "vf3", "vf3s", "vf3p"):
+                        "msat", "vf3", "vf3s", "vf3p", "vf4"):
                 _vs.add(_t)
             elif _t:
                 raise ValueError(
@@ -1114,6 +1364,10 @@ def flydsl_hstu_attention_bwd(
             _vs.discard("vf2")
         # DLRM_HSTU_FP8_BWD_VF3P (guard 0 < qkv_scale <= 0.25)
         _vs = _bwd_vf3p_tokens(_vs, qkv_scale=qkv_scale)
+        # DLRM_HSTU_FP8_BWD_VF4 (code default OFF, declared
+        # precision change; config unchanged: the kernel re-centres the
+        # silu' cast scale from the runtime qkv_scale).
+        _vs = _bwd_vf4_tokens(_vs, config, alpha, qkv_scale)
         if _vs:
             config["valu"] = ",".join(sorted(_vs))
         if ("valu", config.get("valu")) not in _logged_layouts:
@@ -1257,8 +1511,11 @@ def flydsl_hstu_attention_bwd(
         )
 
     # The kernel reads seq_offsets through a 32-bit buffer descriptor;
-    # production carries it as int64.
-    cu = seq_offsets.to(torch.int32)
+    # production carries it as int64.  With DLRM_HSTU_FP8_ATTN_INTGLUE=1 a
+    # dq-split call gets cu from hstu_dq_split.build_workspace_intglue below.
+    _intglue = bool(config.get("dqsplit")) and \
+        _attn_intglue_reason(seq_offsets) is None
+    cu = None if _intglue else seq_offsets.to(torch.int32)
     batch = seq_offsets.numel() - 1
     # N, not seq_offsets.diff().max(): the caller's max_seq_len already bounds
     # every sequence, and reading the real max costs a device-to-host sync in
@@ -1286,7 +1543,14 @@ def flydsl_hstu_attention_bwd(
                 " > 65408 (511 blocks of 128); the +2^31 ws store-drop offset"
                 " would wrap. Remove dz/dzr from MSPLIT_SCHED for this N.")
         from generative_recommenders.ops.flydsl import hstu_dq_split
-        ws = hstu_dq_split.build_workspace(seq_offsets, heads, q.shape[0], N)
+        if _intglue:
+            ws, cu = hstu_dq_split.build_workspace_intglue(
+                seq_offsets, heads, q.shape[0], N,
+                check=os.environ.get("DLRM_HSTU_FP8_ATTN_INTGLUE_CHECK",
+                                     "").strip() == "1")
+        else:
+            ws = hstu_dq_split.build_workspace(seq_offsets, heads, q.shape[0],
+                                               N)
         dq_slot = ws.view(torch.bfloat16)
         if "dq_split" not in _logged_layouts:
             _logged_layouts.add("dq_split")
@@ -1397,6 +1661,7 @@ def try_flydsl_attention_bwd(
     Layouts that cannot share one row stride still take the copy path.
     """
     if not flydsl_enabled():
+        hstu_do8_registry.discard(dout, "flydsl_not_selected")
         if dkdv_fp8_sink is not None:
             dkdv_fp8_sink.declined = "FlyDSL backward not selected"
         return False
@@ -1406,6 +1671,7 @@ def try_flydsl_attention_bwd(
     )
     if reason is not None:
         _log_shape_fallback(reason)
+        hstu_do8_registry.discard(dout, "shape_fallback")
         if dkdv_fp8_sink is not None:
             dkdv_fp8_sink.declined = f"FlyDSL shape fallback: {reason}"
         return False

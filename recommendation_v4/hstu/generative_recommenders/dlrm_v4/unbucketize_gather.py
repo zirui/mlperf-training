@@ -27,6 +27,16 @@ stock path if it fails. Switch: ``DLRM_HSTU_FP8_UNBUCKETIZE_GATHER`` (absent =
 off in code; the yambda_5b.gin ``apply_env_bootstrap`` binding turns it on;
 ``=0`` opts out; read once, at ``install()`` time). The ``DLRM_HSTU_FP8_``
 prefix is forwarded by the launcher.
+
+Fused receive hand-off (``seq_a2a_rowperm.py``, switch
+``DLRM_HSTU_FP8_SEQ_A2A_FUSED_RECV`` under ``DLRM_HSTU_FP8_SEQ_A2A_FUSED``):
+when that path is installed and on, and the awaitable is a ``comm_ops.Request``
+whose wait is the patched ``All2All_Seq_Req_Wait`` (never a ``NoWait``), the
+permutation is parked on the Request instead of being applied by the callback
+below. The patched wait then applies it on every branch, reproducing this
+module's decision (``_unbucketize``) exactly, and the awaitable only checks that
+it was consumed (and raises if not, instead of returning misordered rows).
+Otherwise the callback below runs.
 """
 
 import logging
@@ -43,7 +53,11 @@ _MODE_ENV = "DLRM_HSTU_FP8_UNBUCKETIZE_BWD_MODE"
 _MODES = ("scatter", "gather")
 
 _installed = False
+_orig_init: Any = None
 _state = {"verify_left": None, "disabled": False, "announced": False, "mode": None}
+# Set by seq_a2a_rowperm when its fused receive path is installed:
+# (tensor_awaitable, perm, embedding_dim) -> hand-off object or None.
+_RECV_HOOK: Any = None
 
 # Grow-only constant index buffer (0..n-1), one per (device, dtype). This is a
 # constant, not a cached model result: slicing it is equivalent to arange(n).
@@ -130,9 +144,23 @@ def _bijective(perm: torch.Tensor, rows: int) -> bool:
     return True
 
 
+def _announce(rows: int, embedding_dim: int) -> None:
+    if not _state["announced"]:
+        _state["announced"] = True
+        logger.info(
+            "DLRMV4 armed OK: unbucketize gather: row-wise unbucketize backward = "
+            "%s (rows=%d, dim=%d)",
+            _mode(),
+            rows,
+            embedding_dim,
+        )
+
+
 def _unbucketize(
     ret: torch.Tensor, perm: torch.Tensor, embedding_dim: int
 ) -> torch.Tensor:
+    # seq_a2a_rowperm._ubg_decision mirrors this decision for the fused receive
+    # path; keep the two in step.
     x = ret.view(-1, embedding_dim)
     if (
         _state["disabled"]
@@ -141,21 +169,23 @@ def _unbucketize(
         or not _bijective(perm, x.size(0))
     ):
         return torch.index_select(x, 0, perm)
-    if not _state["announced"]:
-        _state["announced"] = True
-        logger.info(
-            "DLRMV4 armed OK: unbucketize gather: row-wise unbucketize backward = "
-            "%s (rows=%d, dim=%d)",
-            _mode(),
-            x.size(0),
-            embedding_dim,
-        )
+    _announce(x.size(0), embedding_dim)
     return _PermuteRows.apply(x, perm)
+
+
+def _check_consumed(ret: Any, handoff: Any) -> Any:
+    if not handoff.consumed:
+        raise RuntimeError(
+            "DLRMV4 unbucketize gather: the row-wise unbucketize permutation handed to "
+            "the fused seq a2a wait was not applied (the rows would be misordered); "
+            "DLRM_HSTU_FP8_SEQ_A2A_FUSED_RECV=0 runs the stock path"
+        )
+    return ret
 
 
 def install() -> None:
     """Replace the stock unbucketize callback (idempotent)."""
-    global _installed
+    global _installed, _orig_init
     if _installed or not enabled():
         return
     try:
@@ -164,6 +194,7 @@ def install() -> None:
         return
     cls = dist_data.SequenceEmbeddingsAwaitable
     orig_init = cls.__init__
+    _orig_init = orig_init
 
     def __init__(
         self: Any,
@@ -174,9 +205,18 @@ def install() -> None:
         orig_init(self, tensor_awaitable, None, embedding_dim)
         if unbucketize_permute_tensor is not None:
             perm = unbucketize_permute_tensor
-            self.callbacks.append(
-                lambda ret: _unbucketize(ret, perm, embedding_dim)
+            hook = _RECV_HOOK
+            handoff = (
+                hook(tensor_awaitable, perm, embedding_dim)
+                if hook is not None and not _state["disabled"]
+                else None
             )
+            if handoff is not None:  # the patched wait applies perm
+                self.callbacks.append(lambda ret: _check_consumed(ret, handoff))
+            else:
+                self.callbacks.append(
+                    lambda ret: _unbucketize(ret, perm, embedding_dim)
+                )
 
     cls.__init__ = __init__
     _installed = True
@@ -184,3 +224,14 @@ def install() -> None:
         "DLRMV4 unbucketize gather: SequenceEmbeddingsAwaitable patched (bwd=%s)",
         _mode(),
     )
+
+
+def _uninstall_for_tests() -> None:
+    """Restore the stock SequenceEmbeddingsAwaitable.__init__ (unit tests only)."""
+    global _installed
+    if not _installed:
+        return
+    from torchrec.distributed import dist_data
+
+    dist_data.SequenceEmbeddingsAwaitable.__init__ = _orig_init
+    _installed = False

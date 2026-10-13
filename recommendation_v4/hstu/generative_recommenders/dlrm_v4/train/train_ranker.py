@@ -408,6 +408,37 @@ def _main_func(
     # RUN_START as the compliance proof). Initialization only, like the prebuild.
     from generative_recommenders.dlrm_v4.train import dl_prestart as _dlstart
 
+    def _b1pp_first_use_warmup() -> None:
+        # b1pp first-use warmup (dlrm_v4/b1pp.py): compiles the Triton
+        # kernels of the b1pp parts that are switched on (DLRM_HSTU_FP8_KJT_RECAT_FUSED /
+        # _TBE_REBAG / _TBE_BOUNDS_TRITON) and the fused seq-a2a K1-K4
+        # (DLRM_HSTU_FP8_SEQ_A2A_FUSED) of this rank's sequence all-to-alls
+        # (D, local features and world size read from the sharded model; the
+        # per-rank batch sizes below) on synthetic tensors, in the untimed
+        # initialization phase like the FP8 warmup. No data, no RNG, no
+        # collective, no model/optimizer state written. A no-op when every
+        # part is off, and once it has run. Logs "armed OK: [b1pp-warmup]". An
+        # ordinary failure is logged and that part runs stock; a sticky device
+        # fault (a failed synchronize: the HIP context is unusable) RAISES
+        # here, before RUN_START, as the BLAS warmup and the startup preload do.
+        try:
+            from generative_recommenders.dlrm_v4 import b1pp as _b1pp
+        except Exception as _b1pp_err:  # noqa: BLE001 -- an import failure must not kill the run
+            logger.warning(
+                "DLRMV4 b1pp [b1pp-warmup] skipped: %s: %s",
+                type(_b1pp_err).__name__,
+                _b1pp_err,
+            )
+            return
+        _b1pp.run_first_use_warmup(
+            device,
+            model=model,
+            batch_sizes=(
+                getattr(train_dataloader, "batch_size", None),
+                getattr(test_dataloader, "batch_size", None),
+            ),
+        )
+
     if mode == "streaming-train-eval":
         from generative_recommenders.dlrm_v4.train.utils import (
             prestart_streaming_loaders,
@@ -433,12 +464,22 @@ def _main_func(
             batch_size=train_dataloader.batch_size,
             prestarted=bool(_prestarted),
         )
+        # b1pp first-use warmup, here so that, like the FP8 warmup above, its
+        # compile garbage is collected and its objects are frozen by the startup
+        # preload's gc.freeze below (the in-loop full GC at the first window
+        # then does not walk them inside the timed region).
+        _b1pp_first_use_warmup()
         # Startup preload (gin run_startup_preload.enabled = $BLAS_WARMUP):
         # FlyDSL kernel-module import, the JIT build of the WLN_BWD_FLYDSL FlyDSL
         # LayerNorm-backward kernels on synthetic zero/one tensors, and one
         # gc.collect()/freeze(), AFTER every pool above is forked.
         # Initialization only: no data, no RNG, no training state.
         run_startup_preload(prestarted=bool(_prestarted))
+
+    # b1pp first-use warmup for the other modes (a no-op when it already ran in
+    # the streaming block above); before the pre-grow so it sees the final free
+    # memory.
+    _b1pp_first_use_warmup()
 
     # Caching-allocator pre-grow (gin apply_env_bootstrap.DLRM_HSTU_FP8_ALLOC_PREGROW,
     # default on; opt out with DLRM_HSTU_FP8_ALLOC_PREGROW=0). Maps the train
@@ -448,6 +489,28 @@ def _main_func(
     from generative_recommenders.dlrm_v4 import alloc_pregrow as _alloc_pregrow
 
     _alloc_pregrow.pregrow_before_run_start()
+
+    # Targeted HIP code-object preload (gin apply_env_bootstrap.
+    # DLRM_HSTU_FP8_HIP_PRELOAD: yambda_5b.gin binds it ON; code default
+    # unset = off; opt out with DLRM_HSTU_FP8_HIP_PRELOAD=0, a pre-set env var
+    # wins over gin; dlrm_v4/train/hip_preload.py). Reads the env that the
+    # Phase-1 env bootstrap at the top of this function wrote. ROCm
+    # 7.2.1 loads libtorch_hip/fbgemm kernels lazily: the first launch of each
+    # translation unit pays its fat-binary digest + code-object load, and
+    # step 1 (with its once-per-process checks) launches many such TUs for the
+    # first time. hipFuncGetAttributes on one host stub per TU of the checked-in table
+    # (hip_preload_table.jsonl) does that load here instead. Initialization only
+    # (MLPerf training_rules L545-549, library init before the clock touches no
+    # dataset): no kernel launch, no tensor, RNG, model or optimizer state. Here,
+    # after setup()'s set_device, the imports, every warmup and the allocator
+    # pre-grow (which therefore sizes its pools exactly as without the preload),
+    # on every rank. Fail-open per entry, never raises; arming line on rank 0
+    # "armed OK: [hip-preload] ...".
+    from generative_recommenders.dlrm_v4.train import hip_preload as _hip_preload
+
+    _hip_preload.preload_from_env(
+        rank=rank, world_size=world_size, local_world_size=gpus_per_node
+    )
 
     # TSPEC globals guard, last check before the clock starts (so it never runs
     # inside the timed region; mark_run_start below is only a timestamp). No-op
@@ -576,6 +639,24 @@ def _main_func(
                 cleanup()
             except Exception:
                 logger.info("teardown destroy_process_group failed (non-fatal)")
+    # Clean exit ($DL_TEARDOWN_HARD_EXIT, default on; dlrm_v4/train/
+    # clean_exit.py). Reached only when the try above completed: after the
+    # loop (RUN_STOP), the pool close, the barrier and destroy_process_group.
+    # An exception never gets here, so a failure keeps its traceback and
+    # nonzero exit code. Runs the trainer's exit hooks, SIGKILLs the rank's
+    # remaining DataLoader workers (the normal exit terminates and joins
+    # them), flushes the logs and calls os._exit(0), so no daemon thread
+    # (pool-close helper, pin thread) can be inside torch while the
+    # interpreter finalizes (SIGABRT at exit); a TunableOp tuning session
+    # keeps the normal exit (clean_exit.py). streaming-train-eval only: the
+    # mode with the persistent pinned pools. 0 keeps the interpreter exit.
+    if mode == "streaming-train-eval":
+        from generative_recommenders.dlrm_v4.train import clean_exit as _clean_exit
+
+        if _clean_exit.enabled():
+            _clean_exit.hard_exit(rank, log=logger.warning)
+        elif rank == 0:
+            logger.warning(_clean_exit.OFF_LINE)
 
 
 def get_args():  # pyre-ignore [3]

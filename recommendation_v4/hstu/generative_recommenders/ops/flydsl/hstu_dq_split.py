@@ -1,16 +1,16 @@
-"""dq for the full-FP8 attention backward without atomics.
+"""dq for the full-FP8 (C8) attention backward without atomics.
 
 Default OFF ($DLRM_HSTU_FP8_BWD_DQ_SPLIT=1 arms it; see hstu_flydsl_mha).
 
-The fused full-FP8 kernel (hstu_bwd_dkdv, dqsplit=True) skips its dq MFMA and the
+The fused C8 kernel (hstu_bwd_dkdv, dqsplit=True) skips its dq MFMA and the
 bf16p dq atomics and instead stores each workgroup's e4m3 ds tile -- the exact
 A fragments the dq MFMA would have consumed -- into a workspace.  This module
 owns the workspace layout and the dq kernel that consumes it:
 
     dq[m, h, :] = sc * 2**(E8[m, h] - 127) * sum_n ds8[m, n] * k8[n, h, :]
 
-with f32 accumulation over ALL n (the non-split kernel accumulates
-per-n-block partials in bf16 through atomics), one plain bf16 store per row, and no dq
+with f32 accumulation over ALL n (the non-split kernel accumulates per-n-block
+partials in bf16 through atomics), one plain bf16 store per row, and no dq
 zero-fill.  Same products, same scales; deterministic.
 
 Workspace (uint8):
@@ -426,3 +426,121 @@ def dq_from_ds(ws: torch.Tensor, k: torch.Tensor, e8: torch.Tensor,
         H=H, D=D, BMQ=int(bmq), FP8_DOT=bool(fp8_dot), STAGES=int(stages),
         NBLK=int(nblk), XCD=int(order == "xcd"),
         num_warps=int(num_warps), **launch_kw)
+
+
+# ---------------------------------------------------------------------------
+# intglue ($DLRM_HSTU_FP8_ATTN_INTGLUE=1; code default OFF -- the
+# launcher in hstu_flydsl_mha reads the switch per call and, when it is off,
+# runs the stock `seq_offsets.to(torch.int32)` + build_workspace above).
+# Index bookkeeping, not model math: the same int32 values, bitwise.
+#
+# Stock, every dq-split attention-backward call runs the launcher's
+#     cu = seq_offsets.to(torch.int32)
+# and build_workspace's header as 10 tiny torch kernels back to back on the
+# main stream (to, sub, add, floor_divide, fill, mul, add, mul, cumsum,
+# copy).  build_workspace_intglue
+# returns the same (ws, cu) with ONE launch (_intglue_kernel) per call.  No
+# memo and no state: every call recomputes both from its own seq_offsets.
+#
+# Bitwise: all integer arithmetic.  The kernel widens the offsets to int64
+# (as .to(torch.int64) does), takes the int64 difference, floors
+# (d + 127) / 128 with an arithmetic shift (== torch.floor_divide for every
+# int64, negatives included; Triton's // on signed ints truncates toward
+# zero, so it is NOT used), forms heads * nb * (nb + 1) and the prefix sum in
+# wrapping int64 -- wrapping + and * are associative and commutative, so
+# neither the scan order nor the product order can change a bit -- and
+# truncates to int32 as copy_ / .to(torch.int32) do.  The prefix is written
+# as an exclusive scan over i = 0..B (pre[i] = sum_{c < i} t_c): pre[0] = 0
+# and the stock inclusive cumsum at pre[1 + b].
+# $DLRM_HSTU_FP8_ATTN_INTGLUE_CHECK=1 recomputes the stock values on every
+# call and raises on any difference (one host sync per call: debug only).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _intglue_kernel(so_ptr, so_stride, cu_ptr, pre_ptr, B, heads,
+                    BLOCK: tl.constexpr):
+    """One program, i = 0..B in chunks of BLOCK:
+    cu[i] = int32(so[i]);  pre[i] = int32(sum_{c < i} t_c)  (pre[0] = 0),
+    t_c = heads * nb_c * (nb_c + 1), nb_c = floor((so[c+1] - so[c] + 127) / 128),
+    all in wrapping int64 before the int32 truncation."""
+    carry = tl.zeros((1,), dtype=tl.int64)
+    for s in range(0, B + 1, BLOCK):
+        i = s + tl.arange(0, BLOCK)
+        mi = i <= B                      # cu / pre entries
+        m = i < B                        # sequences
+        a = tl.load(so_ptr + i * so_stride, mask=mi, other=0).to(tl.int64)
+        e = tl.load(so_ptr + (i + 1) * so_stride, mask=m,
+                    other=0).to(tl.int64)
+        tl.store(cu_ptr + i, a.to(tl.int32), mask=mi)
+        nb = (e - a + 127) >> 7          # arithmetic shift == floor(/128)
+        t = tl.where(m, heads * nb * (nb + 1), 0)
+        tl.store(pre_ptr + i, (tl.cumsum(t, 0) - t + carry).to(tl.int32),
+                 mask=mi)
+        carry += tl.sum(t, 0)
+
+
+def intglue_unsupported_reason(seq_offsets: torch.Tensor):
+    """None when build_workspace_intglue serves this seq_offsets, else why
+    not (the launcher then runs the stock torch ops)."""
+    if not seq_offsets.is_cuda:
+        return "seq_offsets is not on a GPU"
+    if seq_offsets.device.index != torch.cuda.current_device():
+        # The Triton launch goes to the current device; the stock torch ops
+        # would run on seq_offsets' device.
+        return (f"seq_offsets on {seq_offsets.device}, current device "
+                f"{torch.cuda.current_device()}")
+    if seq_offsets.dim() != 1 or seq_offsets.numel() < 1:
+        return f"seq_offsets shape {tuple(seq_offsets.shape)} (needs [B+1])"
+    if seq_offsets.dtype not in (torch.int64, torch.int32):
+        return f"seq_offsets dtype {seq_offsets.dtype} (int64/int32 only)"
+    if seq_offsets.dtype is torch.int32 and not seq_offsets.is_contiguous():
+        # Stock .to(torch.int32) hands this very (strided) view to the
+        # kernel; a packed copy would not be the same launch argument.
+        return "strided int32 seq_offsets"
+    return None
+
+
+def _intglue_stock(seq_offsets: torch.Tensor, heads: int,
+                   pre: torch.Tensor) -> torch.Tensor:
+    """The stock torch ops: header into pre, returns the int32 offsets."""
+    offs = seq_offsets.to(torch.int64)
+    nb = (offs[1:] - offs[:-1] + 127) // 128
+    pre[0].zero_()
+    pre[1:].copy_(torch.cumsum(heads * nb * (nb + 1), 0))
+    return seq_offsets.to(torch.int32)
+
+
+def build_workspace_intglue(seq_offsets: torch.Tensor, heads: int,
+                            total_tokens: int, N: int, *,
+                            check: bool = False):
+    """(ws, cu) == (build_workspace(seq_offsets, heads, total_tokens, N),
+    seq_offsets.to(torch.int32)), bitwise, in one launch.
+
+    seq_offsets must pass intglue_unsupported_reason.  Same workspace (same
+    _workspace call and size), same header values; cu is a fresh packed
+    int32 [B+1] tensor holding the values of seq_offsets.to(torch.int32).
+    """
+    B = seq_offsets.numel() - 1
+    nb_max = (int(N) + 127) // 128
+    sum_nb = (int(total_tokens) + 127 * B) // 128
+    tiles_bound = heads * (nb_max + 1) * sum_nb
+    hdr = ws_header_bytes(B)
+    ws = _workspace(hdr + tiles_bound * TILE_BYTES, seq_offsets.device)
+    pre = ws[: 4 * (B + 1)].view(torch.int32)
+    cu = torch.empty(B + 1, dtype=torch.int32, device=seq_offsets.device)
+    blk = min(4096, max(16, triton.next_power_of_2(B + 1)))
+    _intglue_kernel[(1,)](
+        seq_offsets, seq_offsets.stride(0), cu, pre, B, int(heads),
+        BLOCK=blk, num_warps=8 if blk >= 2048 else 4)
+    if check:
+        ref_pre = torch.empty(B + 1, dtype=torch.int32,
+                              device=seq_offsets.device)
+        ref_cu = _intglue_stock(seq_offsets, heads, ref_pre)
+        if not (torch.equal(ref_cu, cu) and torch.equal(ref_pre, pre)):
+            raise RuntimeError(
+                "[hstu-attn] DLRM_HSTU_FP8_ATTN_INTGLUE_CHECK: int glue "
+                f"differs from the stock ops (B={B} heads={heads} "
+                f"cu_equal={torch.equal(ref_cu, cu)} "
+                f"header_equal={torch.equal(ref_pre, pre)})")
+    return ws, cu

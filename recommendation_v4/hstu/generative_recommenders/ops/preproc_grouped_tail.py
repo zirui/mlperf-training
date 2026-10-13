@@ -103,6 +103,11 @@ run the E-M1 forward above statement for statement. E-M2's grouped backward
 the gate unset GroupedTail only asks preproc_fp8_l2.enabled() (a cached bool)
 once per forward and runs no E-M3a code (bitwise == the tree without E-M3a);
 the module itself is imported at the top of this file.
+With the action prefill (DLRM_HSTU_FP8_ACTION_PREFILL, modules/
+action_prefill.py) the action MLP arrives through head_prefilled: its plan
+slot (preproc_fp8_l2.prefilled_slot) is BF16 and carries the PrefilledLinear,
+so the FP8 node keeps ONE per-entry non-tensor argument (eps, plans, *flat)
+and x_k stays at ctx.needs_input_grad[2 + 5k].
 
 WHEN IT DECLINES. The shipped path runs and one WARNING is logged on a
 non-ROCm (non-HIP) build, or when F1 or
@@ -143,6 +148,7 @@ from generative_recommenders.ops.fused_linear_norm import (
 )
 from generative_recommenders.ops.layer_norm import LayerNorm, SwishLayerNorm
 from generative_recommenders.ops.triton import preproc_fp8_snr
+from generative_recommenders.ops.triton import triton_ec_dgrad_segreduce as _xs
 from generative_recommenders.ops.triton.triton_layer_norm import (
     compute_BLOCK_D,
     flydsl_ln_bwd_decline_reason,
@@ -159,6 +165,8 @@ from generative_recommenders.ops.triton.triton_preproc_tail_bwd import (
 from torch.fx._symbolic_trace import is_fx_tracing
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+_IX_ATTR: str = "_dlrmv4_ec_indexed_l1"  # ops/ec_indexed_l1.IX_ATTR (literal)
 
 ENV_VAR: str = "DLRM_HSTU_FP8_PREPROC_GROUPED_TAIL"
 # E-M2 sub-switches, read once per process. _BWD is consulted only when the
@@ -356,8 +364,8 @@ def _disable_bwd_flydsl(where: str, error: BaseException) -> None:
         f"{where}: {type(error).__name__}: {lines[0][:200] if lines else ''}"
     )
     logger.warning(
-        "[preproc-grouped-tail-bwd-flydsl] DISABLED (%s); the per-pair "
-        "FlyDSL ln_bwd runs instead rank=%d",
+        "[preproc-grouped-tail-bwd-flydsl] DISABLED (%s); the per-pair FlyDSL "
+        "LayerNorm backward (ln_bwd) runs instead rank=%d",
         _BWD_FLYDSL_BROKEN,
         _rank(),
         exc_info=error,
@@ -520,7 +528,7 @@ def _triton_grouped_guard_reason(
     return (
         "the per-pair LayerNorm backward would run "
         + "/".join(sorted(set(paths)))
-        + ", and the Triton grouped kernel is bitwise to the v2 launch only"
+        + ", and the Triton grouped kernel is bitwise to v2 only"
     )
 
 
@@ -581,6 +589,12 @@ def mlp_decline_reason(
             f"FusedLinearNormMLP._can_fuse declined (enabled={mlp._f1_enabled} "
             f"cuda={x.is_cuda} dim={x.dim()})"
         )
+    return _last_pair_reason(mlp, eps)
+
+
+def _last_pair_reason(mlp: FusedLinearNormMLP, eps: Optional[float]) -> Optional[str]:
+    """mlp_decline_reason's checks on the LAST (Linear, LayerNorm) pair only
+    (shared with GroupedTail.head_prefilled, whose head already ran)."""
     lin, norm = mlp._pairs()[-1]
     if not isinstance(norm, LayerNorm):
         return f"last norm is {type(norm).__name__}, not LayerNorm"
@@ -603,12 +617,21 @@ def mlp_decline_reason(
 def _run_head(mlp: FusedLinearNormMLP, x: torch.Tensor) -> torch.Tensor:
     """Every pair of `mlp` but the last, exactly as FusedLinearNormMLP.forward
     runs them (residual only ever goes to the last pair)."""
+    # Indexed-X (ops/ec_indexed_l1.py, default off): an EC placeholder is rebuilt into the exact member output
+    # (identity backward to the placeholder) BEFORE E-X2b's claim below; every pair then runs unchanged.
+    if isinstance(x, torch.Tensor) and getattr(x, _IX_ATTR, None) is not None:
+        from generative_recommenders.ops import ec_indexed_l1 as _ixp
+
+        x = _ixp.rebuild(x, "_run_head")
     if not mlp._f1_reported:
         # The shipped forward emits F1's "armed OK: fuse_linear_norm FUSED"
         # line from here; keep it, since every pair of this container is
         # still fused.
         mlp._report_once(True, x)
-    for lin, norm in mlp._pairs()[:-1]:
+    for i, (lin, norm) in enumerate(mlp._pairs()[:-1]):
+        # E-X2b: pair 0 may take x's EC dh port (None, None when off). A
+        # _complete_shipped re-run finds the port already claimed and declines.
+        rec, port = _xs.claim(x, lin.weight) if i == 0 else (None, None)
         x = _LinearNormFunction.apply(
             x,
             lin.weight,
@@ -618,6 +641,9 @@ def _run_head(mlp: FusedLinearNormMLP, x: torch.Tensor) -> torch.Tensor:
             norm._eps,
             isinstance(norm, SwishLayerNorm),
             None,
+            None,  # prefilled: never here
+            rec,
+            port,
         )
     return x
 
@@ -625,9 +651,13 @@ def _run_head(mlp: FusedLinearNormMLP, x: torch.Tensor) -> torch.Tensor:
 class _GroupedLinearLNTailFunction(torch.autograd.Function):
     """O = LN_{K-1}(x_{K-1} W^T + b) (+) ... (+) LN_0(x_0 W^T + b), K in {2, 3}.
 
-    Forward args: eps, then per MLP k the five tensors
-    (x_k, lin_w_k, lin_b_k, norm_w_k, norm_b_k), where x_k is the input of
-    that MLP's LAST Linear (the SwishLayerNorm output). (+) is F2's
+    Forward args: eps, then `prefilled` (None, or per MLP k a
+    modules/action_prefill.py PrefilledLinear or None: that k's casts + addmm
+    issued earlier, DLRM_HSTU_FP8_ACTION_PREFILL), then per MLP k the five
+    tensors (x_k, lin_w_k, lin_b_k, norm_w_k, norm_b_k), where x_k is the
+    input of that MLP's LAST Linear (the SwishLayerNorm output). Because eps
+    and prefilled come first, x_k's ctx.needs_input_grad slot is 2 + 5k.
+    (+) is F2's
     round-before-add. Gradients come back in the dtypes of the tensors passed
     in, as _LinearNormFunction returns them.
     """
@@ -637,12 +667,21 @@ class _GroupedLinearLNTailFunction(torch.autograd.Function):
     def forward(  # pyre-ignore[3]
         ctx,  # pyre-ignore[2]
         eps: float,
+        # pyre-ignore[2]: None, or per MLP k a modules/action_prefill.py
+        # PrefilledLinear (or None) holding that k's casts + addmm issued
+        # earlier (GroupedTail.head_prefilled)
+        prefilled,
         *flat: torch.Tensor,
     ) -> torch.Tensor:
         num_in = len(flat) // 5
         if num_in not in (2, 3) or len(flat) != 5 * num_in:
             raise ValueError(
                 f"grouped LN tail: need 2 or 3 x 5 tensors, got {len(flat)}"
+            )
+        if prefilled is not None and len(prefilled) != num_in:
+            raise ValueError(
+                f"grouped LN tail: {len(prefilled)} prefilled entries for "
+                f"{num_in} MLPs"
             )
         saved: List[torch.Tensor] = []
         hs: List[torch.Tensor] = []
@@ -656,15 +695,25 @@ class _GroupedLinearLNTailFunction(torch.autograd.Function):
             # AUTOCAST note there): cast HERE so the matmul runs at the shipped
             # precision and backward reuses the same cast tensors.
             x = x.contiguous()
-            dev = x.device.type
-            if torch.is_autocast_enabled(dev):
-                amp_dtype = torch.get_autocast_dtype(dev)
-                x_c = x.to(amp_dtype)
-                lin_w_c = lin_w.to(amp_dtype)
-                lin_b_c = lin_b.to(amp_dtype)
+            # DLRM_HSTU_FP8_ACTION_PREFILL: this k's casts + addmm may already
+            # have run (fused_linear_norm.linear_fwd, the same statements on the
+            # same operands under the same autocast state) inside the forward
+            # all-to-all window; reuse them. take() returns None on any
+            # mismatch -> computed here.
+            pf = None if prefilled is None else prefilled[k]
+            got = None if pf is None else pf.take(x, lin_w, lin_b)
+            if got is not None:
+                x_c, lin_w_c, lin_b_c, h = got
             else:
-                x_c, lin_w_c, lin_b_c = x, lin_w, lin_b
-            h = torch.addmm(lin_b_c, x_c, lin_w_c.t())
+                dev = x.device.type
+                if torch.is_autocast_enabled(dev):
+                    amp_dtype = torch.get_autocast_dtype(dev)
+                    x_c = x.to(amp_dtype)
+                    lin_w_c = lin_w.to(amp_dtype)
+                    lin_b_c = lin_b.to(amp_dtype)
+                else:
+                    x_c, lin_w_c, lin_b_c = x, lin_w, lin_b
+                h = torch.addmm(lin_b_c, x_c, lin_w_c.t())
             if k > 0 and (h.dtype != hs[0].dtype or h.shape != hs[0].shape):
                 # The shipped chain raises here too (_LinearNormFunction's
                 # residual dtype/shape check): it cannot type-promote.
@@ -806,7 +855,9 @@ class _GroupedLinearLNTailFunction(torch.autograd.Function):
                     BLOCK_D=ctx.block_ds[k],
                     is_swish=False,
                 )
-            n_x, n_w, n_b = needs[1 + 5 * k], needs[2 + 5 * k], needs[3 + 5 * k]
+            # needs_input_grad covers forward's (eps, prefilled, *flat): x_k is
+            # at 2 + 5k (eps and the non-tensor `prefilled` come first).
+            n_x, n_w, n_b = needs[2 + 5 * k], needs[3 + 5 * k], needs[4 + 5 * k]
             dx = dh @ lin_w if n_x else None
             dlin_w = dh.t() @ x if n_w else None
             dlin_b = dh_colsum if n_b else None
@@ -823,7 +874,8 @@ class _GroupedLinearLNTailFunction(torch.autograd.Function):
             # Drop this k's [N, 512] dh before the next k allocates its own:
             # otherwise two are live at once (+N x 1 KB at the backward peak).
             del dh, dx, dlin_w, dlin_b, dnorm_w, dnorm_b, dh_colsum
-        return (None, *grads)
+        # eps, prefilled (not tensors), then the five gradients per MLP.
+        return (None, None, *grads)
 
 
 class GroupedTail:
@@ -845,15 +897,20 @@ class GroupedTail:
         self._device: torch.device = device
         self._mlps: List[FusedLinearNormMLP] = []
         self._ys: List[torch.Tensor] = []
+        # Per queued MLP: a modules/action_prefill.py PrefilledLinear holding
+        # its last pair's casts + addmm issued earlier (head_prefilled), or
+        # None (head()). Consumed once, inside the node that runs that pair.
+        self._pfs: List[Optional[object]] = []
         # Set once the chain has declined; from then on it is the shipped chain.
         self._acc: Optional[torch.Tensor] = None
         self._declined: bool = False
         # E-M3a (ops/preproc_fp8_l2.py, DLRM_HSTU_FP8_PREPROC_L2, default OFF):
-        # one plan slot and the head input per queued MLP. Off: both stay empty
-        # and nothing below changes.
+        # one plan slot and the head input per queued MLP (a prefilled head's
+        # input is None: its slot is BF16). Off: both stay empty and nothing
+        # below changes.
         self._fp8: bool = preproc_fp8_l2.enabled()
         self._plans: List[preproc_fp8_l2.Slot] = []
-        self._x0s: List[torch.Tensor] = []
+        self._x0s: List[Optional[torch.Tensor]] = []
         if self._fp8 and _grouped_bwd_enabled():
             global _FP8_EM2_WARNED
             if not _FP8_EM2_WARNED:
@@ -866,6 +923,11 @@ class GroupedTail:
                     preproc_fp8_l2.ENV_VAR,
                     _rank(),
                 )
+
+    @property
+    def declined(self) -> bool:
+        """True once the chain fell back to the shipped per-MLP tails."""
+        return self._declined
 
     def head(self, mlp: torch.nn.Module, x: torch.Tensor) -> None:
         if not self._declined:
@@ -889,8 +951,10 @@ class GroupedTail:
                     self._plans.append(slot)
                     self._x0s.append(x)
                     self._ys.append(y)
+                    self._pfs.append(None)
                     return
                 self._ys.append(_run_head(mlp, x))
+                self._pfs.append(None)
                 return
             warn_decline_once(reason)
             self._declined = True
@@ -898,18 +962,99 @@ class GroupedTail:
         acc = self._acc
         self._acc = mlp(x) if acc is None else self._mlp_add(mlp, x, acc)
 
+    def prefilled_reason(
+        self, mlp: torch.nn.Module, y: torch.Tensor, fused: bool
+    ) -> Optional[str]:
+        """None when head_prefilled(mlp, y, fused, ...) may run: the chain has
+        already declined (the prefilled head then completes the shipped chain
+        exactly as head() would), or this MLP passes head()'s checks with
+        _can_fuse taken from `fused`. Otherwise the reason head() would decline
+        the group AT THIS MLP (or that E-M3a plans this MLP FP8, see below).
+        The caller must then run the original order
+        (DLRM_HSTU_FP8_ACTION_PREFILL fallback): in that one case the shipped
+        chain completes the queued pairs BEFORE this MLP's head, so a head
+        created earlier (the prefill bridge) would change the backward order."""
+        if self._declined:
+            return None
+        if not isinstance(mlp, FusedLinearNormMLP):
+            return f"{type(mlp).__name__} is not FusedLinearNormMLP"
+        if not fused:
+            return "prefilled head did not take the fused path"
+        reason = _last_pair_reason(mlp, self._eps)
+        if reason is None and (y.shape[0] != self._rows or y.device != self._device):
+            reason = (
+                f"input {tuple(y.shape)} on {y.device} does not match "
+                f"{self._rows} rows on {self._device}"
+            )
+        if reason is None and len(self._mlps) >= 3:
+            reason = "more than 3 MLPs"
+        if reason is None and self._fp8 and len(self._mlps) in preproc_fp8_l2.FP8_MLPS:
+            # E-M3a plans MLP k = len(self._mlps) FP8 (or warms its a1/dh2
+            # sites), but a prefilled head ran the shipped BF16 way and gets a
+            # BF16 slot (prefilled_slot): prefill on would then differ from
+            # off. With FP8_MLPS = (0, 1) the action MLP (k = 2) is never FP8.
+            reason = "DLRM_HSTU_FP8_PREPROC_L2 plans this MLP FP8 (preproc_fp8_l2.FP8_MLPS)"
+        return reason
+
+    def head_prefilled(
+        self,
+        mlp: torch.nn.Module,
+        y: torch.Tensor,
+        fused: bool,
+        prefilled: Optional[object],
+    ) -> None:
+        """head() for an MLP whose head already ran (DLRM_HSTU_FP8_ACTION_PREFILL,
+        modules/action_prefill.py): `y` is the output of every pair but the
+        last, computed by FusedLinearNormMLP.forward_head -- the same
+        _LinearNormFunction calls _run_head makes -- and `fused` is its
+        _can_fuse(x) answer. `prefilled` optionally holds the last pair's
+        casts + addmm, also issued earlier; the node that runs the last pair
+        reuses it (bitwise: same ops on the same operands). Call only when
+        prefilled_reason(mlp, y, fused) is None."""
+        if not self._declined:
+            reason = self.prefilled_reason(mlp, y, fused)
+            if reason is not None:
+                raise RuntimeError(
+                    "GroupedTail.head_prefilled: the group would decline here "
+                    f"({reason}); the caller must run the original order"
+                )
+            assert isinstance(mlp, FusedLinearNormMLP)
+            self._mlps.append(mlp)
+            self._ys.append(y)
+            self._pfs.append(prefilled)
+            if self._fp8:
+                # E-M3a: this head already ran the shipped way, so the entry is
+                # BF16; its slot carries the PrefilledLinear into the FP8 node
+                # (one per-entry non-tensor argument, see preproc_fp8_l2.Slot).
+                self._plans.append(
+                    preproc_fp8_l2.prefilled_slot(len(self._mlps) - 1, prefilled)
+                )
+                self._x0s.append(None)
+            return
+        acc = self._acc
+        # The shipped _mlp_add (F2 on, which the group requires) cut after the
+        # head: the last pair with residual = the running sum.
+        if isinstance(mlp, FusedLinearNormMLP):
+            self._acc = mlp.forward_tail(y, fused, residual=acc, prefilled=prefilled)
+        else:  # pragma: no cover - the prefill only issues for nn.Sequential
+            for m in list(mlp)[-2:]:
+                y = m(y)
+            self._acc = y if acc is None else acc + y
+
     def _complete_shipped(self) -> Optional[torch.Tensor]:
         """The queued last pairs, launched as FusedLinearNormMLP.forward does
         under _mlp_add with F2 on: content without a residual, then each next
         MLP's last pair with residual = the running sum."""
         acc: Optional[torch.Tensor] = None
-        for i, (mlp, y) in enumerate(zip(self._mlps, self._ys)):
+        for i, (mlp, y, pf) in enumerate(zip(self._mlps, self._ys, self._pfs)):
             if self._fp8 and self._plans[i].mode == "fp8":
                 # E-M3a: this head ran P2 and y is its stride-0 proxy. Re-run
                 # the head the shipped way; the FP8 node's output is dropped,
                 # so autograd never reaches it.
                 self._plans[i].payload = None
-                y = _run_head(mlp, self._x0s[i])
+                x0 = self._x0s[i]
+                assert x0 is not None
+                y = _run_head(mlp, x0)
             lin, norm = mlp._pairs()[-1]
             acc = _LinearNormFunction.apply(
                 y,
@@ -920,8 +1065,9 @@ class GroupedTail:
                 norm._eps,
                 False,
                 acc,
+                pf,
             )
-        self._mlps, self._ys = [], []
+        self._mlps, self._ys, self._pfs = [], [], []
         self._plans, self._x0s = [], []
         return acc
 
@@ -940,12 +1086,14 @@ class GroupedTail:
             flat += [y, lin.weight, lin.bias, norm.weight, norm.bias]
         if self._fp8:
             # E-M3a armed: the tail with the FP8 last Linear for the MLPs whose
-            # slot is "fp8"; every other MLP runs this tail's shipped body.
+            # slot is "fp8"; every other MLP runs this tail's shipped body (a
+            # prefilled one reuses its PrefilledLinear, carried by its slot).
             out = preproc_fp8_l2.grouped_tail_apply(self._eps, self._plans, flat)
         else:
-            out = _GroupedLinearLNTailFunction.apply(self._eps, *flat)
+            pfs = tuple(self._pfs) if any(pf is not None for pf in self._pfs) else None
+            out = _GroupedLinearLNTailFunction.apply(self._eps, pfs, *flat)
         _report_armed_once(len(self._mlps), self._rows)
-        self._mlps, self._ys = [], []
+        self._mlps, self._ys, self._pfs = [], [], []
         self._plans, self._x0s = [], []
         return out
 
