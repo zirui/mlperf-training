@@ -90,6 +90,17 @@
 #include <stdint.h>
 
 #include <utility>
+// >>> DIET switch (L11 DO8 VALU/SGPR reduction; DLRM_HSTU_FP8_L11_DO8_DIET, ops/hip/l11_do8.py). L11DO8_DIET 1 (the
+// default, also when the define is absent) compiles the diet: packed v_pk_max_u16 group maxima, one SGPR nit per tile
+// for the row tests, no E == 0 select in grp_exp, the carry form of the exponent, a straight-line rolling 4+4 staging
+// read window with E8 in the reads' latency, and a packed exchange tree. L11DO8_DIET 0 (l11_do8.py passes
+// -DL11DO8_DIET=0 when the knob is not "1") compiles the non-diet kernel body in every "#if ... // DIET" region (the
+// "#else" / "#if !" branches). Both settings produce the same bytes (dO8, E8, dz8, d(attn), partials); only the ISA
+// (VGPR/SGPR use, instruction count) differs. Applies to the 'plus' and the 'only' (-DL11DO8_ONLY=1) builds alike.
+#ifndef L11DO8_DIET
+#define L11DO8_DIET 1
+#endif
+// <<< DIET switch
 
 namespace l11 {
 typedef int i32x4 __attribute__((ext_vector_type(4)));
@@ -383,9 +394,26 @@ __device__ __forceinline__ int grp_exp(float a) {
     const int bits = __builtin_bit_cast(int, a);
     const int E = (bits >> 23) & 0xFF;
     const int mant = bits & 0x7FFFFF;
+#if L11DO8_DIET  // DIET
+    // DIET: the carry/literal form of the contract's
+    //   (mant <= 0x600000) ? 135 - E : 134 - E  ==  134 - E + [mant <= 0x600000]
+    // (an integer identity for every E and mant; with the clamp and the zero select below it gives the same e for
+    // all 2^32 fp32 patterns). Written as the select, LLVM forms v_cndmask_b32(134, 135) - E with BOTH
+    // constants in VGPRs (VOP2 cndmask src1 must be a VGPR; gfx9 VOP3 takes no literal) and hoists the two v_mov_b32
+    // out of the persistent loop: 2 loop-resident VGPRs for 2 tail-only uses. The empty asm keeps 134 - E opaque, so
+    // InstCombine cannot fold "+ zext(mant <= 0x600000)" back into select(.., 135, 134): the add stays an add of the
+    // compare bit (carry-in add, or an inline 0/1 select + add) and 134 is a VOP2 literal; no constant VGPR.
+    int e = 134 - E;
+    asm("" : "+v"(e));
+    e += (mant <= 0x600000) ? 1 : 0;
+    e = e < -60 ? -60 : (e > 60 ? 60 : e);
+    // DIET: the contract's "E == 0 (fp32 subnormal amax) -> 60" select is implied by the clamp above
+    // (E == 0 gives 135 or 134, both clamped to 60), so it is not emitted; every input gives the same e.
+#else  // DIET off
     int e = (mant <= 0x600000) ? 135 - E : 134 - E;
     e = e < -60 ? -60 : (e > 60 ? 60 : e);
     e = (E == 0) ? 60 : e;        // fp32 subnormal amax
+#endif  // DIET
     return (a == 0.0f) ? 0 : e;   // all-zero group
 }
 // 4 fp32 -> 4 e4m3 bytes with the instruction _blk_kernel's `y.to(tl.float8e4nv)` compiles to on gfx950 (stock ISA:
@@ -402,6 +430,18 @@ __device__ __forceinline__ float dpp_max(float v) {  // bound_ctrl: invalid sour
     return __builtin_fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), CTRL,
                                                                                     0xF, 0xF, true)));
 }
+#if L11DO8_DIET  // DIET
+// DIET: per-half unsigned max of two packed bf16 bit-pattern pairs (v_pk_max_u16). On non-negative, non-NaN
+// bf16 patterns (0x0000..0x7F80) u16 order is value order, so this is the value max, exactly.
+__device__ __forceinline__ uint32_t pkmax_u16(uint32_t a, uint32_t b) {
+    typedef unsigned short u16x2_t __attribute__((ext_vector_type(2)));
+    return __builtin_bit_cast(uint32_t, __builtin_elementwise_max(__builtin_bit_cast(u16x2_t, a), __builtin_bit_cast(u16x2_t, b)));
+}
+template <int CTRL>
+__device__ __forceinline__ uint32_t dpp_pkmax_u16(uint32_t v) {  // bound_ctrl: invalid source lanes read 0 (u16 max identity)
+    return pkmax_u16(v, (uint32_t)__builtin_amdgcn_update_dpp(0, (int)v, CTRL, 0xF, 0xF, true));
+}
+#endif  // DIET
 
 }  // namespace l11
 
@@ -432,6 +472,9 @@ __device__ __forceinline__ float dpp_max(float v) {  // bound_ctrl: invalid sour
 //     this kernel computes: per (tile, head, group g = (r % 16) // 8) amax over the valid rows (NaN ignored, as maxnum),
 //     e_g = _grp_exp(RNE_bf16 amax), dO8 = e4m3(x_bf16 * 2^e_g) (v_mul_f32 + v_cvt_scalef32_pk_fp8_f32 under MODE[23]=1),
 //     E8 = 127 - e_g. bf16 DX still stored. EM = 2 ('only'): the same without the bf16 DX store. Needs WLIST = 1.
+//     (WLIST 2 = WLIST 1 + a device tile count; RET 0 keeps the LDS staging write and the emission
+//     reads that copy; RET 2 re-reads DX and is static_asserted out; the only other DX store is the TR = 1 stub's.
+//     Instantiated only by the L11DO8_ONLY .so.)
 //   RET = 0: the wave's 8 bf16 d(attn) rows wait for the group scale in an extra 64 KiB LDS region (LDS 160 KiB);
 //   RET = 1: in registers (8 x 4 VGPR); RET = 2 ('plus' only): re-read from the bf16 DX rows just stored (L2-hot).
 //   WLIST = 2 = WLIST 1 with the tile count read from the device (ca.WLCNT[0], written by
@@ -727,6 +770,18 @@ __global__ __launch_bounds__(512, 2) void l11_outproj_lnmd_bwd_do8(const uint8_t
             issue_A(make_rsrc(A + (size_t)nrow0 * KD, (uint32_t)((WLIST ? nxv : min(BM, M - nrow0)) * KD)));
         }
         L11_SB();
+#if L11DO8_DIET  // DIET
+        // DIET: row it*8 + w of this wave is a valid tile row (it*8 + w < rv) iff it < nit, with ONE wave-uniform SGPR
+        // per tile nit = (rv - w + 7) >> 3 = ceil((rv - w) / 8) (for every int rv, w, it without overflow: x < rv <=>
+        // x <= rv - 1 and floor). Comparing rv with 7 loop-invariant SGPR constants it*8 + w (it = 1..7) lets LLVM
+        // hoist them out of the persistent loop and spill them. The pin keeps the shift form: no InstCombine
+        // re-association back to "w + 8*it < rv"; the tests compare nit with inline constants.
+        int nit = 0;
+        if constexpr (WLIST) {
+            nit = (rv - w + 7) >> 3;
+            asm volatile("" : "+s"(nit));
+        }
+#endif  // DIET
 
         const i32x4 rC = make_rsrc(C + (size_t)row0 * NOUT, (uint32_t)rv * ROWB);
         const i32x4 rR = make_rsrc(R + row0, (uint32_t)rv * 4u);
@@ -798,7 +853,11 @@ __global__ __launch_bounds__(512, 2) void l11_outproj_lnmd_bwd_do8(const uint8_t
                 l11_llvm_buffer_store_v4i32(dx, rC, (int)(vrow + 1024u), 0, 0);
                 l11_llvm_buffer_store_v4i32(dyy, rC, (int)(vrow + 2048u), 0, 0);
             } else if constexpr (TR == 2) {
+#if L11DO8_DIET  // DIET
+              if (WLIST == 0 || it < nit) {  // DO8 WLIST: rows past the tile's valid rows skip the math (uniform)
+#else  // DIET off
               if (WLIST == 0 || it * 8 + w < rv) {  // DO8 WLIST: rows past the tile's valid rows skip the math (uniform)
+#endif  // DIET
                 // ---- the real consumer, v2 op for op (FMA contraction and tl.sum tree as in its ISA):
                 //   du_m/dx_m/dy_m = keep ? RN(s*plane) : 0;  xhat = RN(RN(x-mean)*rstd);  ln = fma(xhat,w,b)
                 //   sig = IEEE 1/(1+exp(-u));  silu = RN(u*sig);  dsilu = fma(silu, RN(1-sig), sig)
@@ -989,6 +1048,51 @@ __global__ __launch_bounds__(512, 2) void l11_outproj_lnmd_bwd_do8(const uint8_t
             // ---- DO8 emission. Tile row r of wave w is it*8 + w, so group g = (r % 16) // 8 = it & 1 and every wave
             // holds 4 rows of each group: per (group, head) max = 16-lane DPP max (lane 15 of each 16-lane row = head
             // lane >> 4) -> per-wave partial in LDS -> one barrier -> 8-wave max.
+#if L11DO8_DIET  // DIET
+            // DIET: the tail's row tests (it < nitc) use an opaque copy of the tile's nit, so LLVM cannot
+            // CSE them with the consumer's tests and keep 8 row-valid lane-mask pairs (s_cselect_b64, 16 SGPRs) live
+            // across the row loop: each convert row re-tests nit against an inline constant instead (same value, same
+            // branch outcome; no instruction is emitted for the copy).
+            int nitc = nit;
+            asm volatile("" : "+s"(nitc));
+            const int hh = lane >> 4;
+            float m0, m1;
+            if constexpr (PKA && !TM) {
+                // DIET: the two group maxima stay ONE packed pair of bf16 bit patterns (lo = group 0,
+                // hi = group 1) through the 16-lane DPP max, the LDS exchange and the 8-wave max (v_pk_max_u16 only).
+                // Bitwise vs the fp32 path below: both halves are non-negative, non-NaN bf16 patterns in 0x0000..0x7F80
+                // (RNE_bf16 of a maxnum of |x| that starts at +0, so never -0 and never NaN), on which u16 order is value
+                // order; bound_ctrl's 0 fill is the max identity as it is for the fp32 max of v >= 0; and the fp32 path's
+                // final RNE_bf16 is the identity on these bf16-exact values. One packed lane-15 LDS write per head and
+                // 8 packed reads; no fp32 max canonicalizations, no tail RNE converts.
+                uint32_t ap = amgp;
+                ap = dpp_pkmax_u16<0x118>(ap);
+                ap = dpp_pkmax_u16<0x114>(ap);
+                ap = dpp_pkmax_u16<0x112>(ap);
+                ap = dpp_pkmax_u16<0x111>(ap);
+                const uint32_t xch = lds0 + (uint32_t)XCHB;  // u32 [h][w]: packed (group 0, group 1) bf16 maxima
+                if ((lane & 15) == 15) {
+                    const uint32_t va = xch + (uint32_t)(hh * 8 + w) * 4u;
+                    asm volatile("ds_write_b32 %0, %1" : : "v"(va), "v"(ap) : "memory");
+                }
+                wait_lgkm<0>();
+                L11_BARRIER();
+                // compiler-visible LDS reads after the barrier (as the fp32 path below; see its note on asm reads)
+                const uint32_t* xcu = reinterpret_cast<const uint32_t*>(smem + XCHB) + hh * 8;
+                // DIET: the 8 packed words (2 x ds_read_b128) reduced as a 3-level tree whose first level pairs word k
+                // of the first read with word k of the second, so no max can start before BOTH reads returned and they
+                // issue back to back before ONE wait (a linear chain would serialise two LDS round trips). Exact for
+                // every input: u16 max is associative and commutative, and the chain's initial 0 is its identity.
+                uint32_t xv[8];
+#pragma unroll
+                for (int k = 0; k < 8; ++k) xv[k] = xcu[k];
+                const uint32_t mp = pkmax_u16(pkmax_u16(pkmax_u16(xv[0], xv[4]), pkmax_u16(xv[1], xv[5])),
+                                              pkmax_u16(pkmax_u16(xv[2], xv[6]), pkmax_u16(xv[3], xv[7])));
+                L11_SB();
+                m0 = bf_lo(mp);  // the same bf16 value the fp32 path's RNE_bf16 yields, exact in fp32
+                m1 = bf_hi(mp);
+            } else {
+#endif  // DIET
             float a0 = PKA ? bf_lo(amgp) : amg0, a1 = PKA ? bf_hi(amgp) : amg1;
             if constexpr (TM) {
                 // DO8 TM: per-lane group maxima from this wave's staged bf16 rows (valid rows only; the stale rows of a
@@ -999,7 +1103,11 @@ __global__ __launch_bounds__(512, 2) void l11_outproj_lnmd_bwd_do8(const uint8_t
                 a1 = 0.f;
                 static_for<8>([&](auto IT_) {
                     constexpr int it = decltype(IT_)::value;
+#if L11DO8_DIET  // DIET
+                    if (it < nitc) {  // == it * 8 + w < rv
+#else  // DIET off
                     if (it * 8 + w < rv) {
+#endif  // DIET
                         const i32x4 x = xrw[it * 512];
                         float a = (it & 1) ? a1 : a0;
 #pragma unroll
@@ -1020,7 +1128,9 @@ __global__ __launch_bounds__(512, 2) void l11_outproj_lnmd_bwd_do8(const uint8_t
             a1 = dpp_max<0x112>(a1);
             a0 = dpp_max<0x111>(a0);
             a1 = dpp_max<0x111>(a1);
+#if !L11DO8_DIET  // DIET off
             const int hh = lane >> 4;
+#endif  // DIET
             const uint32_t xch = lds0 + (uint32_t)XCHB;  // fp32 [g][h][w]
             if ((lane & 15) == 15) {
                 const uint32_t va = xch + (uint32_t)(hh * 8 + w) * 4u;
@@ -1032,6 +1142,61 @@ __global__ __launch_bounds__(512, 2) void l11_outproj_lnmd_bwd_do8(const uint8_t
             // (compiler-visible LDS reads: with asm ds_read_b128 LLVM keeps only element .x of each, which gives a wrong
             // group max; plain loads after the barrier fences instead)
             const float* xcf = reinterpret_cast<const float*>(smem + XCHB) + hh * 8;
+#if L11DO8_DIET  // DIET
+            float fm0 = 0.f, fm1 = 0.f;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                fm0 = __builtin_fmaxf(fm0, xcf[k]);
+                fm1 = __builtin_fmaxf(fm1, xcf[32 + k]);
+            }
+            L11_SB();
+            m0 = bf_lo(pk_bf16(f32x2{fm0, fm0}));  // RNE_bf16 of the group max (exact back to fp32)
+            m1 = bf_lo(pk_bf16(f32x2{fm1, fm1}));
+            }
+            int e0 = grp_exp(m0), e1 = grp_exp(m1);  // (non-const: pinned below)
+            // DIET rolling read window + E8 window. For RET 0 / EMV 2 / TM 0
+            // (the production family, O2SL) the 8-row convert loop below is straight-line, with no per-row validity
+            // test. Its staging reads are COMPILER-VISIBLE LDS loads (plain loads, as the exchange reads above), so the
+            // waitcnt pass places the progressive lgkmcnt(N) waits before each row's converts itself.
+            // Rows 0-3 are read HERE; row k + 4 is read right after row k's 4 converts, into the 4 VGPRs row k just
+            // released (each late read has 3 convert rounds of cover and sits inside the MODE[23] = 1 window, as all 8
+            // reads of the guarded loop always did: a ds_read_b128 has no FP semantics). At most 16 VGPRs of staging
+            // data are in flight.
+            // Every LGKM op in flight here is compiler-visible: the last asm LDS op (the lane-15 exchange write) was
+            // drained by wait_lgkm<0> before the exchange barrier. The LDS pointer is formed from xdxw itself (the
+            // consumer's loop-resident staging-write VGPR), so no second copy of the address stays live.
+            // Rows >= rv: the read returns a stale staging row (the 64 KiB staging region is always in bounds) and the dO8
+            // store offset r * 512 + 8 * lane >= rv * 512 = rD8's num_records, so the buffer range check drops it (as RET 2
+            // and E8 already rely on); rows < rv: the same bytes, scales, converts and addresses as the guarded loop. The 9
+            // emission stores are always issued, which is what S_ST counts.
+            // E8 (O2SL only) is built and stored right after the staging reads ISSUE and before the scale pin and the
+            // MODE[23] = 1 setreg, so its readlane / SALU chain and its store ride the reads' LDS latency. Same bytes and
+            // addresses as the E8 store after the converts: it reads e0/e1 before the empty pin asm, which does not change
+            // them, and it is integer-only (MODE[23] cannot apply). Every other family keeps E8 after the converts.
+            constexpr bool O2SL = (RET == 0 && EMV == 2 && !TM);
+            i32x4 xs[O2SL ? 4 : 1];
+            typedef __attribute__((address_space(3))) const i32x4 lds_ci32x4_t;
+            const lds_ci32x4_t* xrw = (const lds_ci32x4_t*)(uintptr_t)xdxw;  // row it at xrw[it * 512] = +it * 8 KiB
+            if constexpr (O2SL) {
+                static_for<4>([&](auto IT_) {
+                    constexpr int it = decltype(IT_)::value;
+                    xs[it] = xrw[it * 512];  // row it*8 + w
+                });
+                L11_SB();  // the 4 reads issue before the E8 chain below, which then rides their latency
+                // E8 [M,4]: row r -> bytes (127 - e_g(h)) for h = 0..3, g = (r % 16) // 8; lane j < 8 stores row 8j + w
+                const uint32_t b0 = (uint32_t)((127 - __builtin_amdgcn_readlane(e0, 0)) & 0xFF) |
+                                    ((uint32_t)((127 - __builtin_amdgcn_readlane(e0, 16)) & 0xFF) << 8) |
+                                    ((uint32_t)((127 - __builtin_amdgcn_readlane(e0, 32)) & 0xFF) << 16) |
+                                    ((uint32_t)((127 - __builtin_amdgcn_readlane(e0, 48)) & 0xFF) << 24);
+                const uint32_t b1 = (uint32_t)((127 - __builtin_amdgcn_readlane(e1, 0)) & 0xFF) |
+                                    ((uint32_t)((127 - __builtin_amdgcn_readlane(e1, 16)) & 0xFF) << 8) |
+                                    ((uint32_t)((127 - __builtin_amdgcn_readlane(e1, 32)) & 0xFF) << 16) |
+                                    ((uint32_t)((127 - __builtin_amdgcn_readlane(e1, 48)) & 0xFF) << 24);
+                const i32x4 rE8 = make_rsrc(ca.E8 + (size_t)row0 * 4, (uint32_t)rv * 4u);
+                const float bv = __builtin_bit_cast(float, (lane & 1) ? b1 : b0);
+                l11_llvm_buffer_store_f32(bv, rE8, lane < 8 ? (8 * lane + w) * 4 : 0x40000000, 0, 0);
+            }
+#else  // DIET off
             float m0 = 0.f, m1 = 0.f;
 #pragma unroll
             for (int k = 0; k < 8; ++k) {
@@ -1042,6 +1207,7 @@ __global__ __launch_bounds__(512, 2) void l11_outproj_lnmd_bwd_do8(const uint8_t
             m0 = bf_lo(pk_bf16(f32x2{m0, m0}));  // RNE_bf16 of the group max (exact back to fp32)
             m1 = bf_lo(pk_bf16(f32x2{m1, m1}));
             int e0 = grp_exp(m0), e1 = grp_exp(m1);  // (non-const: pinned below)
+#endif  // DIET
             const f32x2 s20 = {__builtin_bit_cast(float, (e0 + 127) << 23), __builtin_bit_cast(float, (e0 + 127) << 23)};
             const f32x2 s21 = {__builtin_bit_cast(float, (e1 + 127) << 23), __builtin_bit_cast(float, (e1 + 127) << 23)};
             const i32x4 rD8 = make_rsrc(ca.DO8 + (size_t)row0 * 512, (uint32_t)rv * 512u);
@@ -1053,7 +1219,12 @@ __global__ __launch_bounds__(512, 2) void l11_outproj_lnmd_bwd_do8(const uint8_t
                 });
             }
             // EMV >= 1: MODE[23] = 1 once for the tile's whole row loop (only the e4m3 converts below run inside it);
+#if L11DO8_DIET  // DIET
+            // the per-row branch structure of EMV 0 is kept (straight-line variants crash the greedy register allocator),
+            // except for the O2SL family (straight-line, rolling 4-row read window)
+#else  // DIET off
             // the per-row branch structure of EMV 0 is kept (straight-line variants crash the greedy register allocator)
+#endif  // DIET
             //   EMV 1: x_bf16 -> fp32, x * 2^e (v_pk_mul_f32), v_cvt_scalef32_pk_fp8_f32 (scale 1.0)
             //   EMV 2/3: v_cvt_scalef32_pk_fp8_bf16 straight from the packed bf16 words, scale 2^-e / 2^+e
             float cs0 = __builtin_bit_cast(float, (127 - e0) << 23);  // EMV 2/3: 2^-e (the convert divides)
@@ -1067,12 +1238,25 @@ __global__ __launch_bounds__(512, 2) void l11_outproj_lnmd_bwd_do8(const uint8_t
             static_for<8>([&](auto IT_) {
                 constexpr int it = decltype(IT_)::value;
                 const int r = it * 8 + w;
+#if L11DO8_DIET  // DIET
+                // RET 2: straight-line (rows >= rv read 0 and their stores are range-dropped). it < nitc == r < rv.
+                // LLVM proves !(it < nitc) => !(it + 1 < nitc) and turns the 8 tests into an early-exit chain; without
+                // the hint each exit is 50/50, so row k's block looks 2^-k cold and the register allocator can split
+                // and spill a dO8 store offset there. Valid rows are the common case.
+                // O2SL: straight-line (rows >= rv convert a stale staging row; their stores are range-dropped)
+                if (RET == 2 || O2SL || __builtin_expect(it < nitc, 1)) {
+#else  // DIET off
                 if (RET == 2 || r < rv) {  // RET 2: straight-line (rows >= rv read 0 and their stores are range-dropped)
+#endif  // DIET
                     i32x4 x;
                     if constexpr (RET == 1) {
                         x = oxr[it];
                     } else if constexpr (RET == 2) {
                         x = xg[it];
+#if L11DO8_DIET  // DIET
+                    } else if constexpr (O2SL) {
+                        x = xs[it & 3];  // row it: read before the setreg (it < 4) or after row it - 4's converts
+#endif  // DIET
                     } else {
                         x = ds_read16<it * 8192>(TM ? xdx_addr() : xdxw);
                         wait_lgkm<0>();
@@ -1089,6 +1273,11 @@ __global__ __launch_bounds__(512, 2) void l11_outproj_lnmd_bwd_do8(const uint8_t
                             "v_cvt_scalef32_pk_fp8_bf16 %1, %5, %6 op_sel:[0,0,1]"
                             : "=&v"(q0), "=&v"(q1)
                             : "v"(x.x), "v"(x.y), "v"(x.z), "v"(x.w), "v"(cs));
+#if L11DO8_DIET  // DIET
+                        // O2SL: row it + 4 into the slot row it just released (after its converts: an asm volatile is a
+                        // memory barrier for the scheduler, so the read cannot be hoisted above them)
+                        if constexpr (O2SL && it < 4) xs[it] = xrw[(it + 4) * 512];
+#endif  // DIET
                     } else if constexpr (EMV == 3) {
                         // the same through the clang builtin (encoding by the compiler), scale 2^-e
                         const float cs = (it & 1) ? cs1 : cs0;
@@ -1136,6 +1325,9 @@ __global__ __launch_bounds__(512, 2) void l11_outproj_lnmd_bwd_do8(const uint8_t
                 }
             });
             if constexpr (EMV >= 1) asm volatile("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 0\n\ts_nop 3" ::: "memory");
+#if L11DO8_DIET  // DIET
+            if constexpr (!O2SL) {  // O2SL stored E8 in the reads' window above
+#endif  // DIET
             // E8 [M,4]: row r -> bytes (127 - e_g(h)) for h = 0..3, g = (r % 16) // 8; lane j < 8 stores row 8j + w
             const uint32_t b0 = (uint32_t)((127 - __builtin_amdgcn_readlane(e0, 0)) & 0xFF) |
                                 ((uint32_t)((127 - __builtin_amdgcn_readlane(e0, 16)) & 0xFF) << 8) |
@@ -1148,6 +1340,9 @@ __global__ __launch_bounds__(512, 2) void l11_outproj_lnmd_bwd_do8(const uint8_t
             const i32x4 rE8 = make_rsrc(ca.E8 + (size_t)row0 * 4, (uint32_t)rv * 4u);
             const float bv = __builtin_bit_cast(float, (lane & 1) ? b1 : b0);
             l11_llvm_buffer_store_f32(bv, rE8, lane < 8 ? (8 * lane + w) * 4 : 0x40000000, 0, 0);
+#if L11DO8_DIET  // DIET
+            }
+#endif  // DIET
         }
         if constexpr (WLIST) {
             cur0 = nx0;
@@ -1204,6 +1399,10 @@ __global__ __launch_bounds__(512, 2) void l11_outproj_lnmd_bwd_do8(const uint8_t
 // =====================================================================================================================
 #ifndef L11DO8_SRC_SHA256
 #define L11DO8_SRC_SHA256 "unknown"
+#endif
+// 1 = the 'only' .so (l11do8_e5_only_launch, EM = 2); 0 (default) = the 'plus' .so, unchanged
+#ifndef L11DO8_ONLY
+#define L11DO8_ONLY 0
 #endif
 #define L11DO8_ABI_VERSION 1
 static constexpr long long L11DO8_M_MAX = 4194304;  // = L11's validated M bound (l11_outproj_lnmd.py M_MAX)
@@ -1354,9 +1553,15 @@ static inline bool l11do8_a4(const void* p) { return p != nullptr && ((uintptr_t
 extern "C" int l11do8_abi_version(void) { return L11DO8_ABI_VERSION; }
 
 extern "C" const char* l11do8_impl(void) {
+#if L11DO8_ONLY
+    return "l11_outproj_lnmd_bwd_do8 abi=1 variant=e5only(E5 1,WLIST 2 device list,EM 2 only no bf16 DX store,"
+           "RET 0 LDS staging,EMV 2 bf16 convert,packed running max)+vd(C1,C2,C3,C4,LANEFIX,PIN)+l11_do8_wl_build "
+           "src_sha256=" L11DO8_SRC_SHA256;
+#else
     return "l11_outproj_lnmd_bwd_do8 abi=1 variant=e5plus(E5 1,WLIST 2 device list,EM 1 plus,RET 0 LDS staging,"
            "EMV 2 bf16 convert,packed running max)+vd(C1,C2,C3,C4,LANEFIX,PIN)+l11_do8_wl_build "
            "src_sha256=" L11DO8_SRC_SHA256;
+#endif
 }
 
 extern "C" int l11do8_drain_last_error(void) { return (int)hipGetLastError(); }
@@ -1407,7 +1612,15 @@ extern "C" int l11do8_wl_build_launch(const void* OFFS, int offs_i64, int B, int
 // plus: WL / CNT = the device work list of l11do8_wl_build_launch (same stream, cap entries); DO8 e4m3 [M,512] and E8
 // uint8 [M,4] (16-B aligned): dO8 / E8 of every listed tile (= quantize_do_e4m3_blk(DX, seq_offsets, N) on every row the
 // quantizer writes). DX bf16 [M,512] is written ('plus').
-extern "C" int l11do8_e5_plus_launch(const void* G8, const void* W8, const float* sa, const float* sb, int M,
+// The 'only' .so (L11DO8_ONLY = 1) exports this same entry as l11do8_e5_only_launch, which launches
+// the EM = 2 instantiation: the same checks and outputs except DX, which is NOT written (the caller passes its bf16
+// placeholder, 16-B aligned as for 'plus'; its bytes are left as they are).
+#if L11DO8_ONLY
+#define L11DO8_E5_LAUNCH l11do8_e5_only_launch
+#else
+#define L11DO8_E5_LAUNCH l11do8_e5_plus_launch
+#endif
+extern "C" int L11DO8_E5_LAUNCH(const void* G8, const void* W8, const float* sa, const float* sb, int M,
                                      const void* X, const void* U, const void* MK, const float* MEAN, const float* RSTD,
                                      const void* WN, const void* BN, void* DX, void* DZ8, int rows_out,
                                      const float* INVS, void* AMAXP, void* DWP, void* DBP, void* DUCS, long long P,
@@ -1454,7 +1667,8 @@ extern "C" int l11do8_e5_plus_launch(const void* G8, const void* W8, const float
     ca.WLCNT = (const int*)CNT;
     const hipError_t stale = hipGetLastError();
     // nblk = cap: a placeholder the kernel replaces with the device count (WLIST = 2) before any use
-    hipLaunchKernelGGL((l11_outproj_lnmd_bwd_do8<1, 2, 0, 0, 1, 2, 1, 0, 1, 2, 1, 0, 2, 0>), dim3((unsigned)G), dim3(512),
+    // (EM = 1 'plus'; EM = 2 'only' in the L11DO8_ONLY build)
+    hipLaunchKernelGGL((l11_outproj_lnmd_bwd_do8<1, 2, 0, 0, 1, 2, 1, 0, 1, 2, L11DO8_ONLY ? 2 : 1, 0, 2, 0>), dim3((unsigned)G), dim3(512),
                        0, (hipStream_t)stream, (const uint8_t*)G8, (const uint8_t*)W8, (uint16_t*)nullptr,
                        (float*)nullptr, sa, sb, M, (int)cap, (const uint16_t*)nullptr, (const uint16_t*)nullptr,
                        (const uint8_t*)nullptr, (const float*)nullptr, (uint16_t*)nullptr, (uint16_t*)nullptr, ca);

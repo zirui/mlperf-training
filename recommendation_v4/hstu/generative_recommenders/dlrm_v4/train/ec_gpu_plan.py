@@ -110,7 +110,7 @@ def make_prefix(offsets, num_rows, limit):
 #      cold rows, longest class first -- rows with 128 < len <= split_above
 #      before the rest (a 2-class stable counting sort built on the GPU from
 #      the same prefix-sum launch as the hot-piece counts; no host sync), and
-#   2. folds each 32-row tile on ONE wave as fold(even rows) + fold(odd rows),
+#   2. folds each BLOCK_S-row tile on ONE wave as fold(even rows) + fold(odd rows),
 #      which is exactly the value the 2-wave tile reduction produces (each wave
 #      owns alternating rows and the cross-wave combine is a single add), minus
 #      its LDS round-trips and barriers. A one-time self-check compares it with
@@ -418,8 +418,9 @@ def segment_reduce_rows(grad_out, reverse_indices, num_rows,
 # as src0 at the production specialization (gfx950 returns src0's payload when
 # both operands are NaN). The fused combine is an inline-asm v_add_f32 whose
 # operand order comes from _FUSED_VALIDATED for the production key (validated
-# offline; no runtime probe) and otherwise from a one-time self-test per
-# (width, dtypes, row-stride classes, fold) that compares raw bits against the
+# offline at BLOCK_S=32, SPLIT_ABOVE=1024; no runtime probe) and otherwise from
+# a one-time self-test per (BLOCK_S, SPLIT_ABOVE, width, dtypes, row-stride
+# classes, fold) that compares raw bits against the
 # per-member LPT calls on overlapping rows with NaN payloads, -0.0, inf and
 # denormals (plus member-0 and member-1 hot rows); no match -> the per-member
 # calls (fail closed). The compiled order differs between specializations.
@@ -721,21 +722,26 @@ def _fused_selftest_members(width, dtypes, strides, device):
 # add at the production > 2 GiB specialization `v_add_f32 out, out_loaded, acc`): the member-1
 # add takes the loaded member-0 value as src0. No runtime probe (and no compile after
 # RUN_START) for these; any other key runs the one-time self-test below first.
-# (width, block_w, dtypes, unit row stride, row stride % 16 == 0, even/odd fold) -> src0_old
+# BLOCK_S and SPLIT_ABOVE (the LIMIT constexpr) are part of the key: both are constexprs
+# of _ecf_main/_ecf_post, the entries were validated at BLOCK_S=32 / SPLIT_ABOVE=1024 only,
+# and another geometry must not reuse them without the self-test.
+# (BLOCK_S, SPLIT_ABOVE, width, block_w, dtypes, unit row stride, row stride % 16 == 0,
+#  even/odd fold) -> src0_old
 _FUSED_VALIDATED = {
-    (512, 512, (torch.bfloat16, torch.bfloat16), (False, False), (True, True), (True, True)): True,
-    (512, 512, (torch.bfloat16,), (False,), (True,), (True,)): True,
+    (32, 1024, 512, 512, (torch.bfloat16, torch.bfloat16), (False, False), (True, True),
+     (True, True)): True,
+    (32, 1024, 512, 512, (torch.bfloat16,), (False,), (True,), (True,)): True,
 }
 
 
 def _fused_src0(width, block_w, columns, device, dtypes, strides):
-    """Per (width, dtypes, row-stride classes): the member-1 add operand order (True = loaded
+    """Per (BLOCK_S, SPLIT_ABOVE, width, dtypes, row-stride classes): the member-1 add operand order (True = loaded
     member-0 value first) under which the fused launch is raw-bit equal to the per-member LPT
     calls, from _FUSED_VALIDATED or a one-time self-test, or None (-> per-member calls)."""
     eo = [_even_odd_ok(width, block_w, columns, device, dtypes[k], strides[k])
           for k in range(len(dtypes))]
-    vkey = (width, block_w, tuple(dtypes), tuple(s == 1 for s in strides),
-            tuple(s % 16 == 0 for s in strides), tuple(eo))
+    vkey = (incumbent._BLOCK_S, incumbent._SPLIT_ABOVE, width, block_w, tuple(dtypes),
+            tuple(s == 1 for s in strides), tuple(s % 16 == 0 for s in strides), tuple(eo))
     key = (str(device),) + vkey
     what = (f"[rccl72] ec_reduce_fused width={width} "
             f"dtypes={[str(d).replace('torch.', '') for d in dtypes]}")

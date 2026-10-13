@@ -78,9 +78,11 @@ debug-only EMIT=True variant (emit_dx) adds one variant per DX storage class
 Top-level imports: os, logging, weakref, collections, torch,
 triton (guarded: CPU tests import this module without Triton),
 ops/triton/preproc_fp8_snr and ops/utils. Nothing from dlrm_v4.train.
+ops/hip/ec_dgrad_x2h is imported lazily, only with its knob on.
 """
 
 import collections
+import importlib
 import logging
 import os
 import weakref
@@ -121,6 +123,17 @@ _BOUND_KINDS: Set[str] = set()
 _PORTS_LOGGED: bool = False
 # name -> Triton CompiledKernel of the last dgrad_segreduce (tests / diagnostics).
 LAST_KERNELS: Dict[str, Any] = {}
+# The pass implementation of the last dgrad_segreduce: "_ecx_dgrad_pass" or X2H's "x2h_pass".
+LAST_PASS_IMPL: str = "_ecx_dgrad_pass"
+# Device types dgrad_segreduce accepts (the kernels are HIP-only).
+_DEVICE_TYPES: Tuple[str, ...] = ("cuda",)
+# X2H (ops/hip/ec_dgrad_x2h.py): literal copy of its ENV_VAR, read without importing it.
+_X2H_ENV_VAR: str = "DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE_HIP"
+_X2H_REQUESTED: Optional[bool] = None
+_X2H_MOD: Any = None  # ops.hip.ec_dgrad_x2h once imported
+# Sentinels of _prefill: acc / frag_v NaN bits, frag_u -1 / frag_n 0 = "no open run" (a
+# skipped fragment write then drops the run's rows from the combine instead of indexing with garbage).
+_PREFILL_F32_BITS: int = 0x7FBADBAD
 
 Member = collections.namedtuple("Member", ["dh", "w1", "idx", "order", "offsets"])
 
@@ -494,11 +507,52 @@ def _check_member(m: Member, kind: str, dev: torch.device, num_rows: int) -> Non
             raise ValueError(f"{kind} tensors on different devices")
 
 
+def _x2h_requested() -> bool:
+    """X2H's knob (read once; no import)."""
+    global _X2H_REQUESTED
+    if _X2H_REQUESTED is None:
+        _X2H_REQUESTED = os.environ.get(_X2H_ENV_VAR, "").strip().lower() in (
+            "1", "true", "on", "yes")
+    return _X2H_REQUESTED
+
+
+def _x2h_for(dev: torch.device, impl: str, em: bool) -> Any:
+    """The X2H module when this call's passes go to x2h_pass, else None.
+    impl "auto": X2H requested, no emit, armed on dev; "triton": never; "x2h"
+    (X2H's prebuild): always, and nothing here falls back."""
+    global _X2H_REQUESTED, _X2H_MOD
+    if impl == "triton":
+        return None
+    if impl not in ("auto", "x2h"):
+        raise ValueError(f"_impl must be 'auto', 'triton' or 'x2h', got {impl!r}")
+    if impl == "x2h" and em:
+        raise ValueError("_impl='x2h' takes no emit (x2h_pass runs EMIT=0 only)")
+    if impl == "auto" and (em or not _x2h_requested()):
+        return None
+    mod = _X2H_MOD
+    if mod is None:
+        try:
+            mod = importlib.import_module("generative_recommenders.ops.hip.ec_dgrad_x2h")
+        except Exception as exc:
+            if impl == "x2h":
+                raise
+            _X2H_REQUESTED = False
+            _once("x2h", "import", f"{TAG} X2H unavailable ({type(exc).__name__}: "
+                  f"{str(exc)[:200]}) -> _ecx_dgrad_pass")
+            return None
+        _X2H_MOD = mod
+    return mod if impl == "x2h" or mod.active(dev) else None
+
+
 def dgrad_segreduce(
     cat: Member,
     item: Member,
     num_rows: int,
     emit: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    *,
+    _impl: str = "auto",
+    _grid: Optional[int] = None,
+    _prefill: bool = False,
 ) -> torch.Tensor:
     """acc fp32 [U, 512]: per row, the sum over both hoisted members of the bf16
     dX rows of its positions (+0.0 for rows neither covers). No host sync.
@@ -506,11 +560,17 @@ def dgrad_segreduce(
     order [2Mc], offsets [U+1]); item: Member(dh_c [Mi,256], W1_c [256,512],
     idx [Mi], order, offsets). emit=(dX_a [Mc,1024], dX_c [Mi,512]) bf16 also
     receives every addend by token (debug/tests only). Raises ValueError on an
-    unsupported input (the caller fails closed)."""
+    unsupported input (the caller fails closed). The passes run on X2H's
+    x2h_pass when it is armed on the device (ops/hip/ec_dgrad_x2h.py; emit
+    always takes the Triton passes). _impl / _grid / _prefill are X2H's prebuild
+    hooks: "triton" or "x2h" force one implementation (no fallback), _grid sets
+    x2h_pass's grid, _prefill writes sentinels into acc and the fragment buffers
+    first (the passes, combine and zero overwrite every word the result reads)."""
+    global LAST_PASS_IMPL
     if _KERNELS_ERROR is not None:
         raise RuntimeError(f"Triton kernels unavailable ({_KERNELS_ERROR})")
     dev = cat.dh.device
-    if dev.type != "cuda" or not isinstance(num_rows, int) or num_rows < 0:
+    if dev.type not in _DEVICE_TYPES or not isinstance(num_rows, int) or num_rows < 0:
         raise ValueError("CUDA tensors and a nonnegative int num_rows required")
     _check_member(cat, "cat", dev, num_rows)
     _check_member(item, "item", dev, num_rows)
@@ -524,21 +584,32 @@ def dgrad_segreduce(
     frag_u = torch.empty((nt,), dtype=torch.int32, device=dev)
     frag_n = torch.empty((nt,), dtype=torch.int32, device=dev)
     frag_v = torch.empty((nt, WIDTH), dtype=torch.float32, device=dev)
+    if _prefill:
+        acc.view(torch.int32).fill_(_PREFILL_F32_BITS)
+        frag_v.view(torch.int32).fill_(_PREFILL_F32_BITS)
+        frag_u.fill_(-1)
+        frag_n.fill_(0)
     em = emit is not None
     dxa, dxc = emit if em else (acc, acc)
     ks: Dict[str, Any] = {}
-    if Ta:
-        ks["cat"] = _ecx_dgrad_pass[(nA,)](
-            cat.dh, cat.w1, cat.idx, cat.order, cat.offsets, acc, frag_u, frag_n, frag_v,
-            Ta, 0, dxa, True, _BM, _BN, HID, WIDTH, 2 * WIDTH, _S, cat.dh.stride(0), em,
-            **_PASS_KW,
-        )
-    if Tc:
-        ks["item"] = _ecx_dgrad_pass[(nC,)](
-            item.dh, item.w1, item.idx, item.order, item.offsets, acc, frag_u, frag_n,
-            frag_v, Tc, nA, dxc, False, _BM, _BN, HID, WIDTH, WIDTH, _S, item.dh.stride(0),
-            em, **_PASS_KW,
-        )
+    hip = _x2h_for(dev, _impl, em)
+    if hip is not None and hip.run_passes(cat, item, acc, frag_u, frag_n, frag_v, nA,
+                                          grid=_grid, strict=_impl == "x2h"):
+        impl = hip.PASS_NAME
+    else:  # the Triton passes (also after an X2H decline or failure, into the same buffers)
+        impl = "_ecx_dgrad_pass"
+        if Ta:
+            ks["cat"] = _ecx_dgrad_pass[(nA,)](
+                cat.dh, cat.w1, cat.idx, cat.order, cat.offsets, acc, frag_u, frag_n, frag_v,
+                Ta, 0, dxa, True, _BM, _BN, HID, WIDTH, 2 * WIDTH, _S, cat.dh.stride(0), em,
+                **_PASS_KW,
+            )
+        if Tc:
+            ks["item"] = _ecx_dgrad_pass[(nC,)](
+                item.dh, item.w1, item.idx, item.order, item.offsets, acc, frag_u, frag_n,
+                frag_v, Tc, nA, dxc, False, _BM, _BN, HID, WIDTH, WIDTH, _S, item.dh.stride(0),
+                em, **_PASS_KW,
+            )
     if nt:
         ks["combine"] = _ecx_combine[(nt,)](
             frag_u, frag_n, frag_v, acc, WIDTH, _COMBINE_BF, num_warps=_COMBINE_WARPS
@@ -548,6 +619,7 @@ def dgrad_segreduce(
     )
     LAST_KERNELS.clear()
     LAST_KERNELS.update(ks)
+    LAST_PASS_IMPL = impl
     return acc
 
 
@@ -627,11 +699,12 @@ def prebuild(device: torch.device) -> str:
     fp64 reference on a synthetic exact-arithmetic input. Raises on mismatch
     (the caller latches the fused path off). Its tensors are fresh allocations, i.e.
     the production specialization class (SPECIALIZATION above), so the first
-    fused backward does not compile."""
+    fused backward does not compile. Always the Triton passes: X2H's own
+    prebuild (blas_warmup) follows and keeps them as its fallback."""
     cat, item, U = _synthetic(device)
     if check_invariants(cat, item, U) is not None:
         raise RuntimeError("prebuild input violates the member invariants")
-    acc = dgrad_segreduce(cat, item, U)
+    acc = dgrad_segreduce(cat, item, U, _impl="triton")
     ref = _reference(cat, item, U)
     torch.cuda.synchronize(device)
     bad = int((acc.view(torch.int32) != ref.view(torch.int32)).sum().item())

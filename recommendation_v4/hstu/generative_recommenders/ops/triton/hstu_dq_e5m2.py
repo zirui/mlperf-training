@@ -56,6 +56,7 @@ Fork of ops/flydsl/hstu_dq_split.py (`_dq_unit` /
 `_dq_from_ds_sched_kernel`, left untouched); keep the main loop in sync.
 """
 
+import os
 from typing import Optional, Sequence, Tuple, Union
 
 import torch
@@ -73,10 +74,16 @@ _SCHEDS = ("il", "lpt", "ilb", "ilr", "bc")
 # DQ_SPLIT_OPT e<N> token); anything else makes the sink decline.
 _LAUNCH_OPTS = frozenset(("waves_per_eu", "num_stages", "num_ctas",
                           "matrix_instr_nonkdim", "kpack"))
+# dq8 epilogue diet V3 (DLRM_HSTU_FP8_DQ8_DIET). Read once at import like the other DLRM_HSTU_FP8_
+# kernel switches; only "1" arms it (absent = off in code; the gin binding turns it on); env "0" is the
+# kill switch (a pre-set env value wins over the binding).
+_DQ8_DIET_ENV = os.environ.get("DLRM_HSTU_FP8_DQ8_DIET")  # the import-time value (arming line)
+_DQ8_DIET: bool = _DQ8_DIET_ENV == "1"
+_DQ8_DIET_LOGGED: bool = False
 
 
 @triton.jit
-def _dq8_unit(
+def _dq8_unit_v0(
     ws_ptr, hdr_ptr, k_ptr, e8_ptr, cu_ptr, dq_ptr, sc, WS_HDR, rs_k, rs_dq,
     b, h, u, dz8_ptr, rs8, pfx_ptr, pcol_ptr, pamax_ptr, inv_ptr,
     H: tl.constexpr, D: tl.constexpr, BMQ: tl.constexpr,
@@ -171,6 +178,175 @@ def _dq8_unit(
         am = tl.max(tl.reshape(tl.abs(x), (BMQ * D,), can_reorder=True),
                     axis=0)
         tl.store(pamax_ptr + prow * H + h, am)
+
+
+@triton.jit
+def _dq8_unit_v3(
+    ws_ptr, hdr_ptr, k_ptr, e8_ptr, cu_ptr, dq_ptr, sc, WS_HDR, rs_k, rs_dq,
+    b, h, u, dz8_ptr, rs8, pfx_ptr, pcol_ptr, pamax_ptr, inv_ptr,
+    H: tl.constexpr, D: tl.constexpr, BMQ: tl.constexpr,
+    FP8_DOT: tl.constexpr, STAGES: tl.constexpr, NBLK: tl.constexpr,
+    RM: tl.constexpr, CMW: tl.constexpr, EVW: tl.constexpr,
+    CMK: tl.constexpr, EVK: tl.constexpr, SPTR: tl.constexpr,
+    WS_C64: tl.constexpr, STORE_BF16: tl.constexpr, LIMIT: tl.constexpr,
+):
+    """`hstu_dq_split._dq_unit` + the e5m2 / partials epilogue, with a
+    mask-free epilogue for full tiles."""
+    st = tl.load(cu_ptr + b).to(tl.int64)
+    L = tl.load(cu_ptr + b + 1).to(tl.int64) - st
+    m0 = u * BMQ
+    if m0 < L:
+        nb = (L + 127) // 128
+        pre = tl.load(hdr_ptr + b).to(tl.int64)
+        base = WS_HDR + (pre + h * nb * (nb + 1)) * 8192
+        t0 = m0 // 64
+        offs_m = tl.arange(0, BMQ)
+        offs_k = tl.arange(0, 128 * NBLK)
+        offs_d = tl.arange(0, D)
+        kb = offs_k // 128
+        kr = offs_k % 128
+        if WS_C64:
+            kp = ((kr // 16) % 2) * 64 + (kr // 32) * 16 + kr % 16
+        else:
+            kp = kr
+        acc = tl.zeros((BMQ, D), dtype=tl.float32)
+        nj = (t0 + BMQ // 64 - 1) // 2 + 1
+        for jc in tl.range(0, (nj + NBLK - 1) // NBLK, num_stages=STAGES):
+            if SPTR:
+                pa = ws_ptr + base + (2 * jc * nb - jc * (jc - 1)
+                                      + (t0 - 2 * jc)) * 8192
+                aoff = offs_m[:, None] * 128 + kp[None, :]
+                if RM:
+                    a = tl.load(pa + aoff, mask=((m0 + offs_m) < L)[:, None],
+                                other=0, cache_modifier=CMW,
+                                eviction_policy=EVW)
+                else:
+                    a = tl.load(pa + aoff, cache_modifier=CMW,
+                                eviction_policy=EVW)
+                pk = k_ptr + (st + 128 * jc) * rs_k + h * D
+                kt = tl.load(pk + kr[:, None] * rs_k + offs_d[None, :],
+                             mask=((128 * jc + kr) < L)[:, None], other=0,
+                             cache_modifier=CMK, eviction_policy=EVK)
+            else:
+                j = jc * NBLK + kb
+                slot = 2 * j * nb - j * (j - 1) + (t0 - 2 * j)
+                ok = ((t0 + offs_m // 64)[:, None] >= 2 * j[None, :]) & \
+                    (j < nj)[None, :]
+                if RM:
+                    ok = ok & ((m0 + offs_m) < L)[:, None]
+                a = tl.load(ws_ptr + base + slot[None, :] * 8192
+                            + offs_m[:, None] * 128 + kp[None, :], mask=ok,
+                            other=0, cache_modifier=CMW, eviction_policy=EVW)
+                kn = 128 * j + kr
+                kt = tl.load(k_ptr + (st + kn)[:, None] * rs_k + h * D
+                             + offs_d[None, :], mask=(kn < L)[:, None],
+                             other=0, cache_modifier=CMK, eviction_policy=EVK)
+            a = a.to(tl.float8e4nv, bitcast=True)
+            kt = kt.to(tl.float8e4nv, bitcast=True)
+            if FP8_DOT:
+                acc = tl.dot(a, kt, acc)
+            else:
+                acc = tl.dot(a.to(tl.bfloat16), kt.to(tl.bfloat16), acc)
+        # Full-tile fast path: a FULL 128-row tile (every row < L, L = this
+        # sequence's length) takes the mask-free epilogue `_dq8_epi_full`; a
+        # partial tile (and the STORE_BF16 diagnostic) runs the masked
+        # epilogue of `_dq8_unit_v0`.
+        if (m0 + BMQ <= L) & (STORE_BF16 == 0):
+            _dq8_epi_full(acc, st, m0, b, h, u, e8_ptr, sc, dz8_ptr, rs8,
+                          pfx_ptr, pcol_ptr, pamax_ptr, inv_ptr, H, D, BMQ,
+                          LIMIT)
+        else:
+            rows = m0 + offs_m
+            rmask = rows < L
+            e8 = tl.load(e8_ptr + (st + rows) * H + h, mask=rmask, other=127)
+            rs = (e8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            out = acc * (rs * sc)[:, None]
+            ob = out.to(tl.bfloat16)
+            if STORE_BF16:
+                # Diagnostic dual store (gates only).
+                tl.store(dq_ptr + (st + rows)[:, None] * rs_dq + h * D
+                         + offs_d[None, :], ob, mask=rmask[:, None])
+            # The value the shipped cast kernel loads, back in fp32, cast with
+            # the same op order as _quantize_amax_colsum_kernel.
+            x = tl.where(rmask[:, None], ob.to(tl.float32), 0.0)
+            inv = tl.load(inv_ptr)
+            y = tl.minimum(tl.maximum(x * inv, -LIMIT), LIMIT)
+            tl.store(dz8_ptr + (st + rows)[:, None] * rs8 + h * D
+                     + offs_d[None, :], y.to(dz8_ptr.dtype.element_ty),
+                     mask=rmask[:, None])
+            prow = tl.load(pfx_ptr + b).to(tl.int64) + u
+            # Column sum by MFMA: ones[16, BMQ] @ x (x is bf16-exact,
+            # products exact, fp32 accumulate in hardware order); row 0 is
+            # stored.
+            ones = tl.full((16, BMQ), 1.0, tl.bfloat16)
+            xb = tl.where(rmask[:, None], ob, 0.0).to(tl.bfloat16)
+            cs16 = tl.dot(ones, xb)
+            r16 = tl.arange(0, 16)
+            tl.store(pcol_ptr + prow * (H * D) + h * D + offs_d[None, :]
+                     + 0 * r16[:, None], cs16, mask=(r16 == 0)[:, None])
+            am = tl.max(tl.reshape(tl.abs(x), (BMQ * D,), can_reorder=True),
+                        axis=0)
+            tl.store(pamax_ptr + prow * H + h, am)
+
+
+@triton.jit
+def _dq8_epi_full(
+    acc, st, m0, b, h, u, e8_ptr, sc, dz8_ptr, rs8, pfx_ptr, pcol_ptr,
+    pamax_ptr, inv_ptr,
+    H: tl.constexpr, D: tl.constexpr, BMQ: tl.constexpr,
+    LIMIT: tl.constexpr,
+):
+    """`_dq8_unit`'s epilogue for a FULL tile (m0 + BMQ <= L, so the shipped
+    rmask is all-true). Byte identity with the shipped (masked) epilogue:
+      * where(True, v, 0) == v and an all-true mask is no mask, so x, xb, the
+        e5m2 bytes and the colsum MFMA operands are the shipped ones bit for
+        bit (same dot shape, dtypes and layouts -> the same MFMA chain);
+      * the int64 row bases are folded into scalars (same byte addresses);
+      * amax: fp32 -> bf16 (v_cvt_pk_bf16_f32, RNE) is odd-symmetric and
+        monotone non-decreasing, so max_i |bf16(out_i)| == bf16(max_i
+        |out_i|) under maxnum (NaNs dropped either way). This skips unpacking
+        the bf16 tile back to fp32 and the |x| selects. Only an all-NaN
+        tile's partial could differ (NaN payload); _dq8_fin_kernel's maxnum
+        from a 0 init drops NaN partials, so the finalized amax is unaffected.
+    The amax is reduced right after `out`, so `out` dies before the cast and
+    the colsum (this order keeps the kernel within 128 VGPRs without spills).
+    """
+    offs_m = tl.arange(0, BMQ)
+    offs_d = tl.arange(0, D)
+    e8 = tl.load(e8_ptr + ((st + m0) * H + h) + offs_m * H)
+    rs = (e8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    out = acc * (rs * sc)[:, None]
+    # amax first (see the docstring); rounded to bf16 at the store.
+    amf = tl.max(tl.reshape(tl.abs(out), (BMQ * D,), can_reorder=True),
+                 axis=0)
+    ob = out.to(tl.bfloat16)
+    # The value the shipped cast kernel loads, back in fp32, cast with the
+    # same op order as _quantize_amax_colsum_kernel (no row mask: all valid).
+    x = ob.to(tl.float32)
+    inv = tl.load(inv_ptr)
+    y = tl.minimum(tl.maximum(x * inv, -LIMIT), LIMIT)
+    p8 = dz8_ptr + ((st + m0) * rs8 + h * D)
+    tl.store(p8 + offs_m[:, None] * rs8 + offs_d[None, :],
+             y.to(dz8_ptr.dtype.element_ty))
+    prow = tl.load(pfx_ptr + b).to(tl.int64) + u
+    # Column sum by MFMA: ones[16, BMQ] @ ob (the shipped xb, unmasked).
+    ones = tl.full((16, BMQ), 1.0, tl.bfloat16)
+    cs16 = tl.dot(ones, ob)
+    r16 = tl.arange(0, 16)
+    tl.store(pcol_ptr + prow * (H * D) + h * D + offs_d[None, :]
+             + 0 * r16[:, None], cs16, mask=(r16 == 0)[:, None])
+    am = amf.to(tl.bfloat16).to(tl.float32)
+    tl.store(pamax_ptr + prow * H + h, am)
+
+
+# dq8 epilogue diet V3: `_dq8_sched_kernel` below calls `_dq8_unit`, which is
+# `_dq8_unit_v3` (a FULL 128-row tile takes the mask-free epilogue `_dq8_epi_full`; bit-identical dz8 q
+# block, pcol, q colsum and finalized amax; only the per-tile amax partial of an all-NaN tile may differ,
+# in NaN payload, and `_dq8_fin_kernel`'s maxnum drops it) when DLRM_HSTU_FP8_DQ8_DIET == "1" at import,
+# else the shipped `_dq8_unit_v0`.
+# `_dq8_sched_kernel` keeps its name and parameter list either way, so its TSPEC rows compile it (with the
+# selected unit) before RUN_START in BOTH settings (counted as src_changed).
+_dq8_unit = _dq8_unit_v3 if _DQ8_DIET else _dq8_unit_v0
 
 
 @triton.jit
@@ -681,6 +857,17 @@ class DqE5m2Sink:
                  else triton.cdiv(BH, 8))
         launch_kw = dict(launch_kw)
         launch_kw["waves_per_eu"] = _WAVES_PER_EU
+        global _DQ8_DIET_LOGGED
+        if not _DQ8_DIET_LOGGED:  # once per process, at the first dq8 launch
+            _DQ8_DIET_LOGGED = True
+            print(
+                "[dq8-diet] epilogue diet V3 "
+                + ("ARMED: _dq8_sched_kernel runs _dq8_unit_v3" if _DQ8_DIET
+                   else "OFF: _dq8_sched_kernel runs the shipped _dq8_unit_v0")
+                + f" (DLRM_HSTU_FP8_DQ8_DIET={_DQ8_DIET_ENV!r} at import)"
+                + f" rank={os.environ.get('RANK', '?')}",
+                flush=True,
+            )
         _dq8_sched_kernel[(units * 8 * U,)](
             ws, hdr, k.view(torch.uint8), e8, seq_offsets, dq, perm,
             float(sc), _dqs.ws_header_bytes(B), int(rs_k), int(rs_dq), U, BH,

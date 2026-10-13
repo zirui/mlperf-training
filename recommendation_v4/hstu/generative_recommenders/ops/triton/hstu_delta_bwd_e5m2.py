@@ -69,6 +69,7 @@ _VKP_V2: bool = os.environ.get("DLRM_HSTU_FP8_BWD_VKP_V2", "0") == "1"
 # element-wise dq accumulator (DECLARED fp32-order change of dq only), and
 # longest-first launch order (2: one-program Triton sort for Z <= 4096 else
 # torch.argsort; 1: torch.argsort; 0: natural order). Order is result-free.
+# Any change of this tuple makes the v2 diet kernel decline.
 _VKP_V2_AMAX_ROWMAX: bool = True
 _VKP_V2_DQ_ELEM: bool = True
 _VKP_V2_LPT: int = 2

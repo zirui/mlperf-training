@@ -112,6 +112,12 @@ EXIT_HOOKS: Tuple[Tuple[str, str], ...] = (
     # both print only (no device work) and are no-ops in a process with no event.
     ("generative_recommenders.ops.hip.l11_do8", "_final"),
     ("generative_recommenders.ops.flydsl.hstu_do8_registry", "_final"),
+    # The DO8-only producer's own "final=1" line.
+    ("generative_recommenders.ops.hip.l11_do8", "_only_final"),
+    # MX6 forward trio (DLRM_HSTU_FP8_FWD_MXFP6, default off): ops/hip/mx6_fwd
+    # registers its "[mx6-fwd] counters at exit" line with atexit at import
+    # (knob on only); print only, no device work.
+    ("generative_recommenders.ops.hip.mx6_fwd", "_at_exit"),
 )
 
 # Grep-able log literals (rank 0).

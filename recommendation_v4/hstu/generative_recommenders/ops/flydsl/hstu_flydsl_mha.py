@@ -973,43 +973,183 @@ def c8_do_blk_planned(
     hstu_do8_registry.take() / discard() with a counter: env changes between
     forward and backward, and a dO that is not the producer's dx (autograd
     accumulation, a hook, a non-contiguous gradient). Any exception: False.
+    Contract v2: with DLRM_HSTU_FP8_L11_DO8_ONLY=1 a planned call also keeps
+    its plan inputs on `out` (_Do8PlanFacts, picked up by new_site) so that
+    hstu_do8_registry.plan() can re-evaluate this predicate at the
+    producer's backward.
     """
     try:
-        if not flydsl_selected() or not bwd_full_fp8_enabled():
-            return False
-        if os.environ.get("DLRM_HSTU_FP8_BWD_FULL_HYBRID", ""):
-            return False
-        check_removed_c8_knobs()
-        if not _host_ok and (unsupported_hardware_reason() is not None
-                             or _load_kernel() is None):
-            return False
-        kernel = _load_kernel()
-        if kernel is None:
-            return False
-        input_fp8 = FP8_E4M3 is not None and k.dtype is FP8_E4M3
-        q_bf16 = input_fp8 and q.dtype is torch.bfloat16
-        if not input_fp8 or q_bf16 or not (qkv_scale > 0.0):
-            return False
-        if (out is None or out.dtype is not torch.bfloat16 or out.dim() != 3
-                or tuple(out.shape) != tuple(v.shape)
-                or not (q.shape[0] == k.shape[0] == v.shape[0]
-                        == out.shape[0])):
-            return False
-        if num_targets is not None and not _targets_max_known(num_targets):
-            return False
-        if unsupported_shape_reason(
-            q, k, v, out, num_targets, max_attn_len, contextual_seq_len,
-            num_softmax_heads,
-        ) is not None:
-            return False
-        fp8_mfma = ("k128" if bwd_qk_mfma_mode() in ("fp8", "fp8_strict")
-                    else "")
-        config = kernel.SHIPPED
-        heads, dim = q.shape[1], q.shape[2]
-        return _c8_do_blk_selected(True, fp8_mfma, input_fp8, q_bf16, config,
-                                   _c8_blk_ok(config, heads, dim))
+        planned = _c8_do_blk_plan_reason(
+            q=q, k=k, v=v, out=out, num_targets=num_targets,
+            max_attn_len=max_attn_len, contextual_seq_len=contextual_seq_len,
+            num_softmax_heads=num_softmax_heads, qkv_scale=qkv_scale,
+        ) is None
+        if planned and hstu_do8_registry.only_requested():
+            hstu_do8_registry.stash_plan(out, _Do8PlanFacts(
+                q, k, v, out, num_targets, max_attn_len, contextual_seq_len,
+                num_softmax_heads, qkv_scale))
+        return planned
     except Exception:  # noqa: BLE001 - a site gate never breaks a forward
         return False
+
+
+def _c8_do_blk_plan_reason(
+    *, q, k, v, out, num_targets, max_attn_len, contextual_seq_len,
+    num_softmax_heads: int = 0, qkv_scale: float = 1.0,
+) -> Optional[str]:
+    """c8_do_blk_planned's predicates in its order: None when the call's
+    FlyDSL backward takes the C8 do_blk branch, else the first failing one.
+    May raise (check_removed_c8_knobs, an invalid QK_MFMA value): callers
+    treat that as not planned. q/k/v/out are read for .shape, .dtype and
+    .dim() only (contract v2 re-evaluates it from _TSpec stand-ins)."""
+    if not flydsl_selected():
+        return "HSTU_ATTN_BWD is not flydsl"
+    if not bwd_full_fp8_enabled():
+        return "DLRM_HSTU_FP8_BWD_FULL off"
+    if os.environ.get("DLRM_HSTU_FP8_BWD_FULL_HYBRID", ""):
+        return "DLRM_HSTU_FP8_BWD_FULL_HYBRID set (both kernels run)"
+    check_removed_c8_knobs()
+    if not _host_ok and (unsupported_hardware_reason() is not None
+                         or _load_kernel() is None):
+        return "host cannot run the FlyDSL backward"
+    kernel = _load_kernel()
+    if kernel is None:
+        return "no FlyDSL backward kernel module"
+    input_fp8 = FP8_E4M3 is not None and k.dtype is FP8_E4M3
+    q_bf16 = input_fp8 and q.dtype is torch.bfloat16
+    if not input_fp8 or q_bf16 or not (qkv_scale > 0.0):
+        return ("q and k not both e4m3, or qkv_scale <= 0 (an FP8 "
+                "calibration step: the bf16-dO kernel reads the bf16 dO)")
+    if (out is None or out.dtype is not torch.bfloat16 or out.dim() != 3
+            or tuple(out.shape) != tuple(v.shape)
+            or not (q.shape[0] == k.shape[0] == v.shape[0]
+                    == out.shape[0])):
+        return "not the full-length ordinary layer (q/k/v/dO shapes)"
+    if num_targets is not None and not _targets_max_known(num_targets):
+        return "num_targets max not memoized (no sync here)"
+    reason = unsupported_shape_reason(
+        q, k, v, out, num_targets, max_attn_len, contextual_seq_len,
+        num_softmax_heads,
+    )
+    if reason is not None:
+        return "shape fallback: " + reason
+    fp8_mfma = ("k128" if bwd_qk_mfma_mode() in ("fp8", "fp8_strict")
+                else "")
+    config = kernel.SHIPPED
+    heads, dim = q.shape[1], q.shape[2]
+    if not _c8_do_blk_selected(True, fp8_mfma, input_fp8, q_bf16, config,
+                               _c8_blk_ok(config, heads, dim)):
+        return "C8 do_blk not selected (qk_mfma or kernel config)"
+    return None
+
+
+# Contract v2: the debug readers of the bf16 dO (_full_fp8_stats and
+# _bwd_dump read dout_orig, the HSTU_ATTN_BWD_CHECK reference reads dout).
+_DO8_ONLY_DEBUG_ENVS = ("DLRM_HSTU_FP8_BWD_FULL_STATS", "DLRM_HSTU_FP8_BWD_DUMP",
+                        "DLRM_HSTU_FP8_BWD_DUMP_CALLS", "HSTU_ATTN_BWD_CHECK")
+
+
+def _do8_only_debug_reason() -> Optional[str]:
+    """Contract v2: the first armed debug reader of the bf16 dO, else None.
+    DLRM_HSTU_FP8_BWD_DUMP counts on any non-empty raw value, the dump
+    reader's own predicate (_bwd_dump_dir: a directory name, "0" and
+    whitespace included); the integer knobs on any value but "" or "0"
+    (after strip). Stricter than the helpers: rank, call index and
+    remaining count are not consulted."""
+    for name in _DO8_ONLY_DEBUG_ENVS:
+        raw = os.environ.get(name, "")
+        if (raw != "" if name == "DLRM_HSTU_FP8_BWD_DUMP"
+                else raw.strip() not in ("", "0")):
+            return f"debug reader of the bf16 dO armed: {name}"
+    return None
+
+
+class _TSpec:
+    """Shape and dtype of a tensor, without its storage: all the C8 plan
+    predicates read (contract v2)."""
+
+    __slots__ = ("shape", "dtype")
+
+    def __init__(self, t) -> None:
+        self.shape = t.shape
+        self.dtype = t.dtype
+
+    def dim(self) -> int:
+        return len(self.shape)
+
+
+class _Do8PlanFacts:
+    """Contract v2: one ordinary-layer attention call's C8 plan inputs, kept
+    by c8_do_blk_planned (the 'only' knob on) on the site and re-evaluated by
+    hstu_do8_registry.plan() at the producer's backward, before its launch,
+    with the environment and num_targets memo of that moment. Keeps no
+    tensor storage except num_targets (B ints, saved by the attention ctx
+    anyway; the memo key is its identity and _version)."""
+
+    __slots__ = ("q", "k", "v", "out", "num_targets", "max_attn_len",
+                 "contextual_seq_len", "num_softmax_heads", "qkv_scale")
+
+    def __init__(self, q, k, v, out, num_targets, max_attn_len,
+                 contextual_seq_len, num_softmax_heads, qkv_scale) -> None:
+        self.q, self.k, self.v, self.out = (
+            _TSpec(q), _TSpec(k), _TSpec(v), _TSpec(out))
+        self.num_targets = num_targets
+        self.max_attn_len = max_attn_len
+        self.contextual_seq_len = contextual_seq_len
+        self.num_softmax_heads = num_softmax_heads
+        self.qkv_scale = float(qkv_scale)
+
+    def reason(self) -> Optional[str]:
+        """None: the call still takes the C8 do_blk branch and no debug
+        reader of the bf16 dO is armed; else why not ('plus')."""
+        try:
+            why = _c8_do_blk_plan_reason(
+                q=self.q, k=self.k, v=self.v, out=self.out,
+                num_targets=self.num_targets, max_attn_len=self.max_attn_len,
+                contextual_seq_len=self.contextual_seq_len,
+                num_softmax_heads=self.num_softmax_heads,
+                qkv_scale=self.qkv_scale)
+        except Exception as error:  # noqa: BLE001 - 'plus', never a raise
+            why = f"the C8 predicate raised {type(error).__name__}"
+        if why is not None:
+            return "not C8: " + why
+        return _do8_only_debug_reason()
+
+
+def _do8_only_require_c8(dout, q, k, v, qkv_scale) -> None:
+    """Contract v2, top of flydsl_hstu_attention_bwd for a dO that carries an
+    'only' record: raise hstu_do8_registry.Do8OnlyError, before anything
+    below reads dout, unless this call takes the C8 do_blk branch (whose
+    take() hands over the record) with no debug reader of the bf16 dO. The
+    branch's own predicates: no HYBRID, DLRM_HSTU_FP8_BWD_FULL, e4m3 q and k,
+    qk_mfma fp8/fp8_strict, _c8_do_blk_selected on kernel.SHIPPED (the
+    branch's config differs from SHIPPED only in sched/scale_in_cvt, which
+    it does not read). try_flydsl_attention_bwd's selection and shape
+    returns raise through hstu_do8_registry.discard()."""
+    kernel = _load_kernel()
+    input_fp8 = FP8_E4M3 is not None and k.dtype is FP8_E4M3
+    q_bf16 = input_fp8 and q.dtype is torch.bfloat16
+    if os.environ.get("DLRM_HSTU_FP8_BWD_FULL_HYBRID", ""):
+        why = "DLRM_HSTU_FP8_BWD_FULL_HYBRID also runs the bf16-dO kernel"
+    elif not bwd_full_fp8_enabled():
+        why = "DLRM_HSTU_FP8_BWD_FULL is off (bf16-dO kernel)"
+    elif kernel is None or not _c8_do_blk_selected(
+            True,
+            "k128" if (input_fp8 and not q_bf16 and bwd_qk_mfma_mode()
+                       in ("fp8", "fp8_strict")) else "",
+            input_fp8, q_bf16, kernel.SHIPPED,
+            _c8_blk_ok(kernel.SHIPPED, q.shape[1], q.shape[2])):
+        why = ("no C8 do_blk branch for this call (q/k dtypes, e.g. an FP8 "
+               "calibration step; qk_mfma; kernel config)")
+    else:
+        why = _do8_only_debug_reason()
+        if why is None and not (dout.dtype is torch.bfloat16
+                                and dout.is_contiguous()):
+            why = "the dO is not a contiguous bf16 tensor"
+    if why is not None:
+        raise hstu_do8_registry.Do8OnlyError(
+            "[hstu-attn] dO8 contract v2 'only': this attention backward "
+            f"cannot serve a dO whose bf16 values were never written: {why}")
 
 
 def flydsl_hstu_attention_bwd(
@@ -1049,6 +1189,10 @@ def flydsl_hstu_attention_bwd(
     default dq16 mode dq is bf16 and IS the accumulator, so there is no
     down-convert pass and the zero-fill moves half the bytes.
     """
+    # Contract v2 ('only'): a dO whose producer skipped the bf16
+    # store must take the C8 branch below; raise before anything reads it.
+    if hstu_do8_registry.only_record(dout) is not None:
+        _do8_only_require_c8(dout, q, k, v, qkv_scale)
     _hy = os.environ.get("DLRM_HSTU_FP8_BWD_FULL_HYBRID", "")
     if _hy and not _hybrid_inner[0] and bwd_full_fp8_enabled():
         if _hy not in ("dq", "dkdv"):

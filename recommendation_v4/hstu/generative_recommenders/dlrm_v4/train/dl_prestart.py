@@ -104,18 +104,75 @@ def require_run_start(what: str) -> None:
         )
 
 
-def page_cache_snapshot(root: str, rank: int) -> Optional[str]:
-    """Count page-cache-resident pages of every .npy under ``root`` and log
-    them, separating the header page of each file from sample pages. Uses
+# The reference data set, relative to the data root: the hstu_cache_L<N>
+# entries of the checksums/sha256sums_yambda_5b_cache.txt manifest,
+# processed_5b/item_popularity.npy and the two shared_metadata item mappings
+# the reference reader opens. "prestart" marks the files the trainer itself
+# opens before RUN_START (dataset construction, as in the reference);
+# anchor_ts and the time-window index (ts_indices/ts_offsets) are read only
+# after RUN_START.
+_REF_CACHE_FILES: Tuple[Tuple[str, bool], ...] = (
+    ("_READY", True),
+    ("store_meta.json", True),
+    ("flat_event_types.npy", True),
+    ("flat_is_like.npy", True),
+    ("flat_is_listen_plus.npy", True),
+    ("flat_is_organic.npy", True),
+    ("flat_is_skip.npy", True),
+    ("flat_item_ids.npy", True),
+    ("flat_played_ratio.npy", True),
+    ("flat_timestamps.npy", True),
+    ("flat_uid.npy", True),
+    ("unique_uids.npy", True),
+    ("user_start.npy", True),
+    ("user_end.npy", True),
+    ("positions_L{H}.npy", True),
+    ("anchor_ts_L{H}.npy", False),
+    # Offline time-window index (DL_WINDOW_INDEX=1). Read only after RUN_START.
+    ("ts_indices_L{H}_W86400.npy", False),
+    ("ts_offsets_L{H}_W86400.npy", False),
+)
+_REF_OTHER_FILES: Tuple[Tuple[str, bool], ...] = (
+    ("processed_5b/item_popularity.npy", True),
+    ("shared_metadata/artist_item_mapping.parquet", True),
+    ("shared_metadata/album_item_mapping.parquet", True),
+)
+
+
+def reference_data_files(
+    history_length: int = 4086, prestart_only: bool = False
+) -> List[str]:
+    """Reference data files relative to the data root (see _REF_CACHE_FILES)."""
+    cache = f"processed_5b/hstu_cache_L{int(history_length)}"
+    out = [
+        f"{cache}/{name.format(H=int(history_length))}"
+        for name, pre in _REF_CACHE_FILES
+        if pre or not prestart_only
+    ]
+    out += [name for name, pre in _REF_OTHER_FILES if pre or not prestart_only]
+    return out
+
+
+def page_cache_snapshot(
+    root: str, rank: int, history_length: Optional[int] = None
+) -> Optional[str]:
+    """Count page-cache-resident pages of the reference .npy files the trainer
+    opens before RUN_START (``reference_data_files(prestart_only=True)``) and
+    log them, separating the header page of each file from sample pages. Uses
     mincore(2) on a PROT_READ mapping, which reads nothing. Called right before
     RUN_START: after the launcher's cache flush, the sample-page count is the
-    evidence that no data was read before the clock. Diagnostics only."""
+    evidence that no data was read before the clock. Diagnostics only.
+
+    Only explicit reference paths are touched (no directory glob), so no
+    non-reference file in the data root is mapped before RUN_START.
+    ``history_length`` defaults to $HISTORY_LENGTH (gin default 4086)."""
     import ctypes
-    import glob
 
     import numpy as np
 
     try:
+        if history_length is None:
+            history_length = int(os.environ.get("HISTORY_LENGTH", "4086") or 4086)
         libc = ctypes.CDLL(None, use_errno=True)
         libc.mmap.restype = ctypes.c_void_p
         libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
@@ -124,7 +181,11 @@ def page_cache_snapshot(root: str, rank: int) -> Optional[str]:
         libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
         page = os.sysconf("SC_PAGE_SIZE")
         prot_read, map_shared, chunk = 0x1, 0x01, 1 << 30
-        files = sorted(glob.glob(os.path.join(root, "**", "*.npy"), recursive=True))
+        files = [
+            os.path.join(root, rel)
+            for rel in reference_data_files(history_length, prestart_only=True)
+            if rel.endswith(".npy") and os.path.isfile(os.path.join(root, rel))
+        ]
         total = header = sample = 0
         hot: List[str] = []
         for p in files:

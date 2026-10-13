@@ -664,6 +664,60 @@ apply_env_bootstrap.DLRM_HSTU_FP8_COLSUM = True
 #     bundle below (streaming section). NUMERICS: none.
 #     Opt out (development only, not a compliant timed run): CLEAR_CACHES=0.
 #
+# Reference-data-only staging flag (nothing in the trainer reads it; the
+#     bootstrap only exports it). A flag the launcher's data-staging step may
+#     read: True = stage only the reference data set
+#     (dl_prestart.reference_data_files(): the hstu_cache_L<N> entries of
+#     checksums/sha256sums_yambda_5b_cache.txt, the time-window index
+#     ts_indices/ts_offsets, processed_5b/item_popularity.npy and the two
+#     shared_metadata item mappings), so no non-reference file is in the data
+#     directory. Keep True for an MLPerf submission: no knowledge of the
+#     training data may be generated offline or before RUN_START beyond what
+#     the reference prepares.
+#     NUMERICS: none (the trainer opens the same reference files either way).
+#     Kill switch: env DLRM_HSTU_FP8_STAGE_REF_ONLY=0 (wins over this binding).
+#     Not FP8 math.
+apply_env_bootstrap.DLRM_HSTU_FP8_STAGE_REF_ONLY = True
+#
+# Persistent compiled-kernel cache across containers (KCACHE_DIR; NOT a gin
+#     knob: it runs in the launcher, before and after the trainer process).
+#     Default OFF (KCACHE_DIR unset = none).
+#     WHAT: Triton keeps compiled kernels in the container's writable layer,
+#     so a freshly provisioned container compiles every Triton kernel inside
+#     the timed region. With KCACHE_DIR=<absolute dir under REPO_MOUNT or
+#     DATA_MOUNT>, each node's worker copies $KCACHE_DIR/triton into the
+#     container-local TRITON_CACHE_DIR before the trainer starts (untimed, no
+#     dataset touched; per-entry temp copy + rename, time-bounded) and logs
+#     the bundle's content digest. With KCACHE_PUBLISH=1 (populating runs
+#     only) it also publishes the entries this run compiled back, by atomic
+#     rename, after the trainer exits with rc=0 (after RUN_STOP); the default
+#     KCACHE_PUBLISH=0 never creates, chmods or writes the bundle. Nothing
+#     touches shared storage while the clock runs, and Triton autotune results
+#     are never copied (only compiled code). Triton keys every entry on the
+#     kernel source, constexprs, specialization, target and Triton build, so
+#     a stale entry is a miss, never a wrong kernel; the key does not cover
+#     the ROCm runtime or the image, so keep one bundle per image and tree.
+#     KCACHE_FLYDSL=1 (default 0; FlyDSL writes its own disk cache
+#     non-atomically from the node's 8 ranks) also carries that cache.
+#     Scored-run policy: populate a bundle with KCACHE_PUBLISH=1 in
+#     dedicated non-scored runs of the same image and tree at every node
+#     count used (a bundle holds only the specializations its runs compiled),
+#     freeze it read-only, and run scored runs with the default
+#     KCACHE_PUBLISH=0 on the frozen copy (every log carries the same digest).
+#     IMPACT: the Triton compiles of the first training steps and of the FP8
+#     switch become cache loads; no steady-state effect.
+#     NUMERICS: none (the same compiled kernels are loaded instead of built).
+#     RULES: compilation and its caching are initialization work done before
+#     the run (training_rules.adoc L545-549; training_policies issue #399 on
+#     pre-compiling, caching and loading before the run); the page-cache
+#     flush above still runs, and the cache holds compiled code only, no
+#     dataset content.
+#     ARMED log: launcher "[kcache] armed: seed+writeback <dir> publish=0|1
+#     triton_entries=<n>", one "[kcache] seeded <host>: ... bundle_sha=<hex>
+#     files=<n> publish=0|1" per node, and on trainer rank 0 "armed OK:
+#     [kcache] seeded entries=<n> bundle_sha=<hex> ... TRITON_CACHE_DIR=...".
+#     Kill switch: KCACHE_DIR unset or none (the default).
+#
 # TSPEC, a Triton specialization table compiled
 #     before RUN_START ($TRITON_SPEC_REPLAY; dlrm_v4/train/triton_spec.py,
 #     called from train_ranker). ON: the binding below names the table.
@@ -730,8 +784,13 @@ apply_env_bootstrap.DLRM_HSTU_FP8_COLSUM = True
 #     apply_env_bootstrap, not an @env_str macro like FP8_WARMUP: the recorder
 #     must be installed before the Phase-2 kernel imports, and an @env_str
 #     binding resolves only at the Phase-3 parse, after the replay.
-#     ON with the table recorded on this tree at 1n/2n/4n (start
-#     windows + final eval) and a 1n late window, merged into
+#     ON with the table recorded on this tree at 1n/2n/4n on synthetic data
+#     (start windows 0-7 + final eval of window 8, late windows 9-10 + final
+#     eval of window 11; dlrm_v4/train/tspec_synth_data.py builds the dataset
+#     on each node and scripts/ts_index_tool.py prebuild builds its window
+#     index from that synthetic cache; the unmodified trainer reads both
+#     through DLRM_DATA_PATH with DL_WINDOW_INDEX=1 (the production path),
+#     TRITON_SPEC_RECORD=<dir> and TRITON_SPEC_REPLAY=0), merged into
 #     ops/triton/triton_spec_table.jsonl. Re-record after any change listed
 #     above.
 #     Kill switch: TRITON_SPEC_REPLAY=0. Off costs one INFO line
@@ -777,6 +836,30 @@ apply_env_bootstrap.DLRM_HSTU_FP8_BWD_MSPLIT = 1
 apply_env_bootstrap.DLRM_HSTU_FP8_BWD_MSPLIT_SCHED = "mid,sb,wsl,sgv5,la"
 apply_env_bootstrap.DLRM_HSTU_FP8_BWD_DQ_SPLIT_SCHED = "ilr"
 apply_env_bootstrap.DLRM_HSTU_FP8_BWD_DQ_SPLIT_OPT = "sp,r1,wcg"
+#
+# dq8 EPILOGUE DIET V3 (bit-identical outputs, no precision change).
+# Files: ops/triton/hstu_dq_e5m2.py (`_dq8_unit_v3`, `_dq8_epi_full`; the shipped
+# epilogue stays as `_dq8_unit_v0`). What: the dq-split dq GEMM `_dq8_sched_kernel`
+# (attention backward; the e5m2 dq sink) runs, for every FULL 128-row
+# tile (every row < the sequence length; most in-model tiles), an epilogue
+# without the row mask: the int64 row bases fold into scalars and the tile amax
+# is reduced from |out| in fp32 and rounded to bf16 once, instead of from the
+# bf16-rounded tile (bf16 RNE is odd-symmetric and monotone, so the value is
+# the same). Partial tiles run the shipped epilogue verbatim. Bit-identical:
+# the e5m2 dz8 q block, the q colsum partials (pcol) and the finalized amax;
+# the per-tile amax partial (pamax) of an all-NaN tile may differ in NaN
+# payload only, and _dq8_fin_kernel's maxnum drops NaN partials. Kernel name
+# and parameter list are unchanged, so the TSPEC rows of `_dq8_sched_kernel`
+# compile it with the selected epilogue before RUN_START in both settings
+# (the replay detail line counts them as src_changed).
+# Arming line (stdout print, once per process at the first dq8 launch):
+#   "[dq8-diet] epilogue diet V3 ARMED: _dq8_sched_kernel runs _dq8_unit_v3";
+#   with the kill switch: "[dq8-diet] epilogue diet V3 OFF: ...".
+# Code default OFF; the binding below turns it ON; a pre-set env var wins over
+# gin (_bind_bool). Kill switch: env DLRM_HSTU_FP8_DQ8_DIET=0 (the shipped
+# epilogue, `_dq8_unit_v0`). Only "1" arms it ("true"/"True" do not); the
+# value is read once at import.
+apply_env_bootstrap.DLRM_HSTU_FP8_DQ8_DIET = True
 #
 # LayerNorm-family folds (five independent switches).
 #     WHAT: (a) WLN_FWD_V2: the D=256 swish LinearNorm forward of the
@@ -1553,7 +1636,7 @@ apply_env_bootstrap.DLRM_HSTU_FP8_PREPROC_GROUPED_TAIL = True
 # bundle; the fused dense Adam next to the dense optimizer.
 # Precedence where knobs reach the same call site:
 #   - Train loader: DL_SINGLE_POOL replaces the two alternating train pools
-#     with one chained pool; DL_PRIME_PACE acts only with it off. The eval
+#     with one chained pool. The eval
 #     batched builder changes only the eval pools' batch builder; the train
 #     batched builder moves the single train pool to the same builder, and
 #     with DL_SINGLE_POOL=0 the train pools keep the per-sample builder unless
@@ -1642,40 +1725,11 @@ apply_env_bootstrap.DLRM_HSTU_FP8_PREPROC_GROUPED_TAIL = True
 #     next window, as with the alternating pools.
 #     ARMED (every rank, once per run): "armed OK: [wbnd] single train pool
 #     rank=" followed by the rank and the world size.
-#     Opt out: DL_SINGLE_POOL=0 (two alternating pools; DL_PRIME_PACE then
-#     paces their re-prime).
+#     Opt out: DL_SINGLE_POOL=0: two alternating pools, the freed pool
+#     re-primed one-shot (its whole prefetch depth) for the window after next.
 window_single_pool.enabled = @dlsp/env_int()
 dlsp/env_int.key     = "DL_SINGLE_POOL"
 dlsp/env_int.default = 1
-
-# Paced prime of the window after next (fallback for
-#     DL_SINGLE_POOL=0).
-#     Only used with DL_SINGLE_POOL=0 (two alternating pools), and
-#     only with the chained warm window stream (train pipeline with
-#     TP_WARM_WINDOWS=1, default); without it the prime stays one-shot.
-#     WHAT: for a window after next that holds at least the prefetch depth
-#     (PREFETCH_FACTOR x NUM_WORKERS batches), the reset of its pool sends no
-#     index; the main thread hands that pool its indices gradually, in
-#     proportion to the active window's pulls, reaching the full depth after
-#     the first DL_PRIME_PACE fraction of the active window (and topping up
-#     to the full depth when the paced window opens, if a short active window
-#     ends first). Shorter windows keep the one-shot prime: their whole prime
-#     is small, and releasing it late would leave the pool too little time to
-#     build it before the window opens. utils.py window_prime_pacing /
-#     _PrefetchingWindowLoader.pace_tick.
-#     WHY / IMPACT: spreads the re-prime burst described under DL_SINGLE_POOL
-#     over the active window instead of removing it (full-size windows only).
-#     NUMERICS: unchanged inputs: same samples, same order, same batches, same
-#     workers and the same prefetch depth when each window starts; only WHEN
-#     the indices of the window after next reach its workers changes. Not a
-#     compute reduction.
-#     ARMED (every rank, once per run, only with DL_SINGLE_POOL=0): "armed
-#     OK: [wbnd] window prime pacing frac=", then the rank and the world size.
-#     With DL_PRIME_PACE=0 each rank prints "[wbnd] prime pacing OFF" instead.
-#     Opt out: DL_PRIME_PACE=0 (one-shot prime).
-window_prime_pacing.fraction = @dlpace/env_float()
-dlpace/env_float.key     = "DL_PRIME_PACE"
-dlpace/env_float.default = 0.75
 #
 # -----------------------------------------------------------------------------
 # FP8 K=tokens weight-gradient bundle: e5m2 du emission, a plain-segment
@@ -2206,6 +2260,111 @@ apply_env_bootstrap.DLRM_HSTU_FP8_BWD_DO8_TAKE = True
 #     directory builds again before RUN_START.
 #   DO8's build and cache key also follow L11's compiler override
 #     DLRM_HSTU_FP8_BWD_OUTPROJ_LNMD_FUSED_HIPCC.
+#
+# DO8 'only' mode (DLRM_HSTU_FP8_L11_DO8_ONLY; default OFF without this
+#     binding): DO8 under the dO8 registry's 'only' contract
+#     (ops/hip/l11_do8.py; ops/hip/l11_do8.cu built a second time with
+#     -DL11DO8_ONLY=1; consumer: the dO8 registry in
+#     ops/flydsl/hstu_do8_registry.py, hstu_flydsl_mha.py and the attention
+#     Function's backward of triton_hstu_preprocess_and_attention.py). Inert
+#     unless DO8 emits for the call (its DISPATCH above) and
+#     DLRM_HSTU_FP8_BWD_DO8 is 1.
+#     WHAT: on a call DO8 emits for, after every decline check and the
+#     dz8/dO8/E8 allocations (host only; the placeholder/partials allocations
+#     and the launch's checks follow it and are covered by cancel), the
+#     consumer's plan(site, attn) answers "only" when the attention backward
+#     of THIS call will take the C8 do_blk branch (the forward gate's own
+#     predicate, re-evaluated with the environment of that moment: FP8
+#     calibration steps have BF16 q/k and answer "plus"), no debug reader of
+#     the bf16 dO is armed (DLRM_HSTU_FP8_BWD_FULL_STATS,
+#     DLRM_HSTU_FP8_BWD_DUMP, DLRM_HSTU_FP8_BWD_DUMP_CALLS,
+#     HSTU_ATTN_BWD_CHECK) and nothing in autograd can read d(attn) (grad or
+#     anomaly mode, hooks or retain_grad on attn or on the attention output).
+#     Then ONE launch of the EM = 2 instantiation of l11_outproj_lnmd_bwd_do8
+#     writes everything DO8 writes EXCEPT the bf16 d(attn); autograd
+#     receives that launch's untouched d(attn) buffer (the allocation 'plus'
+#     makes, same shape and dtype) and the record is published with
+#     bf16_written=False. The attention backward and the exact re-runs of
+#     that layer call take the same dO8/E8 (retained until the attention
+#     Function's backward returns); any path that would read the bf16 dO
+#     raises Do8OnlyError (fail closed). "plus" (or the knob off): DO8
+#     exactly.
+#     WHY: deletes the bf16 d(attn) write of every ordinary-layer call.
+#     NUMERICS: bit-identical to DO8 'plus' on every training value. The
+#     attention backward takes the same dO8/E8 bytes (EM = 2 vs EM = 1:
+#     dO8, E8, dz8 and every partial byte-identical, checked at prebuild)
+#     and the C8 branch reads no bf16 dO. Memory: dO8 + E8 (T x 516 B) stay
+#     alive until the attention Function's backward returns (through the
+#     uvqk projection backward).
+#     FALLBACK: a planned call that fails after the plan (the launch's
+#     checks, the placeholder/partials allocations, the EM = 2 launch or
+#     the host work after it) is cancelled (hstu_do8_registry.cancel) and
+#     rerun by L11's own E5 launch (bf16 d(attn) written; the attention
+#     backward quantizes it). Only a failed EM = 2 kernel launch (rc > 0)
+#     latches 'only' alone (DO8 keeps its 'plus' launches); any other
+#     failure there latches DO8, as in 'plus'. A failed 'only' publish
+#     raises.
+#     BUILD: the 'only' .so (the EM = 2 instantiation), its own cache key,
+#     resource gate (0 VGPR spill, 0 scratch, LDS 163840) and self-check
+#     (EM = 2 vs EM = 1 on DO8's synthetic inputs: dO8, E8, dz8, AMAXP,
+#     DWP, DBP, DUCS byte-identical; a NaN sentinel prefilled in the EM = 2
+#     d(attn) buffer untouched), right after DO8's prebuild; any failure
+#     latches 'only' only. Needs DO8-VD (DLRM_HSTU_FP8_L11_VD=1): with the
+#     pre-diet ops/hip/l11_do8_novd.cu 'only' is INERT ('plus', one line).
+#     ARMED (every rank, "[rank N]", once each per process): "armed OK: L11
+#     DO8 dO8/E8 emission only prebuild before run_start ..." and, at the
+#     first 'only' record, "armed OK: L11 DO8 dO8/E8 emission only ACTIVE
+#     mode=e5 only ..."; the registry's "[hstu-attn] dO8 registry only
+#     REQUESTED", "... only ARMED" and its counter line (planned ==
+#     published == taken == released, released_untaken=0, cancelled=0). The
+#     producer's counters: "[l11-do8] only counters: planned= only_launched=
+#     published= cancelled= fallback= plan_plus= latched=". Trace: the
+#     l11_outproj_lnmd_bwd_do8<..., 2, 0, 2, 0> (EM = 2) kernel in place of
+#     the EM = 1 one; no _blk_wl_kernel / _blk_kernel.
+#     Must be ABSENT: "L11 DO8 dO8/E8 emission only DISABLED", "... only
+#     INERT", "... only prebuild DEVICE FAULT", "Do8OnlyError".
+#     Debug: DLRM_HSTU_FP8_L11_DO8_ONLY_POISON=1 fills every placeholder
+#     with bf16 NaN (0x7FC0), so a hidden reader of d(attn) shows NaN.
+#     With DLRM_HSTU_FP8_BWD_DQ_E5M2=0 also set DLRM_HSTU_FP8_L11_DO8_ONLY=0.
+#     Opt out: DLRM_HSTU_FP8_L11_DO8_ONLY=0 in the environment (a pre-set
+#     value wins over the binding; only the value 1 arms it): DO8 'plus'
+#     bit for bit (the registry is not asked; nothing 'only' is built or
+#     printed). DLRM_HSTU_FP8_L11_DO8=0 or DLRM_HSTU_FP8_BWD_DO8=0
+#     also end it (no emission at all).
+apply_env_bootstrap.DLRM_HSTU_FP8_L11_DO8_ONLY = True
+#
+# DO8 diet (DLRM_HSTU_FP8_L11_DO8_DIET; bit-identical outputs, no precision
+#     change): the VALU/SGPR diet of DO8's emission
+#     tail in ops/hip/l11_do8.cu (preprocessor switch L11DO8_DIET, default 1;
+#     ops/hip/l11_do8.py adds -DL11DO8_DIET=0 to every DO8 build when this
+#     knob is not 1). Inert unless DO8 builds (and the DO8-VD source
+#     l11_do8.cu is selected, DLRM_HSTU_FP8_L11_VD=1; the pre-diet
+#     l11_do8_novd.cu has no switch).
+#     WHAT: O1 the two group maxima as ONE packed pair of bf16 bit patterns
+#     through the 16-lane DPP max, the LDS exchange and the 8-wave max
+#     (v_pk_max_u16); combine v6x: the 8 packed exchange words as a 3-level
+#     tree after both ds_read_b128; O7(i) one wave-uniform SGPR row count
+#     per tile (nit) for every row-valid test (no hoisted, spilled per-row
+#     constants); O11 + v3b: grp_exp without the E == 0 select (implied by
+#     the clamp) and with the carry form of its +1; O2 + E8 window
+#     (RET 0 / EMV 2 / TM 0, the production family): a straight-line 8-row
+#     convert loop with rolling 4+4 staging reads and E8 built and stored
+#     in the reads' latency. Applies to the 'plus' and the 'only' .so.
+#     NUMERICS: bit-identical to the diet off on every output (dO8, E8, the
+#     dz8 u block and pad rows, d(attn), AMAXP/DWP/DBP/DUCS partials); each
+#     transform is an exact identity (u16 order = value order on the
+#     non-negative bf16 maxima).
+#     Each .so still passes DO8's and DO8 'only''s prebuild self-checks.
+#     BUILD: the knob only changes the hipcc flags (a separate cache key and
+#     .so per setting); on = exactly the flags without this switch.
+#     ARMED: DO8's and DO8 'only''s prebuild lines unchanged; with the knob
+#     off they end in "; diet OFF (DLRM_HSTU_FP8_L11_DO8_DIET != 1: ...)".
+#     Code default OFF; the binding below turns it ON; a pre-set env var
+#     wins over gin (_bind_bool). Only the value 1 arms it; the value is
+#     read once (the first DO8 build). Kill switch: env
+#     DLRM_HSTU_FP8_L11_DO8_DIET=0 (every guarded region of l11_do8.cu
+#     compiles its "#else" / "#if !" branch; same output bytes).
+apply_env_bootstrap.DLRM_HSTU_FP8_L11_DO8_DIET = True
 #
 # -----------------------------------------------------------------------------
 # Same contract: the bindings
@@ -3266,6 +3425,65 @@ apply_env_bootstrap.DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE = True
 #   Never set either in a timed or production run.
 #
 # -----------------------------------------------------------------------------
+# X2H: E-X2b's pass as one persistent HIP kernel, x2h_pass
+# (BIT-IDENTICAL to the Triton pass; no numerics change). Code default OFF;
+# the binding below turns it ON; a pre-set env var wins over gin
+# (_bind_bool).
+# Files: ops/hip/ec_dgrad_x2h.py and ops/hip/x2h_pass.cu; dispatch in
+# ops/triton/triton_ec_dgrad_segreduce.dgrad_segreduce; prebuild hook in
+# dlrm_v4/train/blas_warmup.py (_prebuild_ec_dgrad_x2h, before RUN_START).
+#   WHAT: E-X2b's two Triton passes (_ecx_dgrad_pass: cat, item) run as
+#   x2h_pass, one persistent workgroup per CU. Each of its 8 waves owns 64
+#   output columns and keeps that W1 slice in registers. The dh rows of a
+#   128-position tile are gathered into LDS by LDS-DMA, double-buffered. The
+#   MFMA chains, the bf16 rounding, the slots, the passes and the STORE /
+#   fragment rules are Triton's, operation for operation. The allocations,
+#   _ecx_combine and _ecx_zero_uncovered are unchanged; each pass adds one
+#   small x2h_wpack launch (W1 into register-fragment order).
+#   NUMERICS: none (bit-identical to E-X2b). Each run checks it before
+#   RUN_START (PREBUILD: one role, finite inputs, three grids) and stays on
+#   Triton on a mismatch.
+#   MLPerf: the same FLOPs as E-X2b; only the schedule differs.
+#   PREBUILD (every rank, before RUN_START, after E-X2b's prebuild; needs
+#   BLAS_WARMUP):
+#   - hipcc builds x2h_pass.cu into /tmp/dlrm_hstu_ec_dgrad_x2h (cached by
+#     source, flags and toolchain);
+#   - an exact check on E-X2b's synthetic input;
+#   - a bitwise cross-check against the Triton passes on a deterministic
+#     rounding-heavy input (> 6 tiles per CU per member; grids #CU / 7 / #CU;
+#     the transient is released before alloc_pregrow).
+#   Every check runs on sentinel-filled output buffers (a skipped write cannot
+#   pass on recycled memory), and the tile counters and the zero row are
+#   checked after every x2h_pass call.
+#   Only then is the device armed. Nothing is built after RUN_START: without
+#   a passed prebuild the Triton passes run.
+#   FALLBACKS (E-X2b stays on with the Triton passes):
+#   - knob off; E-X2b off;
+#   - no prebuild on the device ("NOT armed");
+#   - an input outside x2h_pass's contract, or CUDA graph capture
+#     ("DECLINED", that call only);
+#   - a failed prebuild or a raising launch: X2H off for the process
+#     ("FAILED CLOSED").
+#   ARMED (every rank, once, tagged "[rank N]"):
+#     "armed OK: [ec-dgrad-x2h] pre-run_start prebuild OK"
+#     "armed OK: [ec-dgrad-x2h] fused passes"
+#     E-X2b's "armed OK: [ec-dgrad-segreduce] fused" line, which names
+#     "x2h_pass x2"
+#   Must be ABSENT:
+#     "[ec-dgrad-x2h] FAILED CLOSED"
+#     "[ec-dgrad-x2h] DECLINED"
+#     "[ec-dgrad-x2h] NOT armed"
+#     "[ec-dgrad-x2h] DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE_HIP=1 IGNORED"
+#     (printed when E-X2b is off, not armed or latched off)
+#     "[ec-dgrad-segreduce] X2H unavailable"
+#   Opt out (kill switch): DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE_HIP=0.
+#   Diagnostic env knobs (never set in a timed run):
+#   - DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE_HIP_ROLE=0: Triton's MFMA roles plus
+#     an LDS transpose (default 1);
+#   - DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE_HIP_HIPCC;
+#   - DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE_HIP_CACHE.
+apply_env_bootstrap.DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE_HIP = True
+# -----------------------------------------------------------------------------
 # IX: Indexed-X preprocessor L1 (DECLARED fp32
 # REDUCTION-ORDER NUMERICS CLASS; no precision change). Code default OFF; the
 # binding below turns it ON; a pre-set env var wins over gin (_bind_bool).
@@ -3338,6 +3556,34 @@ apply_env_bootstrap.DLRM_HSTU_FP8_EC_INDEXED_L1 = True
 #   Log only: it never changes a result and never raises. It costs a transient
 #   X and host syncs, so never set it in a timed or production run.
 #
+# -----------------------------------------------------------------------------
+# IX wgrad index order: IX's split-K wgrad loads the next block's EC
+# indices AFTER the current block's dot (no precision change, bitwise
+# identical P and dW1). Code default OFF; the
+# binding below turns it ON; a pre-set env var wins over gin (_bind_bool).
+# Files: ops/triton/triton_ec_indexed_l1.py (wgrad_idx_after_dot(), read once
+# per process at the first wgrad or prebuild; dlrm_v4/train/_env_bootstrap.py).
+# It acts only on IX's indexed wgrad: with IX off, declined or latched off,
+# nothing here runs.
+#   WHAT: ON launches `_ecix_wgrad`, whose token loop loads block it+1's
+#   indices after tl.dot of block it; the software pipeliner then schedules
+#   the next block's gathered U rows earlier in the loop body. OFF launches
+#   `_ecix_wgrad_idxpf`: block it+1's indices loaded one iteration ahead,
+#   before block it's gather (IDXPF=1). Same values, same tl.dot sequence,
+#   same tail.
+#   NUMERICS: BIT-IDENTICAL (P partials and dW1); the forward, the reduce
+#   and every other gradient are untouched.
+#   TSPEC / specialization: `_ecix_wgrad`'s L1 specialization key and its
+#   TSPEC row identity (module, qualname, key) are the same in both settings
+#   (same parameters, constexprs, launch options); the TSPEC replay compiles
+#   the row from the current source before RUN_START. OFF compiles the
+#   separate kernel `_ecix_wgrad_idxpf` (same parameter list and
+#   specialization class) in IX's prebuild.
+#   ARMED: no new loud line (INFO log "[ec-indexed-l1] wgrad loop order: ...",
+#   once per process); IX's "armed OK: [ec-indexed-l1] wgrad" as before.
+#   Opt out (kill switch): DLRM_HSTU_FP8_EC_IX_WGRAD_IDX_AFTER_DOT=0 (the
+#   IDXPF order). Only "1"/"true"/"on"/"yes" arm it; read once per process.
+apply_env_bootstrap.DLRM_HSTU_FP8_EC_IX_WGRAD_IDX_AFTER_DOT = True
 # -----------------------------------------------------------------------------
 # IX-FP8F: Indexed-X preprocessor L1 forward on FP8 operands
 # (DECLARED PRECISION CHANGE: fp8 e4m3, TRAIN ONLY; eval stays bf16). Code
@@ -3521,28 +3767,126 @@ apply_env_bootstrap.DLRM_HSTU_FP8_BWD_VF4 = True
 # the default scale.
 #   WHAT: the full-FP8 attention backward casts dS to e4m3 at the scale
 #   2**(ceil(log2 N) + K) (ops/flydsl/hstu_flydsl_mha.py _sc("DSC", "-3"),
-#   mu2_dsc), with the hardware +-448 saturation. K = -4 instead of the
-#   default -3 halves that scale; the dk epilogue and the dq-split scale
+#   mu2_dsc), with the hardware +-448 saturation. K = -5 instead of the
+#   default -3 quarters that scale; the dk epilogue and the dq-split scale
 #   divide by the same mu2_dsc, so the gradients are unchanged in exact
 #   arithmetic. Nothing is skipped; same kernels, a different bwd_dkdv
 #   compile-time constant (one kernel variant).
 #   WHY: the per-(sequence, head, 32-token) dO block scale lifts each
 #   sequence's last (target) row to the top of the e4m3 range, and on late
 #   layers that row's dS exceeds 448 at the default scale and is clamped
-#   (a coherent bias on the target rows that carry the loss gradient). One
-#   more binade of headroom removes the clamp.
+#   (a coherent bias on the target rows that carry the loss gradient). More
+#   headroom removes the clamp.
+#   PROVENANCE (no offline analysis of training data): K = -5 is
+#   derived synthetically. The pre-cast value is y = 2^K * beta_N * SiLU'(x) * (w . v),
+#   beta_N = 2^ceil(log2 N)/N in [1, 2); the dO block scale and the qkv scale cancel,
+#   SiLU' <= 1.0998, so only the absolute V scale and beta_N move the clamp-free K.
+#   At init V = LN(x) W_v is near-Gaussian (sigma 0.632); a fixed-seed synthetic
+#   analysis (semi-analytic, checked against Monte Carlo, no training-data
+#   statistic) gives the 95th-percentile clamp-free K = -4/-5/-5 at N = 4096/2896/2049,
+#   so the worst case over the config range N in (2048, 4096] is -5.
 #   NUMERICS: NOT bit-identical. Target-row dS is no longer clamped; dS
 #   values below the new e4m3 grid floor round to zero, which matters only
 #   for the small rows that share the target's dO block (the target's dO
 #   dominates their block scale); rows of every other block see only a
 #   small flush-to-zero change. The dq/dk/dv
 #   formats and every other scale are unchanged.
-#   ARMED (every rank, once): "env bootstrap: DLRM_HSTU_FP8_BWD_FULL_DSC_K=-4"
+#   ARMED (every rank, once): "env bootstrap: DLRM_HSTU_FP8_BWD_FULL_DSC_K=-5"
 #   (or "honoring pre-set ..."), and the backward line "[hstu-attn] FULL-FP8
-#   backward ARMED: f8b=all mu2=k128 ... dsc=2^(ceil(log2 N) - 4) ..." (dsc=2^8
+#   backward ARMED: f8b=all mu2=k128 ... dsc=2^(ceil(log2 N) - 5) ..." (dsc=2^7
 #   for N in (2048, 4096]; 2^9 with the default).
 #   Opt out (kill switch): DLRM_HSTU_FP8_BWD_FULL_DSC_K=-3.
-apply_env_bootstrap.DLRM_HSTU_FP8_BWD_FULL_DSC_K = -4
+apply_env_bootstrap.DLRM_HSTU_FP8_BWD_FULL_DSC_K = -5
+# -----------------------------------------------------------------------------
+# MXFP6 forward K=512 trio: U, V/Q/K and the targets-only V/K (DECLARED
+# PRECISION CHANGE). Absent = off in code; bound True below. ops/hip/mx6_fwd.py
+# (adapter, call-site arms in ops/triton/triton_hstu_preprocess_and_attention.py),
+# the MX6 LN producer ops/hip/ln_store_mx6.py, ops/hip/mx6_ref.py (torch
+# reference of the MX6 activation bytes, checks only) and the MXFP6 K=512 GEMMs
+# (module names in mx6_fwd.py).
+#   WHAT: on training forwards that take the LN store_t (the fp8t uvqk / vk
+#   wgrad planned with STORE_T, STORE_T_V2 and the step-tiled xT of XT_TILED,
+#   all armed above) and whose e4m3 V/Q/K (targets: V/K) pack is handed to the
+#   backward (SAVE_UVQK, EARLY_RELEASE_UVQK, the layer mask, SAVE_TARGETS_VK),
+#   the GEMM operands change from e4m3 with one per-tensor scale to MXFP6:
+#   - activations: E2M3 codes with one E8M0 scale per (row, 32 K), quantized
+#     (ceil exponent rule, RNE) from the same pre-scaled y = LN(x) * inv_scale
+#     the e4m3 path quantizes. The LN producer writes them pre-tiled in the
+#     GEMM's LDS image order, together with the fp32 mean / rstd and the
+#     token-major e4m3 xT8 the store_t writes (same bytes, same allocator);
+#   - weights: E2M3 with one E8M0 scale per 32 x 32 block of W / scale_b,
+#     cached per weight and refreshed when weight._version moves;
+#   - V/Q/K (N=1536) and the targets-only V/K (N=1024) run on K=512 kernels of
+#     v_mfma_scale_f32_16x16x128_f8f6f4 (E2M3 x E2M3) with the shipped
+#     per-tensor scales, output-scale fold, scaled bias and saturating e4m3
+#     epilogue; U (N=512, bf16 + bias) too once its kernel is built; until
+#     then the producer also writes the e4m3 x8 and U stays on the shipped
+#     FP8 GEMM.
+#   Every K product is still computed. Not engaged (shipped FP8 path): the
+#   calibration window, no-grad / eval forwards (eval keeps the FP8 recipe: a
+#   declared train / eval asymmetry), and any call
+#   outside the coverage above (a DECLINED line). A retained-graph second
+#   backward rebuilds the pack through MX6, as the forward did.
+#   NUMERICS: NOT bit-identical (DECLARED PRECISION CHANGE): the U / V/Q/K /
+#   V/K GEMM operands are E2M3 with E8M0 block scales instead of e4m3 with one
+#   per-tensor scale; the outputs keep their dtype, shape and scale. Nothing
+#   else changes: mean / rstd / xT8 are the store_t's bytes, the backward
+#   GEMMs, the wgrad operands and the attention kernels are unchanged.
+#   GUARDS: the first producer call per device also runs the shipped store_t
+#   (mean / rstd / xT8 / x8 must be its bytes), checks x6 / xs on row slices
+#   (head, 2^31-byte offsets, last tile) against the torch reference of the
+#   exact fp32 y, and reruns the producer's other kernel instantiation (x8
+#   written or not) into fresh poisoned buffers (every output byte equal);
+#   any mismatch latches the producer off (shipped LN). The first call per
+#   device, site (U, VQK, VK) and weight keeps the MX6 output only if it has
+#   no non-finite value and, on row windows (the first 65,536 rows, the rows
+#   around each 2^31-element / -byte output offset, the last tile), matches
+#   the shipped FP8 GEMM with rel L2 <= 0.25, <= 0.5 in every 128-row tile
+#   and a slope <MX6, FP8> / <FP8, FP8> within 0.03 of 1 (a gross-error
+#   bound: the two formats differ by design); a rejection or any exception of
+#   that call latches the site to the shipped FP8 path for the process and
+#   the call returns the FP8 output.
+#   COLD START: with DLRM_HSTU_FP8_PREBUILD=1 (gin default),
+#   triton_fp8.prebuild_extensions imports the producer and GEMM modules, runs
+#   their prebuild, and self-checks before RUN_START: the producer on zeros
+#   and on a deterministic ramp, both kernel instantiations, every output
+#   byte against the torch reference, then the GEMMs on zeros. Synthetic data
+#   in plain torch buffers: no data, no RNG, no model or cache state and no
+#   TM_NONEXP pool block (the pool is first mapped by its own prewarm). A
+#   failed prebuild latches every MX6 site off for the process.
+#   ARMED (every rank): before RUN_START "[ln-store-mx6] prebuilt in" and
+#   "[mx6-fwd] prebuilt: producer=... [impl=... src=...@<sha>] gemm=...
+#   N=1536,1024,512 ... OK" (N=1536,1024 without the U kernel); at the first frozen-scale training step "ARMED
+#   wgrad_ck xt_tiled producer ln_store_mx6 on cuda:<i>", "[mx6-fwd] producer
+#   check on cuda:<i>: ... -> ok", "[mx6-fwd] guard VQK on cuda:<i>: ... ->
+#   armed" (once per uvqk layer weight), "[mx6-fwd] guard VK on cuda:<i>: ...
+#   -> armed" ("[mx6-fwd] guard U ... -> armed" once U runs MXFP6) and, once
+#   every site is decided, "[mx6-fwd] ARMED on cuda:<i> (...): producer=...
+#   gemm=... sites U:N=512:... VQK:N=1536:mx6 VK:N=1024:mx6"; at exit
+#   "[mx6-fwd] counters at exit (pid ...): planned_uvqk=<n> planned_vk=<n>
+#   served_U=... served_VQK=<n> served_VK=<n> ... declined=0" (an armed run
+#   serves every planned call: served_VQK = planned_uvqk, served_VK =
+#   planned_vk).
+#   Must be ABSENT: "[mx6-fwd] DECLINED", "-> REJECTED", "[mx6-fwd] prebuild
+#   DECLINED", "[mx6-fwd] ERROR", "[ln-store-mx6] prebuild FAILED", and
+#   TM_NONEXP_TILED's "pool created lazily". A frozen-scale step before the
+#   fp8t wgrad publishes its dz scale (4 warm-up backward calls) would
+#   decline with "uvqk:store_t". Expected: "[mx6-fwd] not engaged
+#   (expected):" for the calibration window and eval forwards.
+#   Armed by the binding below; env
+#   DLRM_HSTU_FP8_FWD_MXFP6=0 is the kill switch (a pre-set env value wins over
+#   this binding). DLRM_HSTU_FP8_FWD_MXFP6_STRICT=1 (env only) turns a decline, a
+#   guard rejection or a not-ready prebuild into an error;
+#   DLRM_HSTU_FP8_FWD_MXFP6_SHADOW_AUDIT=N (env only) audits every N-th weight
+#   shadow hit.
+#   Diagnostic / test env knobs (env only by design, never set in production,
+#   no gin binding): DLRM_HSTU_FP8_FWD_MXFP6_STRICT=1 (fail closed: raise
+#   instead of falling back to the shipped FP8 path; never changes a value),
+#   DLRM_HSTU_FP8_FWD_MXFP6_SHADOW_AUDIT=N (weight-shadow audit, read only),
+#   DLRM_HSTU_FP8_FWD_MXFP6_GEMM_MODULE / _PRODUCER_MODULE (module-name
+#   overrides for tests). Unset = the behaviour described above.
+#   Kill switch: env DLRM_HSTU_FP8_FWD_MXFP6=0 (a pre-set env value wins over this binding).
+apply_env_bootstrap.DLRM_HSTU_FP8_FWD_MXFP6 = True
 #
 # -----------------------------------------------------------------------------
 # Same contract as
@@ -3879,6 +4223,65 @@ apply_env_bootstrap.DLRM_HSTU_FP8_FWD_K512_TILED_A = True
 #     DLRM_HSTU_FP8_EVAL_FWD_HYGIENE_LOSS=0 (the binding below).
 apply_env_bootstrap.DLRM_HSTU_FP8_EVAL_FWD_HYGIENE = True
 apply_env_bootstrap.DLRM_HSTU_FP8_EVAL_FWD_HYGIENE_LOSS = False
+
+# -----------------------------------------------------------------------------
+# EVAL EMBEDDING LOOKAHEAD. Same contract as the knobs above: the binding
+# below is True (the code default when it is absent is OFF); env kill switch
+# of the same name; a pre-set env var wins over gin
+# (DLRM_HSTU_FP8_EVAL_EMB_LOOKAHEAD=0 disarms it).
+#   WHAT: the forward-only eval pipeline (train/utils.py build_train_pipeline
+#     role="eval") issues batch N+1's dist_init (KJT all_to_all wait + recat),
+#     EmbeddingCollection TBE lookup, fused K1 send permute and forward
+#     sequence all_to_all at the END of progress(N), on a dedicated
+#     normal-priority side stream, instead of at the head of forward(N+1) on
+#     the main stream; the all_to_all completes under batch N's dense forward
+#     and the main stream no longer waits on it. The forward of N+1 consumes the issued
+#     awaitable lazily at the stock first touch; K3'/decode,
+#     construct_jagged_tensors and all dense work stay on main, in stock
+#     order. Batch 0 of every pass runs the stock path.
+#     Side stream: created before RUN_START (train_ranker, after the allocator
+#     pre-grow), placed off the main stream's hardware queue by the
+#     host_sync_free.shares_hw_queue probe, its large and small pools
+#     pre-grown from the margin (_POOL_GIB, default 4 GiB, plus 64 MiB of
+#     1 MiB blocks); one all_reduce of a 0/1 readiness vote before RUN_START
+#     makes the arming rank-uniform (any rank without such a stream: OFF on
+#     every rank).
+#     Fences: the side stream waits on an event the main stream records right
+#     after the previous batch's embedding wait (covers the last train
+#     update, TBE state order, buffer reuse, and bounds the host lead); the
+#     main stream waits on the side stream at the end of every pass.
+#     Declines (stock eval on every rank) with DLRM_HSTU_FP8_SYNCFREE or
+#     ..._DISTINIT_MAIN off; EVAL_INTERIM_LOG>0; TP_DEFER_INPUT_DIST other
+#     than 1 (a rank's stock fallback mid-pass would then pair different
+#     collectives with its peers); or an embedding output that no all_to_all
+#     orders (the main stream waits on the side stream only through each
+#     sharding's all_to_all): only table_wise, column_wise and row_wise arm;
+#     data_parallel (EMB_SHARDING_OVERRIDES), world size 1 and torchrec sync
+#     collectives decline. TP_EVAL_PIPELINE=0 (no eval pipeline) makes no
+#     side stream or pool; EVAL_INTERIM_LOG>0 still pre-grows the pool
+#     (unused margin only). Training steps, the train pipeline and the
+#     eval-free benchmark are unchanged (role "train" never takes it).
+#   NUMERICS: BITWISE eval predictions, labels and weights (same kernels on
+#     the same inputs; same collectives in the same per-rank order; only the
+#     issue time and stream of the lookup/permute/send change). Training
+#     unchanged.
+#   ARMED (every rank): "armed OK: eval emb lookahead stream ready" (before
+#     RUN_START), "DLRMV4 eval emb lookahead: eval pipeline subclass
+#     installed" and "DLRMV4 eval emb lookahead ACTIVE" (first eval pass).
+#     Must be ABSENT: "eval emb lookahead DECLINED", "eval emb lookahead
+#     DISABLED", "consumed-event fence missing", "failure after collectives",
+#     "drained", "bitwise=False".
+#   Diagnostics (env only, not bound): DLRM_HSTU_FP8_EVAL_EMB_LOOKAHEAD_VERIFY=N
+#     (byte compare vs a stock recompute on main for batch indices 1..N of
+#     every pass; +1 TBE forward and +1 sequence all_to_all per sharding per
+#     verified batch on every rank; never in a timed run), _ISSUE=end|top,
+#     _PRIO=0|-1, _POOL_GIB=<GiB> (default 4; 0 = neither pool pre-grown),
+#     _REPORT=1. VERIFY coverage: the recompute reuses the looked-ahead KJT,
+#     so the side-stream dist_init (KJT all_to_all wait + recat) is not
+#     independently checked by VERIFY, and only embeddings are compared (not
+#     predictions, labels or weights).
+#   Opt out (kill switch): DLRM_HSTU_FP8_EVAL_EMB_LOOKAHEAD=0 (env wins).
+apply_env_bootstrap.DLRM_HSTU_FP8_EVAL_EMB_LOOKAHEAD = True
 
 # -----------------------------------------------------------------------------
 # EVAL LN*U*DROPOUT FORWARD ON V3. DECLARED NUMERICS CHANGE OF THE EVAL
@@ -4483,7 +4886,7 @@ ecbo/env_int.default = 1
 # a sort-then-segment-reduce Triton kernel.
 #
 # THE ATOMICS ARE THE COST, NOT THE BANDWIDTH. The expand backward scatters
-# ~7.9M token rows into ~54k unique rows, and aten::scatter_add_ serialises
+# many token rows into far fewer unique rows, and aten::scatter_add_ serialises
 # every duplicate landing on the same row through a global atomic. Sorting the
 # destinations first makes each output row a CONTIGUOUS SEGMENT that a single
 # program folds with tl.sum, so the cold path has no atomic at all; only rows
@@ -4531,8 +4934,8 @@ make_model.ec_merge_uih_candidate = True
 # a binding on a configurable that is not yet registered raises "No configurable
 # matching". enable_segment_reduce lives in the light module that utils.py
 # imports eagerly for this reason; do not make that import lazy.
-#   enable_segment_reduce.split_above = 1024
-#   enable_segment_reduce.block_s     = 32
+#   enable_segment_reduce.split_above = 8192
+#   enable_segment_reduce.block_s     = 16
 #   enable_segment_reduce.num_warps   = 2
 #   enable_segment_reduce.block_w_cap = 512
 # Diagnostic: dump the REAL segment-length distribution (bincount + quantile on
@@ -5144,6 +5547,40 @@ fp8w/env_str.default = "2"
 #     FP8_WARMUP_SKIP=F2e); rank 0 then logs "[fp8-warmup] item=F2e
 #     flydsl_bwd_full_fp8_e8 skip(reason=...)".
 apply_env_bootstrap.DLRM_HSTU_FP8_WARMUP_F2E = True
+#
+# F2r: every RPP bucket of the two e5m2 sink finalizers in the FP8
+#     first-use warm-up (dlrm_v4/train/fp8_warmup.py item F2r). Code default ON (absent or
+#     "1"); the binding below states it; the env var of the same name wins
+#     over gin.
+#     WHAT: the E1 sink's finalizer (_e8_fin_kernel, DkdvE5m2Sink.finish)
+#     and the dq sink's (_dq8_fin_kernel, _dq8_finalize) specialize on
+#     RPP = rows per program = 8*ceil(ceil(rb/256)/8), rb = (M+127*B)//128+1
+#     for a layer call of M rows. F2e/F2q reach RPP 8 only and the TSPEC
+#     table holds 64..88, so an engaged step whose M reaches another RPP
+#     compiles both kernels inside the timed region. F2r
+#     calls both finalizers through the production wrappers once per RPP
+#     bucket of M = 0 .. B*4096 (B = 1024: RPP 8..136, 17 per kernel) on
+#     synthetic partials of the bucket's largest M whose all-zero row prefix
+#     masks every row (nothing is read), under F2e's (e8) and F2q's (dq8)
+#     preconditions.
+#     IMPACT: no fin-kernel compile after RUN_START at any scale, window or
+#     data order. Untimed initialization pays the new compiles once per
+#     rank: 24 at B = 1024 with the TSPEC table (64..88) and F2e/F2q (8)
+#     already in. No effect on the steady step.
+#     NUMERICS: none (bit-identical). The same Triton L1 keys and binaries
+#     the engaged steps would otherwise compile on demand (no kernel source change);
+#     synthetic local tensors only, no RNG draw, no model / optimizer / FP8
+#     scale state (FP8_WARMUP_VERIFY=1 checks).
+#     ARMED (every rank, tagged rank=R): "[fp8-warmup] item=F2r sink_fin_rpp
+#     B=<B> M<=<4096*B> ok ... e8_rpp=8..136/17 dq8_rpp=8..136/17 rank=R"
+#     (B = 1024, both sinks on) and "F2r:1" in the items= of the warm-up's
+#     armed OK line. Must be ABSENT: "item=F2r sink_fin_rpp" with "FAIL(";
+#     with TRITON_SPEC_MONITOR=1, _e8_fin_kernel / _dq8_fin_kernel in the
+#     kernels= of "[triton-spec] monitor post-run_start".
+#     Opt out (kill switch): DLRM_HSTU_FP8_WARMUP_FIN_RPP=0 (or
+#     FP8_WARMUP_SKIP=F2r); rank 0 then logs "[fp8-warmup] item=F2r
+#     sink_fin_rpp skip(reason=...)".
+apply_env_bootstrap.DLRM_HSTU_FP8_WARMUP_FIN_RPP = True
 # -----------------------------------------------------------------------------
 # EVAL LOADERS: BIT-IDENTICAL BATCHED BATCH BUILDER (datasets/yambda.py
 #     DLRMv4YambdaDataset.build_batch; switches in datasets/dataset.py, applied
@@ -5408,8 +5845,8 @@ apply_env_bootstrap.DL_COLD_PREFETCH_STREAM = "1"
 #     each received batch's shared storages after its pin: one per batch
 #     with DL_FAST_BATCH_ONESTORE, one per tensor otherwise. Each works
 #     without the other.
-#   - Train loader: neither changes the single chained pool or
-#     DL_PRIME_PACE's pacing (pools, prefetch depth, schedule, batches).
+#   - Train loader: neither changes the single chained pool's pacing
+#     (pools, prefetch depth, schedule, batches).
 #     DL_PIN_FREE_SHM also releases the train batches; with DL_SINGLE_POOL=0
 #     that includes the re-prime burst of the two alternating pools at each
 #     window boundary.

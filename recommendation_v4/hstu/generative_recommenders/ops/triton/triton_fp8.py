@@ -134,6 +134,9 @@ _HSTU_FP8_FWD_K512_TILED_A: bool = (
 # turns it on). fp32 summation order only, as K512; anything it does not
 # cover stays on hipBLASLt.
 _HSTU_FP8_FWD_K1536: bool = os.environ.get("DLRM_HSTU_FP8_FWD_K1536", "0") == "1"
+# MXFP6 forward K=512 trio (ops/hip/mx6_fwd.py; DECLARED PRECISION CHANGE,
+# default off): only its prebuild hook lives here.
+_HSTU_FP8_FWD_MXFP6: bool = os.environ.get("DLRM_HSTU_FP8_FWD_MXFP6", "0") == "1"
 # U-slice forward GEMM (QKV-fused path: e4m3 normed_x [M,512] x e4m3 W_u
 # [512,512] + bf16 bias -> bf16) always on hipBLASLt's data-parallel grid.
 # torch._scaled_mm hands hipBLASLt torch's process-wide 76 MiB workspace, and
@@ -1549,6 +1552,15 @@ def prebuild_extensions() -> bool:
         except k1536_fp8_addmm.PrebuildError:
             if _HSTU_FP8_FAIL_CLOSED:
                 raise
+    if _HSTU_FP8_FWD_MXFP6:
+        # DLRM_HSTU_FP8_FWD_MXFP6: the MX6 LN producer and the MXFP6 GEMMs,
+        # plus one self-check on synthetic zeros. Not ready: one
+        # "[mx6-fwd] prebuild DECLINED" line and the forward stays on the
+        # FP8 path (PrebuildError only under ..._MXFP6_STRICT=1).
+        from generative_recommenders.ops.hip import mx6_fwd
+
+        if mx6_fwd.prebuild():
+            built = True
     # L11 fused out-proj dgrad + LN*U*dropout backward: hipcc
     # build + load + synthetic self-check; a no-op unless
     # DLRM_HSTU_FP8_BWD_OUTPROJ_LNMD_FUSED=1. Last, after every other build:

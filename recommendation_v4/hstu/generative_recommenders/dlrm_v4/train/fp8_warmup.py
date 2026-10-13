@@ -47,6 +47,9 @@ Knobs (all read here, at call time):
   DLRM_HSTU_FP8_WARMUP_F2E=0
                             skip item F2e (absent or "1" = run it; gin binds
                             it through apply_env_bootstrap).
+  DLRM_HSTU_FP8_WARMUP_FIN_RPP=0
+                            skip item F2r (absent or "1" = run it; gin binds
+                            it through apply_env_bootstrap).
 
 MEMORY. Every tensor the items allocate is released before this returns (torch
 reserved memory is back at its pre-warmup value after empty_cache()). The items
@@ -109,6 +112,13 @@ bootstrap), under F2's preconditions, for F2's N list. Of tpa only its env
 predicates are read; both sinks are local objects. Its ok line prints on every
 rank, with the synchronized backward time (the e8 compile on a cold FlyDSL
 cache) and the number of new compile_hstu_bwd_dkdv builds.
+F2r. The two sinks' finalizers (_e8_fin_kernel of
+DkdvE5m2Sink.finish, _dq8_fin_kernel of _dq8_finalize) take RPP, the partial
+rows per program, as a constexpr that grows with the call's row count M; F2e
+and F2q finish at T = 2B (RPP 8) only. F2r calls both finalizers once per RPP
+bucket of M = 0 .. B * _N_C on synthetic partials whose all-zero row prefix
+masks every row (_fin_rpp_prebuild), under F2e's (e8) and F2q's (dq8)
+preconditions, so no engaged step compiles one inside the timed region.
 """
 
 import collections
@@ -141,9 +151,40 @@ _TAG = "[fp8-warmup]"
 # pre-grow unchanged.
 WARMUP_RAN: bool = False
 
-# N classes (each <= gin max_seq_len 4096). 2992 is the logged production N;
-# 3000 is its %16 != 0 sibling; 4096 gives U_TILES=32 (%16 == 0) in the dq-split
-# kernel. All three have c = ceil(log2 N) = 12. N_D (c=11) only with N11=1.
+# N classes (synthetic; each <= gin max_seq_len 4096). N reaches a compile key
+# in three ways only; F1 (FlyDSL e4m3 forward) and M2 (bf16 FlyDSL backward)
+# take N as a launch argument, so any N serves them:
+#  (a) MAX_SEQ_LEN = N, a non-constexpr int of the Triton delta forward and
+#      backward and main forward kernels (T1/T2/T2e, tier 2 T1b/T2b/M1).
+#      Triton specializes such ints as == 1, % 16 == 0 or neither;
+#      AUTOTUNE_MAX_SEQ_LEN is the static max_seq_len for every N <= 4096.
+#      Those loops run (_N_A, _N_B): N % 16 == 0 and N % 16 != 0.
+#  (b) U_TILES = cdiv(N, BMQ), a non-constexpr int of the dq-split kernels
+#      (hstu_dq_split, hstu_dq_e5m2._dq8_sched_kernel; BMQ 128 by default,
+#      or 64), same rule. F2/F2q/F2e run (_N_A, _N_C): U_TILES 24 (47 at
+#      BMQ 64), not % 16, and 32 (64), % 16 == 0.
+#  (c) c = ceil(log2 N) sets the full-FP8 FlyDSL backward's mu2_ssc/mu2_dsc,
+#      so F2/F2q/F2e compile one build per c. c = 12 is the class of every
+#      N in 2049..4096, the top class under the configured max_seq_len
+#      (4096 = 2^12, the gin default MAX_SEQ_LEN; an override changes the top
+#      class); FP8_WARMUP_N11=1 adds c = 11 (_N_D).
+# _N_A = 2992 is the only value in both loop lists: N % 16 == 0 for (a) and
+# U_TILES % 16 != 0 for (b), with c = 12. Every multiple of 16 in 2064..3008
+# or 3088..3968 selects the same classes; 2992 is one of them.
+# _N_B = 3000: N % 16 != 0, c = 12. _N_C = 4096 = max_seq_len: U_TILES % 16
+# == 0, c = 12, and F2r's row bound B * _N_C. _N_D = 2000: c = 11 (N11=1).
+# Not warmed (they compile at first use, as without this warmup): N or
+# U_TILES == 1, c <= 10, and c = 11 unless N11=1.
+# Synthetic scales (no calibration state is read). Runtime fp32 arguments,
+# with one exception: under DLRM_HSTU_FP8_BWD_VF3P / _VF4 (gin True) the
+# dq-split backward adds its vf3p/vf4 VALU tokens, a compile-key change, only
+# when 0 < qkv_scale <= hstu_flydsl_mha._VF3P_QKV_SCALE_MAX (0.25). 2^-6 is a
+# power of two inside that guard, so F2/F2q/F2e build the vf3p/vf4 variant; a
+# run whose calibrated scale exceeds 0.25 builds the other one at first use.
+# _LN_INV_SCALE = 2^6 is a finite positive fp32 value: where the MASKGEN_PK
+# path applies (gin), it passes _use_lnmd_fwd_maskgen_pk's 0 < Y_INV_SCALE <
+# inf check, so the maskgen_pk kernel is built as in production; otherwise it
+# only reaches fp32 kernel arguments.
 _N_A = 2992
 _N_B = 3000
 _N_C = 4096
@@ -160,13 +201,21 @@ _SEEDS = (2 ** 40, 2 ** 40 + 1)
 _ARENA_BYTES = 2 ** 31 + 2 ** 28
 _ALIGN = 256
 
-# LN*U*dropout large-row sizes (rows >= 2^20 run the v2/v3/maskgen forward).
-# _ROWS_L: the [rows, 3*512] output is > 2 GiB in e4m3 and bf16 (its production
-# class), x/u [rows, 512] bf16 stay < 2 GiB. _ROWS_XL (FP8_WARMUP_STORES=both):
-# x/u > 2 GiB as well (production batches above ~2.1M rows/rank).
+# LN*U*dropout large-row sizes (rows >= 2^20 run the v2/v3/maskgen forward,
+# triton_hstu_linear._use_lnmd_fwd_v2). Chosen from the 2^31 - 1 byte storage
+# rule (STORAGE CLASS) at H*Dv = 512, not from batch statistics; both lie in
+# the configured row range 2B .. B * max_seq_len.
+# _ROWS_L = 1572864 is in 1398102 .. 2097151, where the [rows, 3*512] output
+# is > 2 GiB in e4m3 (and bf16) and x/u [rows, 512] bf16 stay <= 2 GiB.
+# _ROWS_XL = 2162688 (FP8_WARMUP_STORES=both) is above 2097151: x/u > 2 GiB
+# too. Each also runs at + 1, the % 16 != 0 class of the row-count argument.
+# Not warmed: rows 2^20 .. 1398101 (e4m3 output <= 2 GiB on this kernel).
 _ROWS_L = 3 << 19
 _ROWS_XL = 33 << 16
-# U1 (FWD_U_DP): production-class token counts for the U-slice GEMM.
+# U1 (FWD_U_DP): synthetic large token counts for the U-slice GEMM (_ROWS_L
+# and the odd _ROWS_L + 1), so the code object hipBLASLt's heuristic picks for
+# such an M loads before RUN_START. Not a class bound: an M for which the
+# heuristic picks another solution loads that one at first use.
 _U_DP_ROWS = (_ROWS_L, _ROWS_L + 1)
 
 _VERIFY_MAX_NUMEL = 64 * 1024 * 1024
@@ -1055,6 +1104,60 @@ def _shadow_specs(main_layers: List[Any], last: Any, targets_only: bool,
     return out
 
 
+def _fin_rpp_buckets(B: int, n_max: int, ak: int) -> List[Tuple[int, int]]:
+    """[(RPP, M)] for every RPP a sink finalizer whose amax partials have `ak`
+    columns takes for a layer call of M = 0 .. n_max rows at batch B, with M
+    the largest such row count <= n_max. The wrappers' rule (hstu_dkdv_e5m2
+    partial_rows_bound + DkdvE5m2Sink.finish, hstu_dq_e5m2 _dq8_partials +
+    _dq8_finalize; 256 = their _FIN_PROGS): rb = (M + 127 B) // 128 + 1
+    partial rows, RPP = blk * ceil(ceil(rb / 256) / blk) with blk = 8 if
+    ak <= 128 else 4 if ak <= 512 else 1."""
+    blk = 8 if ak <= 128 else (4 if ak <= 512 else 1)
+    rb_max = (n_max + 127 * B) // 128 + 1
+    top: Dict[int, int] = {}
+    for j in range(1, -(-rb_max // 256) + 1):  # j = ceil(rb / 256)
+        m = min(128 * 256 * j - 1 - 127 * B, n_max)  # largest M with that j
+        if m >= 0:
+            top[blk * -(-j // blk)] = m
+    return sorted(top.items())
+
+
+def _fin_rpp_prebuild(dev: torch.device, B: int, H: int, D: int, n_max: int,
+                      e8: bool, dq8: bool) -> str:
+    """Item F2r: the engaged call's finalizers, through its production
+    wrappers, once per RPP bucket of M = 0 .. n_max rows (_fin_rpp_buckets).
+    The partials are allocated by the wrappers for the bucket's largest M and
+    left uninitialized; the row prefix is built from all-zero seq_offsets, so
+    R = pfx[B] = 0 masks every partial row (nothing is read) and the outputs
+    are local and dropped. Same L1 key as the engaged call: same wrappers,
+    dtypes and constexprs, fresh < 2 GiB allocations (pointer class DS), B the
+    production batch size (its % 16 class)."""
+    from generative_recommenders.ops.flydsl.hstu_dkdv_e5m2 import DkdvE5m2Sink
+    from generative_recommenders.ops.triton import hstu_dq_e5m2 as dqe
+
+    # int64 [B + 1] as production's seq_offsets: the prefix kernels reuse
+    # F2e's / F2q's compile.
+    so0 = torch.zeros(B + 1, dtype=torch.int64, device=dev)
+    one = torch.ones(1, dtype=torch.float32, device=dev)
+    z8 = torch.zeros(1, dtype=torch.uint8, device=dev)
+    done: List[str] = []
+    # Largest bucket first: the smaller partials then reuse its cached block.
+    if e8:
+        rows = _fin_rpp_buckets(B, n_max, H * 32)  # pamax [rb, H * 32]
+        for _rpp, m in reversed(rows):
+            sink = DkdvE5m2Sink(z8, one)
+            sink.launch_kwargs(so0, m, H, D)  # _e8_pfx_kernel + partials
+            sink.finish()  # _e8_fin_kernel at this RPP
+        done.append(f"e8_rpp={rows[0][0]}..{rows[-1][0]}/{len(rows)}")
+    if dq8:
+        rows = _fin_rpp_buckets(B, n_max, H)  # pamax [rb * H]
+        for _rpp, m in reversed(rows):
+            pfx, pcol, pamax = dqe._dq8_partials(so0, m, H, D)
+            dqe._dq8_finalize(pamax, pcol, pfx)  # _dq8_fin_kernel
+        done.append(f"dq8_rpp={rows[0][0]}..{rows[-1][0]}/{len(rows)}")
+    return " ".join(done)
+
+
 def _warm_items(r: _Runner, model: torch.nn.Module, B: int, tier: int,
                 stores: Tuple[bool, ...]) -> Dict[str, Any]:
     from generative_recommenders.modules import hstu_transducer as htr
@@ -1456,6 +1559,34 @@ def _warm_items(r: _Runner, model: torch.nn.Module, B: int, tier: int,
                 r.run(tag_e, name_e, f"N={N} store=big path={path}", f2e,
                       all_ranks=True)
 
+        # ---- F2r: every RPP bucket of the sink finalizers ----
+        # F2e/F2q finish at T = 2B, i.e. RPP 8 only; RPP follows the live row
+        # count M, so an engaged step whose M reaches another RPP would
+        # compile _e8_fin_kernel / _dq8_fin_kernel inside the timed
+        # region. F2r covers every
+        # bucket from config alone: both finalizers once per RPP of M = 0 ..
+        # B * _N_C (any batch of B sequences of at most max_seq_len tokens):
+        # _fin_rpp_prebuild. e8 under F2e's preconditions (not its kill
+        # switch), dq8 under F2q's. Kill switch:
+        # DLRM_HSTU_FP8_WARMUP_FIN_RPP=0 (or FP8_WARMUP_SKIP=F2r).
+        e8_fin = (bool(_call(tpa, "_dkdv_e5m2_requested", False))
+                  and grad_dtype is not None and uvqk_fp8t
+                  and bool(_call(bwd_fp8, "uvqk_fp8_backward_enabled", False))
+                  and e1_layout_ok()
+                  and not bool(_call(tpa, "_dq_sink_diagnostics_on", False)))
+        dq8_fin = dq_sink_reason is None
+        if os.environ.get("DLRM_HSTU_FP8_WARMUP_FIN_RPP", "1").strip() == "0":
+            # Kill switch of the gin binding (absent or "1" = run it).
+            r.skip("F2r", "sink_fin_rpp", "DLRM_HSTU_FP8_WARMUP_FIN_RPP=0")
+        elif not (e8_fin or dq8_fin):
+            r.skip("F2r", "sink_fin_rpp", "neither the E1 nor the dq e5m2 sink")
+        else:
+            def f2r() -> str:
+                return _fin_rpp_prebuild(dev, B, H, Dq, B * _N_C, e8_fin, dq8_fin)
+
+            r.run("F2r", "sink_fin_rpp", f"B={B} M<={B * _N_C}", f2r,
+                  all_ranks=True)
+
     # ---- T1/T2: targets-only delta attention, e4m3 V/K --------------------
     # DELTA_FWD_BM16 (T1, read per call, latch restored) and
     # VKP_V2 (T2e: _hstu_attn_delta_bwd_e5m2_v2 + its longest-first
@@ -1505,8 +1636,9 @@ def _warm_items(r: _Runner, model: torch.nn.Module, B: int, tier: int,
                     # published (during calibration) the FP8-step backward is
                     # hstu_attention_delta_bwd_e5m2, writing the E5M2 dV|dK
                     # pack padded to uvqk_tm_pad() rows (tpa targets bwd).
-                    # Pure function: no bwd_fp8 _sites entry. rows T and T+1
-                    # cover both 16-divisibility specializations.
+                    # Pure function: no bwd_fp8 _sites entry. This kernel takes
+                    # no row-count argument, so rows T and T+1 build the same
+                    # variant (kept for parity with the other items).
                     for rows in (T, T + 1):
                         def bwd8(N: int = N, big: bool = big, rows: int = rows) -> None:
                             vk = bufs.act((rows, H * Dv + H * Dq), kv_dtype, big)

@@ -1023,6 +1023,19 @@ def _flydsl_fwd_fp8() -> Callable[..., Optional[torch.Tensor]]:
     return try_flydsl_attention_fwd_fp8
 
 
+# DLRM_HSTU_FP8_FWD_MXFP6 (DECLARED PRECISION CHANGE, default off; read once
+# at import): the training forward's LN store_t + U + V/Q/K (ordinary layers)
+# and LN store_t + V/K (targets-only layer) on the MX6 LN producer and the
+# MXFP6 K=512 GEMMs (ops/hip/mx6_fwd.py). Every arm below is an
+# `if _MX6_FWD and ...:` whose `else` is the non-MX6 statement, so with the
+# knob off the adapter is never imported and only the non-MX6 code runs.
+# Defined below the module's @triton.jit kernels on
+# purpose: a kernel's starting line enters Triton's cache key.
+_MX6_FWD: bool = os.environ.get("DLRM_HSTU_FP8_FWD_MXFP6", "0") == "1"
+if _MX6_FWD:
+    from generative_recommenders.ops.hip import mx6_fwd as _mx6_fwd
+
+
 class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore [14]
@@ -1161,7 +1174,36 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                     "BF16 normed_x save (DLRM_HSTU_FP8_SAVE_NORMED_X); the "
                     "token-major E4M3 normed_x replaces it",
                 )
-            if fp8t_planned and bwd_fp8.uvqk_store_fp8t():
+            if _MX6_FWD and (
+                mx6 := _mx6_fwd.uvqk_ln_store(
+                    x=x,
+                    norm_weight=norm_weight,
+                    norm_bias=norm_bias,
+                    eps=norm_eps,
+                    fp8_scale_value=fp8_scale_value,
+                    uvqk_weight=uvqk_weight,
+                    uvqk_bias=uvqk_bias,
+                    u_columns=hidden_dim * num_heads,
+                    qkv_frozen=use_fp8_qkv and qkv_scale_value is not None,
+                    grad=bool(ctx.needs_input_grad[0]),
+                    store_t=fp8t_planned and bwd_fp8.uvqk_store_fp8t(),
+                    pack_saved=(
+                        recompute_uvqk_in_backward
+                        and _SAVE_FP8_UVQK
+                        and allow_save_fp8_uvqk
+                    ),
+                    pad_to=bwd_fp8.uvqk_tm_pad(),
+                    tiled_xt=wgrad_ck.tiled_active(x.device),
+                )
+            ) is not None:
+                # MX6 LN producer in place of the store_t: the same mean /
+                # rstd / token-major xT8, plus x6 / xs for the MX6 GEMMs and
+                # the e4m3 x8 (None once U runs MX6) for the FP8 U.
+                normed_x = mx6.x8
+                x_mean = mx6.mean
+                x_rstd = mx6.rstd
+                stored_x_fp8_t = mx6.xt8
+            elif fp8t_planned and bwd_fp8.uvqk_store_fp8t():
                 (
                     normed_x,
                     x_mean,
@@ -1201,25 +1243,50 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             if use_fp8_qkv and qkv_scale_value is not None:
                 assert fp8_qkv_scale is not None
                 u_columns = hidden_dim * num_heads
-                u = scaled_addmm_fp8_preq(
-                    activation_fp8=normed_x,
-                    scale_a=fp8_scale,
-                    weight=uvqk_weight,
-                    bias_or_residual=uvqk_bias[:u_columns],
-                    out_dtype=x.dtype,
-                    weight_layout=((0, u_columns),),
-                    data_parallel=True,
-                ).contiguous()
-                vqk = scaled_mm_fp8_out_preq(
-                    activation_fp8=normed_x,
-                    scale_a=fp8_scale,
-                    weight=uvqk_weight,
-                    bias=uvqk_bias[u_columns:],
-                    weight_layout=((u_columns, uvqk_weight.shape[1]),),
-                    output_scale=fp8_qkv_scale,
-                    scale_a_value=fp8_scale_value,
-                    output_scale_value=qkv_scale_value,
-                ).contiguous()
+                if _MX6_FWD and mx6 is not None and mx6.u_mx6:
+                    # MXFP6 U (N=512 kernel, bf16 + bias epilogue).
+                    u = _mx6_fwd.gemm_u(
+                        mx6,
+                        uvqk_weight=uvqk_weight,
+                        uvqk_bias=uvqk_bias,
+                        u_columns=u_columns,
+                        fp8_scale=fp8_scale,
+                        out_dtype=x.dtype,
+                    )
+                else:
+                    u = scaled_addmm_fp8_preq(
+                        activation_fp8=normed_x,
+                        scale_a=fp8_scale,
+                        weight=uvqk_weight,
+                        bias_or_residual=uvqk_bias[:u_columns],
+                        out_dtype=x.dtype,
+                        weight_layout=((0, u_columns),),
+                        data_parallel=True,
+                    ).contiguous()
+                if _MX6_FWD and mx6 is not None:
+                    # MXFP6 V/Q/K (N=1536 kernel), e4m3 at the qkv scale.
+                    vqk = _mx6_fwd.gemm_vqk(
+                        mx6,
+                        ctx=ctx,
+                        uvqk_weight=uvqk_weight,
+                        uvqk_bias=uvqk_bias,
+                        u_columns=u_columns,
+                        fp8_scale=fp8_scale,
+                        fp8_scale_value=fp8_scale_value,
+                        fp8_qkv_scale=fp8_qkv_scale,
+                        qkv_scale_value=qkv_scale_value,
+                    )
+                else:
+                    vqk = scaled_mm_fp8_out_preq(
+                        activation_fp8=normed_x,
+                        scale_a=fp8_scale,
+                        weight=uvqk_weight,
+                        bias=uvqk_bias[u_columns:],
+                        weight_layout=((u_columns, uvqk_weight.shape[1]),),
+                        output_scale=fp8_qkv_scale,
+                        scale_a_value=fp8_scale_value,
+                        output_scale_value=qkv_scale_value,
+                    ).contiguous()
                 v, q, k = vqk.split(
                     [
                         hidden_dim * num_heads,
@@ -1282,7 +1349,10 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                     fp8_qkv_scale,
                     uvqk[:, hidden_dim * num_heads :],
                 )
-        if use_fp8 and fp8_scale_value is not None:
+        if _MX6_FWD and normed_x is None:
+            # MX6-served call without an e4m3 normed_x (U on MX6).
+            _mx6_fwd.record_contract("phi1_input_ln_projection", mx6, u=u)
+        elif use_fp8 and fp8_scale_value is not None:
             record_fp8_capability("phi1_input_ln_projection")
             record_fp8_contract(
                 "phi1_input_ln_projection",
@@ -1510,7 +1580,21 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     # pyre-ignore[14]
-    def backward(
+    def backward(ctx, dsilu_u, dout, dresidual):  # pyre-ignore[2,3]
+        # Contract v2: an 'only' dO8 record taken by this layer call's C8
+        # attention backward stays retained for the dkdv_fp8_sink exact
+        # re-runs in _backward_impl and is released when this backward ends,
+        # on every exit (a no-op without such a record).
+        try:
+            return _HSTUPreprocessAndAttentionFunction._backward_impl(
+                ctx, dsilu_u, dout, dresidual
+            )
+        finally:
+            hstu_do8_registry.release(getattr(ctx, "do8_site", None))
+
+    @staticmethod
+    # pyre-ignore[14]
+    def _backward_impl(
         ctx,  # pyre-ignore[2]
         dsilu_u: torch.Tensor,
         dout: torch.Tensor,
@@ -1738,16 +1822,32 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                         weight_layout=((0, u_columns),),
                         data_parallel=True,
                     ).contiguous()
-                vqk_fp8 = scaled_mm_fp8_out_preq(
-                    activation_fp8=normed_x_fp8,
-                    scale_a=input_scale,
-                    weight=uvqk_weight,
-                    bias=uvqk_bias[u_columns:],
-                    weight_layout=((u_columns, uvqk_weight.shape[1]),),
-                    output_scale=qkv_scale,
-                    scale_a_value=ctx.fp8_input_scale_value,
-                    output_scale_value=ctx.fp8_qkv_scale_value,
-                ).contiguous()
+                if _MX6_FWD and (
+                    vqk_mx6 := _mx6_fwd.recompute_vqk(
+                        ctx,
+                        x=x,
+                        norm_weight=norm_weight,
+                        norm_bias=norm_bias,
+                        uvqk_weight=uvqk_weight,
+                        uvqk_bias=uvqk_bias,
+                        input_scale=input_scale,
+                        qkv_scale=qkv_scale,
+                    )
+                ) is not None:
+                    # Retained-graph backward of an MX6-served forward:
+                    # rebuild V/Q/K through MX6 (as the forward did).
+                    vqk_fp8 = vqk_mx6
+                else:
+                    vqk_fp8 = scaled_mm_fp8_out_preq(
+                        activation_fp8=normed_x_fp8,
+                        scale_a=input_scale,
+                        weight=uvqk_weight,
+                        bias=uvqk_bias[u_columns:],
+                        weight_layout=((u_columns, uvqk_weight.shape[1]),),
+                        output_scale=qkv_scale,
+                        scale_a_value=ctx.fp8_input_scale_value,
+                        output_scale_value=ctx.fp8_qkv_scale_value,
+                    ).contiguous()
                 v, q, k = vqk_fp8.split(
                     [
                         ctx.hidden_dim * ctx.num_heads,
@@ -2366,7 +2466,40 @@ class _HSTUPreprocessAndAttentionTargetsOnlyFunction(torch.autograd.Function):
                 "normed_x save (DLRM_HSTU_FP8_SAVE_NORMED_X); the token-major "
                 "E4M3 normed_x replaces it",
             )
-        if vk_fp8t_planned and bwd_fp8.uvqk_store_fp8t():
+        if _MX6_FWD and (
+            mx6 := _mx6_fwd.vk_ln_store(
+                x=x,
+                norm_weight=norm_weight,
+                norm_bias=norm_bias,
+                eps=norm_eps,
+                fp8_scale_value=fp8_scale_value,
+                uvqk_weight=uvqk_weight,
+                uvqk_bias=uvqk_bias,
+                vk_layout=(
+                    (u_dim, u_dim + v_dim),
+                    (u_dim + v_dim + q_dim, uvqk_weight.shape[1]),
+                ),
+                qkv_frozen=qkv_fp8_forward,
+                grad=bool(ctx.needs_input_grad[0]),
+                store_t=vk_fp8t_planned and bwd_fp8.uvqk_store_fp8t(),
+                pack_handed=(
+                    qkv_fp8_forward
+                    and _SAVE_FP8_UVQK
+                    and _EARLY_RELEASE_FP8_UVQK
+                    and allow_save_fp8_vk
+                ),
+                pad_to=bwd_fp8.uvqk_tm_pad(),
+                tiled_xt=wgrad_ck.tiled_active(x.device),
+            )
+        ) is not None:
+            # MX6 LN producer in place of the store_t (same mean / rstd /
+            # xT8); V/K is the only reader of the e4m3 normed_x here, so x8
+            # is written on the first-call guard only.
+            normed_x = mx6.x8
+            x_mean = mx6.mean
+            x_rstd = mx6.rstd
+            stored_vk_x_fp8_t = mx6.xt8
+        elif vk_fp8t_planned and bwd_fp8.uvqk_store_fp8t():
             assert fp8_scale is not None
             tiled_xt = wgrad_ck.tiled_active(x.device)
             tm_pad = bwd_fp8.uvqk_tm_pad()
@@ -2473,44 +2606,61 @@ class _HSTUPreprocessAndAttentionTargetsOnlyFunction(torch.autograd.Function):
         if qkv_fp8_forward:
             assert fp8_scale is not None
             assert fp8_qkv_scale is not None
-            vk_layout = (
-                (u_dim, u_dim + v_dim),
-                (u_dim + v_dim + q_dim, uvqk_weight.shape[1]),
-            )
-            vk = None
-            if normed_x is None:
-                # Tiled-A V/K: the store_t skipped y; the projection reads y's
-                # bytes from the step-tiled yT (K512 tiled-A entry). A decline
-                # there (logged once; B15T then latches off) rebuilds y from
-                # yT, bit for bit, for the row-major projection.
-                assert stored_vk_x_fp8_t is not None
-                vk = scaled_mm_fp8_out_preq_tiled_a(
-                    stored_vk_x_fp8_t,
-                    int(x.shape[0]),
-                    fp8_scale,
-                    uvqk_weight,
-                    b_vk,
-                    weight_layout=vk_layout,
-                    output_scale=fp8_qkv_scale,
-                    scale_a_value=fp8_scale_value,
-                    output_scale_value=qkv_scale_value,
+            if _MX6_FWD and mx6 is not None:
+                # MXFP6 V/K (N=1024 kernel), e4m3 at the qkv scale.
+                vk = _mx6_fwd.gemm_vk(
+                    mx6,
+                    ctx=ctx,
+                    uvqk_weight=uvqk_weight,
+                    b_vk=b_vk,
+                    vk_layout=(
+                        (u_dim, u_dim + v_dim),
+                        (u_dim + v_dim + q_dim, uvqk_weight.shape[1]),
+                    ),
+                    fp8_scale=fp8_scale,
+                    fp8_scale_value=fp8_scale_value,
+                    fp8_qkv_scale=fp8_qkv_scale,
+                    qkv_scale_value=qkv_scale_value,
                 )
-                if vk is None:
-                    normed_x = b15t_row_major_y(
-                        stored_vk_x_fp8_t, int(x.shape[0])
+            else:
+                vk_layout = (
+                    (u_dim, u_dim + v_dim),
+                    (u_dim + v_dim + q_dim, uvqk_weight.shape[1]),
+                )
+                vk = None
+                if normed_x is None:
+                    # Tiled-A V/K: the store_t skipped y; the projection reads y's
+                    # bytes from the step-tiled yT (K512 tiled-A entry). A decline
+                    # there (logged once; B15T then latches off) rebuilds y from
+                    # yT, bit for bit, for the row-major projection.
+                    assert stored_vk_x_fp8_t is not None
+                    vk = scaled_mm_fp8_out_preq_tiled_a(
+                        stored_vk_x_fp8_t,
+                        int(x.shape[0]),
+                        fp8_scale,
+                        uvqk_weight,
+                        b_vk,
+                        weight_layout=vk_layout,
+                        output_scale=fp8_qkv_scale,
+                        scale_a_value=fp8_scale_value,
+                        output_scale_value=qkv_scale_value,
                     )
-            if vk is None:
-                vk = scaled_mm_fp8_out_preq(
-                    activation_fp8=normed_x,
-                    scale_a=fp8_scale,
-                    weight=uvqk_weight,
-                    bias=b_vk,
-                    weight_layout=vk_layout,
-                    output_scale=fp8_qkv_scale,
-                    scale_a_value=fp8_scale_value,
-                    output_scale_value=qkv_scale_value,
-                )
-            vk = vk.contiguous()
+                    if vk is None:
+                        normed_x = b15t_row_major_y(
+                            stored_vk_x_fp8_t, int(x.shape[0])
+                        )
+                if vk is None:
+                    vk = scaled_mm_fp8_out_preq(
+                        activation_fp8=normed_x,
+                        scale_a=fp8_scale,
+                        weight=uvqk_weight,
+                        bias=b_vk,
+                        weight_layout=vk_layout,
+                        output_scale=fp8_qkv_scale,
+                        scale_a_value=fp8_scale_value,
+                        output_scale_value=qkv_scale_value,
+                    )
+                vk = vk.contiguous()
             assert candidate_normed_x_bf16 is not None
             candidate_normed_x = candidate_normed_x_bf16
         elif input_fp8_forward:
@@ -2607,7 +2757,14 @@ class _HSTUPreprocessAndAttentionTargetsOnlyFunction(torch.autograd.Function):
             k_scale=attention_qkv_scale,
             v_scale=attention_qkv_scale,
         )
-        if input_fp8_forward:
+        if _MX6_FWD and mx6 is not None and normed_x is None:
+            # MX6-served call without an e4m3 normed_x (after the guard call).
+            # mx6 is checked too: with tiled-A V/K a call MX6 does not serve
+            # can also leave normed_x None; it takes the record below.
+            _mx6_fwd.record_contract(
+                "phi1_targets_input_ln", mx6, compact_q=q, compact_u=u
+            )
+        elif input_fp8_forward:
             record_fp8_capability("phi1_targets_input_ln")
             record_fp8_contract(
                 "phi1_targets_input_ln",
@@ -2850,16 +3007,32 @@ class _HSTUPreprocessAndAttentionTargetsOnlyFunction(torch.autograd.Function):
                     dtype=torch.float32,
                     device=x.device,
                 )
-                vk_fp8 = scaled_mm_fp8_out_preq(
-                    activation_fp8=normed_x_fp8,
-                    scale_a=input_scale,
-                    weight=uvqk_weight,
-                    bias=torch.cat((b_v, b_k), dim=0),
-                    weight_layout=vk_layout,
-                    output_scale=qkv_scale,
-                    scale_a_value=ctx.fp8_input_scale_value,
-                    output_scale_value=ctx.fp8_qkv_scale_value,
-                ).contiguous()
+                if _MX6_FWD and (
+                    vk_mx6 := _mx6_fwd.recompute_vk(
+                        ctx,
+                        x=x,
+                        norm_weight=norm_weight,
+                        norm_bias=norm_bias,
+                        uvqk_weight=uvqk_weight,
+                        b_vk=torch.cat((b_v, b_k), dim=0),
+                        vk_layout=vk_layout,
+                        input_scale=input_scale,
+                        qkv_scale=qkv_scale,
+                    )
+                ) is not None:
+                    # Retained-graph backward of an MX6-served forward.
+                    vk_fp8 = vk_mx6
+                else:
+                    vk_fp8 = scaled_mm_fp8_out_preq(
+                        activation_fp8=normed_x_fp8,
+                        scale_a=input_scale,
+                        weight=uvqk_weight,
+                        bias=torch.cat((b_v, b_k), dim=0),
+                        weight_layout=vk_layout,
+                        output_scale=qkv_scale,
+                        scale_a_value=ctx.fp8_input_scale_value,
+                        output_scale_value=ctx.fp8_qkv_scale_value,
+                    ).contiguous()
                 vk = vk_fp8
                 attention_vk_scale = ctx.fp8_qkv_scale_value
             else:
