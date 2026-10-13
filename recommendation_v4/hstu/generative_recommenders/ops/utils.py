@@ -18,6 +18,7 @@
 
 import functools
 import os
+import sys
 
 import torch
 
@@ -126,13 +127,43 @@ def arm_print_all_ranks(msg: str) -> None:
     checked rank by rank. The text before the tag is unchanged, so marker
     greps still match. Logging only: no computed value changes, and each
     caller still prints once per process.
+
+    One write per line. A launcher that filters the merged output line by line
+    (e.g. a sed that drops hipBLASLt's untuned-shape warnings) sees those
+    warnings from every rank as unbuffered std::cerr tokens, one write per
+    `<<`, so a token without its newline is often pending. A line printed right
+    then shares one physical line with the token, and the filter deletes the
+    whole line. So the line is written as ONE os.write
+    of "\n<msg> [rank N]\n". The leading newline ends any pending token, so the
+    message gets a physical line of its own (a write of at most PIPE_BUF bytes
+    to a pipe is atomic), and an empty line is the only side effect. Python's
+    buffered stdout is flushed first, so the line keeps its place among the
+    process's own prints. Without a file descriptor (pytest capsys, a
+    replaced sys.stdout) or if the write fails before any byte, it falls back
+    to print(). DLRM_HSTU_FP8_ARM_PRINT_ATOMIC=0 restores the plain
+    print() (read per call). Logging only.
     """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         rank = str(torch.distributed.get_rank())
     else:
         # RANK is not always exported to the spawned trainer processes.
         rank = os.environ.get("RANK", "0") or "0"
-    print(f"{msg} [rank {rank}]", flush=True)
+    line = f"{msg} [rank {rank}]"
+    if os.environ.get("DLRM_HSTU_FP8_ARM_PRINT_ATOMIC", "1") != "0":
+        try:
+            sys.stdout.flush()
+            fd = sys.stdout.fileno()
+            data = memoryview(("\n" + line + "\n").encode("utf-8", "backslashreplace"))
+            written = os.write(fd, data)
+        except Exception:
+            written = 0
+        if written:
+            # A pipe write of <= PIPE_BUF bytes is all-or-nothing; finish a
+            # short write (a longer line or a regular file) rather than repeat it.
+            while written < len(data):
+                written += os.write(fd, data[written:])
+            return
+    print(line, flush=True)
 
 
 def copy_if_different_ptr(dst: torch.Tensor, src: torch.Tensor) -> None:

@@ -66,6 +66,25 @@ The stacked LayerNorm(512) backward kernels (FlyDSL) of that path are JIT-built
 after the forks by run_startup_preload (_prebuild_flydsl_ln_bwd, " grp3f8=..."),
 next to the other FlyDSL LayerNorm-backward kernels; without DL_PRESTART they
 compile at first use.
+
+EC_DGRAD_SEGREDUCE HOOK (_prebuild_ec_dgrad_segreduce, only with
+DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE=1, default OFF; unset or "0": returns before
+importing anything). triton_ec_dgrad_segreduce.prebuild compiles the four
+Triton kernels on a small synthetic input built without RNG and checks the
+result bitwise against fp64. It leaves Triton compiled kernels and that
+module's gate cache behind; a failure latches only that path off.
+
+Indexed-X HOOK (_prebuild_ec_indexed_l1, only with DLRM_HSTU_FP8_EC_INDEXED_L1=1, default OFF; unset or "0":
+returns before importing anything). triton_ec_indexed_l1.prebuild compiles the six Triton kernels (_ecix_fwd,
+_ecix_wgrad, _ecix_wgrad_reduce x item + cat) on a synthetic integer-valued input built without RNG and checks
+them bitwise against fp64; it releases its transient (torch.cuda.empty_cache) before alloc_pregrow.
+A failure latches only Indexed-X off.
+
+Indexed-X FP8 HOOK (_prebuild_ec_indexed_l1_fp8, inside the Indexed-X hook's RNG / sync / empty_cache bracket, only with
+DLRM_HSTU_FP8_EC_INDEXED_L1_FP8=1 (default OFF) while Indexed-X is armed; unset or "0": nothing is imported).
+triton_ec_indexed_l1_fp8.prebuild compiles every FP8F kernel at the production class and checks it against its exact
+reference; the hook prints "[ec-indexed-l1-fp8] pre-run_start prebuild OK (...)". A failure latches only the FP8
+forward off (Indexed-X stays on). With the knob on but Indexed-X off, the hook prints the knob's IGNORED line instead.
 """
 
 import contextlib
@@ -582,6 +601,162 @@ def run_blas_warmup(device: torch.device, enabled: int = 0,
             failed, seconds,
         )
     _warmup_preproc_fp8_l2(device)
+    _prebuild_ec_dgrad_segreduce(device)
+    _prebuild_ec_indexed_l1(device)
+
+
+def _prebuild_ec_dgrad_segreduce(device: torch.device) -> None:
+    """Fused EC dgrad + segment reduce (ops/triton/triton_ec_dgrad_segreduce.py,
+    DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE=1, default OFF): JIT-build its four
+    Triton kernels before RUN_START on a synthetic exact-arithmetic input
+    (no RNG, no module/parameter state) and check the result bitwise
+    against an fp64 reference. A failure latches the path off for the process
+    (one FAILED CLOSED line) and startup goes on; a sticky device fault fails
+    the run here, as in _warmup_preproc_fp8_l2. Gate unset or "0": returns
+    before importing anything."""
+    if os.environ.get("DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE", "").strip().lower() not in (
+        "1", "true", "on", "yes",
+    ):
+        return
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    try:
+        from generative_recommenders.ops.triton import triton_ec_dgrad_segreduce as xs
+
+        if not xs.enabled():
+            return
+        rng_before = _rng_snapshot(device)
+    except Exception as error:  # never abort a run over a warmup
+        logger.warning("[blas-warmup] ec-dgrad-segreduce prebuild skipped: %s", error)
+        return
+    try:
+        xs.prebuild(device)
+    except Exception as error:
+        xs.latch_off("prebuild", error)
+    try:
+        rng_after = _rng_snapshot(device)
+        if not torch.equal(rng_before[0], rng_after[0]) or (
+            rng_before[1] is not None and not torch.equal(rng_before[1], rng_after[1])
+        ):
+            logger.error("[blas-warmup] RNG state moved in the ec-dgrad-segreduce "
+                         "prebuild; restoring it")
+            torch.random.set_rng_state(rng_before[0])
+            if rng_before[1] is not None:
+                torch.cuda.set_rng_state(rng_before[1], device)
+    except Exception as error:
+        logger.error("[blas-warmup] RNG state check failed: %s", error)
+    try:
+        torch.cuda.synchronize(device)
+    except Exception as error:
+        raise RuntimeError(
+            "[blas-warmup] device fault during the ec-dgrad-segreduce prebuild; "
+            "the HIP context is unusable. Rerun with "
+            "DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE=0 to isolate."
+        ) from error
+
+
+def _prebuild_ec_indexed_l1(device: torch.device) -> None:
+    """Indexed-X L1 (ops/triton/triton_ec_indexed_l1.py, DLRM_HSTU_FP8_EC_INDEXED_L1=1, default OFF): JIT-build
+    its six Triton kernels before RUN_START on a synthetic exact-arithmetic input (no RNG, no module/parameter
+    state) and check the results bitwise against fp64. A failure latches Indexed-X off (one FAILED CLOSED line)
+    and startup goes on; a sticky device fault fails the run here. Gate unset or "0": returns before importing."""
+    if os.environ.get("DLRM_HSTU_FP8_EC_INDEXED_L1", "").strip().lower() not in ("1", "true", "on", "yes"):
+        _fp8f_ignored_without_ix()
+        return
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    try:
+        from generative_recommenders.ops.triton import triton_ec_indexed_l1 as ixk
+
+        if not ixk.enabled():
+            return
+        rng_before = _rng_snapshot(device)
+    except Exception as error:  # never abort a run over a warmup
+        logger.warning("[blas-warmup] ec-indexed-l1 prebuild skipped: %s", error)
+        return
+    try:
+        ixk.prebuild(device)
+    except Exception as error:
+        ixk.latch_off("prebuild", error)
+    _prebuild_ec_indexed_l1_fp8(device, ixk)  # its own knob, only while Indexed-X is still armed
+    try:
+        rng_after = _rng_snapshot(device)
+        if not torch.equal(rng_before[0], rng_after[0]) or (
+            rng_before[1] is not None and not torch.equal(rng_before[1], rng_after[1])
+        ):
+            logger.error("[blas-warmup] RNG state moved in the ec-indexed-l1 prebuild; restoring it")
+            torch.random.set_rng_state(rng_before[0])
+            if rng_before[1] is not None:
+                torch.cuda.set_rng_state(rng_before[1], device)
+    except Exception as error:
+        logger.error("[blas-warmup] RNG state check failed: %s", error)
+    try:
+        torch.cuda.synchronize(device)
+    except Exception as error:
+        raise RuntimeError(
+            "[blas-warmup] device fault during the ec-indexed-l1 prebuild; the HIP context is unusable. "
+            "Rerun with DLRM_HSTU_FP8_EC_INDEXED_L1=0 to isolate."
+        ) from error
+    # Release the prebuild transient before alloc_pregrow maps the free HBM (as the PREPROC_L2 hook does).
+    try:
+        torch.cuda.empty_cache()
+    except Exception as error:
+        logger.warning("[blas-warmup] empty_cache after the ec-indexed-l1 prebuild failed: %s", error)
+
+
+# Literal copies of ops/triton/triton_ec_indexed_l1_fp8.ENV_VAR / TAG (read without importing).
+_FP8F_ENV: str = "DLRM_HSTU_FP8_EC_INDEXED_L1_FP8"
+_FP8F_TAG: str = "[ec-indexed-l1-fp8]"
+
+
+def _fp8f_requested() -> bool:
+    return os.environ.get(_FP8F_ENV, "").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _fp8f_ignored_without_ix() -> None:
+    """FP8 Indexed-X knob on with Indexed-X off: its IGNORED line, once per process (this hook runs once), every rank.
+    Imports only ops/utils; knob off: returns at once."""
+    if not _fp8f_requested():
+        return
+    msg = (f"{_FP8F_TAG} {_FP8F_ENV}=1 IGNORED (NOT armed): Indexed-X (DLRM_HSTU_FP8_EC_INDEXED_L1) is off; the FP8 "
+           "forward runs only on the Indexed-X path")
+    try:
+        from generative_recommenders.ops.utils import arm_print_all_ranks
+
+        arm_print_all_ranks(msg)
+    except Exception:  # never abort a run over a warmup line
+        logger.warning("%s", msg)
+
+
+def _prebuild_ec_indexed_l1_fp8(device: torch.device, ixk) -> None:  # pyre-ignore[2]
+    """FP8 Indexed-X L1 forward (ops/triton/triton_ec_indexed_l1_fp8.py, DLRM_HSTU_FP8_EC_INDEXED_L1_FP8=1, default OFF): called
+    inside _prebuild_ec_indexed_l1's RNG / sync / empty_cache bracket, after the Indexed-X prebuild, and acts only
+    while Indexed-X is still armed. F8.prebuild JIT-builds every FP8F kernel at the production specialization class
+    and checks it against its exact reference; its summary becomes the "[ec-indexed-l1-fp8] pre-run_start prebuild
+    OK (...)" line (every rank). Same failure policy as the Indexed-X prebuild: a failure latches only the FP8 forward off
+    (F8.latch_off, one FAILED CLOSED line; Indexed-X stays on) and startup goes on. Knob unset or "0": returns
+    before importing anything."""
+    if not _fp8f_requested() or not ixk.enabled():
+        return
+    try:
+        from generative_recommenders.ops.triton import triton_ec_indexed_l1_fp8 as f8
+    except Exception as error:  # the first FP8 forward fails the same way (ec_indexed_l1 fails closed): say it now
+        ixk._say(f"{_FP8F_TAG} FAILED CLOSED at prebuild (import): {type(error).__name__}: {str(error)[:300]} -> "
+                 "bf16 Indexed-X for the rest of the run")
+        return
+    try:
+        if not f8.fp8f_enabled():
+            return
+        summary = str(f8.prebuild(device))
+    except Exception as error:
+        try:
+            f8.latch_off("prebuild", error)
+        except Exception:
+            ixk._say(f"{_FP8F_TAG} FAILED CLOSED at prebuild: {type(error).__name__}: {str(error)[:300]} -> "
+                     "bf16 Indexed-X for the rest of the run")
+        return
+    ok = f"{_FP8F_TAG} pre-run_start prebuild OK"
+    ixk._say(summary if summary.startswith(ok) else f"{ok} ({summary})")
 
 
 def _warmup_preproc_fp8_l2(device: torch.device) -> None:

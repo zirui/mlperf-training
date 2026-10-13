@@ -147,6 +147,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 from generative_recommenders.ops.layer_norm import LayerNorm, SwishLayerNorm
 from generative_recommenders.ops.triton import bwd_fp8, preproc_fp8_snr
+from generative_recommenders.ops.triton import triton_ec_dgrad_segreduce as _xs
 from generative_recommenders.ops.triton import triton_layer_norm as TLN
 from generative_recommenders.ops.triton.triton_layer_norm import (
     compute_BLOCK_D,
@@ -163,6 +164,16 @@ FP8_MLPS: Tuple[int, ...] = (0, 1)
 _MIN_ROWS: int = 1 << 16
 _HID: int = 256
 _OUT: int = 512
+# Indexed-X L1 (ops/ec_indexed_l1.py, DLRM_HSTU_FP8_EC_INDEXED_L1, default off): the tag on an EC placeholder
+# (literal: nothing is imported unless a tensor carries it).
+_IX_ATTR: str = "_dlrmv4_ec_indexed_l1"
+
+
+def _ix() -> Any:
+    from generative_recommenders.ops import ec_indexed_l1
+
+    return ec_indexed_l1
+
 
 _ENABLED: Optional[bool] = None
 _ARMED_LOGGED: bool = False
@@ -475,6 +486,9 @@ def run_head(
         if not mlp._f1_reported:
             mlp._report_once(True, x)
         slot.mode = "fp8"
+        # E-X2b: pair 0 may take x's EC dh port (None, None when off). The
+        # "warm" branch below claims inside `shipped` (= _run_head).
+        rec, port = _xs.claim(x, lin0.weight)
         y = _LinearSwishLNEmitFunction.apply(
             x,
             lin0.weight,
@@ -486,6 +500,8 @@ def run_head(
             emu,
             slot.train,
             slot,
+            rec,
+            port,
         )
         _report_armed_once(k, x.shape[0], emu, shipped_emu)
         return y, slot
@@ -581,7 +597,13 @@ def _quantize_w2(
 class _LinearSwishLNEmitFunction(torch.autograd.Function):
     """Pair 0 with the SwishLN forward replaced by P2. Returns a stride-0 bf16
     proxy of a1's shape; the e4m3 a1 goes to `slot.payload`. backward ==
-    _LinearNormFunction.backward with is_swish=True (no residual)."""
+    _LinearNormFunction.backward with is_swish=True (no residual).
+
+    Indexed-X L1 (ops/ec_indexed_l1.py, DLRM_HSTU_FP8_EC_INDEXED_L1, default off):
+    when x is an EC placeholder (it carries _IX_ATTR), h = _ecix_fwd(U, idx, W1_c,
+    b1_c) reads X through the EC index, the node saves (U, idx) instead of X, and
+    the backward's dW1 sums over all M tokens from (U, idx); dX = dh @ W1_c is
+    unchanged. Any in-Function decline rebuilds the exact X and runs this body."""
 
     @staticmethod
     # pyre-ignore[14]
@@ -597,14 +619,29 @@ class _LinearSwishLNEmitFunction(torch.autograd.Function):
         emu: int,
         train: bool,
         slot: Slot,
+        ex2b_rec: Optional["_xs.PortRecord"] = None,
+        ex2b_port: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from generative_recommenders.ops.triton.triton_preproc_fp8 import (
             swishln256_fwd_emit,
         )
 
-        x = x.contiguous()
-        x_c, lin_w_c, lin_b_c = _autocast_casts(x, lin_w, lin_b)
-        h = torch.addmm(lin_b_c, x_c, lin_w_c.t())
+        x_in = x
+        ixu = None
+        if getattr(x, _IX_ATTR, None) is not None:  # Indexed-X placeholder (never with the knob off)
+            w_c, b_c = _autocast_weight_casts(x.device, lin_w, lin_b)  # == the shipped casts
+            ixu = _ix().fwd(x, w_c, b_c, lin_w.dtype, "_LinearSwishLNEmitFunction", train=train)
+        if ixu is not None and ixu.h is not None:  # indexed: X is never materialized
+            # IX-FP8F (train only): table = Ud and w_bwd = Wd, so the saved W1, dX = dh @ W1 and E-X2b's bound W1
+            # use the dequantized operands; w_bwd is None on every bf16 path (lin_w_c = w_c).
+            x_c, lin_w_c, lin_b_c, h = ixu.table, (w_c if ixu.w_bwd is None else ixu.w_bwd), b_c, ixu.h
+        else:
+            cw, cb = (lin_w, lin_b) if ixu is None else (w_c, b_c)  # decline: reuse the casts above
+            if ixu is not None:
+                x = ixu.x  # in-Function decline: the exact rebuilt X
+            x = x.contiguous()
+            x_c, lin_w_c, lin_b_c = _autocast_casts(x, cw, cb)
+            h = torch.addmm(lin_b_c, x_c, lin_w_c.t())
         site = _site("a1", k, h.device)
         # Eval (train=False) skips the token-major copy: only the L2 wgrad reads it.
         # The amax partials go straight to the site's bookkeeping launch (eval
@@ -614,7 +651,13 @@ class _LinearSwishLNEmitFunction(torch.autograd.Function):
         )
         decode = site.steady(partials, snapshot=True) if train else site.scale
         slot.payload = (a1_rm, a1_tm, decode)
-        ctx.save_for_backward(x_c, lin_w_c, lin_b_c, h, norm_w, norm_b, mean, rstd)
+        # Indexed-X: slot 0 is U [U, 512] instead of X, slot 8 is the member's int64 idx.
+        ctx.save_for_backward(x_c, lin_w_c, lin_b_c, h, norm_w, norm_b, mean, rstd,
+                              *(() if ixu is None or ixu.h is None else (ixu.idx,)))
+        ctx.ix = None if ixu is None else ixu.call  # IXCall: metadata + ledger, no tensors
+        # E-X2b: as _LinearNormFunction.forward (W1 handed to the EC backward). With
+        # Indexed-X the record's tagged tensor is the caller's placeholder.
+        ctx.ex2b = None if ex2b_port is None else _xs.bind(ex2b_rec, x_c if ixu is None else x_in, lin_w_c)
         ctx.grad_dtypes = (x.dtype, lin_w.dtype, lin_b.dtype)
         ctx.eps = eps
         ctx.BLOCK_D = compute_BLOCK_D(h)
@@ -629,7 +672,8 @@ class _LinearSwishLNEmitFunction(torch.autograd.Function):
     def backward(  # pyre-ignore[3]
         ctx, dy: torch.Tensor  # pyre-ignore[2]
     ) -> Tuple[Optional[torch.Tensor], ...]:
-        x, lin_w, lin_b, h, norm_w, norm_b, mean, rstd = ctx.saved_tensors
+        saved = ctx.saved_tensors
+        x, lin_w, lin_b, h, norm_w, norm_b, mean, rstd = saved[:8]  # with Indexed-X, x is U [U, 512]
         dh, dnorm_w, dnorm_b, dh_colsum = triton_weighted_layer_norm_bwd_dxsum(
             dy=dy.contiguous(),
             x=h,
@@ -642,11 +686,20 @@ class _LinearSwishLNEmitFunction(torch.autograd.Function):
             is_swish=True,
         )
         needs = ctx.needs_input_grad
-        dx = dh @ lin_w if needs[0] else None
-        dlin_w = dh.t() @ x if needs[1] else None
+        # E-X2b: as _LinearNormFunction.backward (dh through the EC port).
+        routed = ctx.ex2b is not None and _xs.route(ctx, ctx.ex2b, dh, len(needs) - 1)
+        dx = dh @ lin_w if needs[0] and not routed else None
+        ix = ctx.ix
+        if ix is not None and ix.indexed:
+            # Indexed-X: dW1 over ALL M tokens from (U, idx), already in W1's dtype.
+            dlin_w = _ix().wgrad(ix, dh, x, saved[8], ctx.grad_dtypes[1]) if needs[1] else None
+        else:
+            dlin_w = dh.t() @ x if needs[1] else None
+        if ix is not None:
+            ix.ledger.note_bwd(routed)  # backward-time consumer accounting (EC backward check)
         dlin_b = dh_colsum if needs[2] else None
         x_dt, w_dt, b_dt = ctx.grad_dtypes
-        return (
+        out = (
             _match(dx, x_dt),
             _match(dlin_w, w_dt),
             _match(dlin_b, b_dt),
@@ -657,7 +710,10 @@ class _LinearSwishLNEmitFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # ex2b_rec
+            dh if routed else None,  # ex2b_port: E-X2b's dh
         )
+        return out[: len(needs)]
 
 
 def _wgrad_nn_b(
@@ -763,7 +819,7 @@ def _grouped_bwd(
         or TLN._WLN_BWD_FLYDSL_BROKEN is not None
         or not arch.startswith("gfx950")
     ):
-        _GROUPED_LAST_DECLINE = "FlyDSL ln_bwd / E-M2 FlyDSL predicate: FlyDSL ln_bwd off/latched/not gfx950"
+        _GROUPED_LAST_DECLINE = "FlyDSL ln_bwd predicate: ln_bwd off/latched/not gfx950"
         return None
     try:
         # Before E-M2's predicate, which imports ln_bwd_grouped itself and
@@ -782,7 +838,7 @@ def _grouped_bwd(
 
     pr7_owns, why = pgt._flydsl_grouped_reason(dy, hs, norm_ws, norm_bs, means, rstds)
     if not pr7_owns or why is not None or pgt._BWD_FLYDSL_BROKEN is not None:
-        _GROUPED_LAST_DECLINE = f"FlyDSL ln_bwd / E-M2 FlyDSL predicate: {why}"
+        _GROUPED_LAST_DECLINE = f"FlyDSL ln_bwd predicate: {why}"
         return None
     inv_scales: List[Optional[torch.Tensor]] = [
         _site("dh2", 0, dy.device).inv_scale,

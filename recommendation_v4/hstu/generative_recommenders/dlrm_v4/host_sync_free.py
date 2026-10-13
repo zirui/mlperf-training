@@ -54,7 +54,9 @@ MLPerf train-loss ``float()`` -- so all three go together:
    ``split_wait_poll_on`` issues the deferred splits wait only once the
    collective has finished. Knobs ``..._DISTINIT_MAIN``,
    ``..._SPLITWAIT_POLL`` (default 1 when sync-free is active).
-   ``enabled()`` follows the knob alone at every node count.
+   ``enabled()`` follows the knob alone at every node count. At 2+ nodes the
+   TRAIN pipeline's side streams run at priority 0
+   (train_pipe_stream_priority()); 1n and eval keep -1.
 
 A one-step lag fence (``StepFence``) keeps the host at most one step ahead of
 the GPU, which bounds queued memory/allocator state without emptying the
@@ -135,16 +137,169 @@ _PRIO_ENV = _ENV.replace("SYNCFREE", "PIPE_STREAM_PRIO")  # DLRM_HSTU_FP8_PIPE_S
 _DISTINIT_ENV = _ENV + "_DISTINIT_MAIN"  # DLRM_HSTU_FP8_SYNCFREE_DISTINIT_MAIN
 
 
+def _prio_value(name: str) -> Optional[int]:
+    """Read a stream-priority knob: unset/empty = None, else -1 or 0.
+
+    torch on ROCm clamps stream priorities to {-1 (high), 0 (normal)}; any
+    other value would come back clamped, the pipeline would then rebuild its
+    streams and strand the pre-grown pools, so it is refused up front.
+    """
+    v = os.environ.get(name)
+    if v is None or v.strip() == "":
+        return None
+    try:
+        p = int(v)
+    except ValueError:
+        p = None
+    if p not in (-1, 0):
+        raise ValueError(
+            "%s=%r: expected -1 (torchrec's high priority) or 0 (normal)" % (name, v)
+        )
+    return p
+
+
 def pipe_stream_priority() -> Optional[int]:
     """Explicit priority for torchrec's pipeline memcpy / data-dist streams.
 
-    None (the default) keeps torchrec's own choice (-1, high priority) at every
-    node count. ``DLRM_HSTU_FP8_PIPE_STREAM_PRIO=<p>`` overrides it.
+    None (the default) keeps torchrec's own choice (-1, high priority) for
+    every pipeline; train_pipe_stream_priority() adds the multi-node priority
+    for the train pipeline at 2+ nodes. ``DLRM_HSTU_FP8_PIPE_STREAM_PRIO=<p>``
+    overrides it for every pipeline.
     """
-    v = os.environ.get(_PRIO_ENV)
-    if v is not None and v != "":
-        return int(v)
-    return None
+    return _prio_value(_PRIO_ENV)
+
+
+_PRIO_MN_ENV = _PRIO_ENV + "_MN"  # DLRM_HSTU_FP8_PIPE_STREAM_PRIO_MN
+
+
+def _spans_nodes() -> bool:
+    """True when the job runs on more than one node.
+
+    Calls _env_bootstrap._spans_nodes, which also decides the other multi-node
+    defaults at bootstrap and stays torch-free there. NNODES (exported by the
+    launcher at every node count) or SLURM_NNODES decides when set; only without either is the
+    process-group size compared with the ranks of one node (LOCAL_WORLD_SIZE,
+    else the visible devices). Imported here, not at module level: the
+    bootstrap module imports gin.
+    """
+    from generative_recommenders.dlrm_v4.train import _env_bootstrap
+
+    return _env_bootstrap._spans_nodes()
+
+
+def train_pipe_stream_priority() -> Optional[int]:
+    """Priority for the TRAIN pipeline's memcpy / data-dist streams.
+
+    The override ``DLRM_HSTU_FP8_PIPE_STREAM_PRIO`` (every pipeline) wins.
+    Otherwise ``DLRM_HSTU_FP8_PIPE_STREAM_PRIO_MN=<p>`` (the gin binds 0;
+    -1 opts out) applies to the train pipeline only, and only when the job
+    spans more than one node. None keeps torchrec's own choice (-1, high
+    priority): 1-node runs and the eval pipeline are unchanged.
+
+    Why: the deferred next-batch input dist does not wait on the following
+    batch's H2D, so it has about a step of slack before the next forward reads
+    it. Its EC dedup / bucketize / permute kernels then need not pre-empt the
+    main stream, and at high priority they slow the critical rank's
+    main-stream kernels.
+
+    Placement: at priority 0 HIP binds the pair into the NORMAL hardware-queue
+    pool (GPU_MAX_HW_QUEUES per priority, least-referenced reuse), which also
+    holds the main stream. The pair must not land on main's queue (FIFO with
+    the forward); alloc_pregrow / the pipeline check that with
+    shares_hw_queue() and fall back to -1 if it does.
+    """
+    p = pipe_stream_priority()
+    if p is not None:
+        return p
+    v = _prio_value(_PRIO_MN_ENV)  # validated at every node count
+    if v is None or not _spans_nodes():
+        return None
+    return v
+
+
+_mn_inactive_logged = False
+
+
+def log_train_pipe_priority_inactive(role: str) -> bool:
+    """Say once per process that the multi-node priority is bound but the job
+    is 1-node.
+
+    Called where a pipeline has picked its side-stream priority and got None.
+    Logs one info line, only for the train pipeline, only when
+    DLRM_HSTU_FP8_PIPE_STREAM_PRIO_MN binds 0, DLRM_HSTU_FP8_PIPE_STREAM_PRIO is unset and
+    the job does not span nodes (the same gate as
+    train_pipe_stream_priority()). Log only: no stream, priority, probe or
+    allocation changes. True if it logged now.
+    """
+    global _mn_inactive_logged
+    if (
+        _mn_inactive_logged
+        or role != "train"
+        or pipe_stream_priority() is not None
+        or _prio_value(_PRIO_MN_ENV) in (None, -1)
+        or _spans_nodes()
+    ):
+        return False
+    _mn_inactive_logged = True
+    logger.info(
+        "DLRMV4 multi-node side-stream priority inactive: single node, train "
+        "pipeline keeps torchrec priority -1"
+    )
+    return True
+
+
+def disable_train_pipe_priority(reason: str) -> None:
+    """Turn the multi-node train priority off for the rest of this process
+    (fallback to -1)."""
+    os.environ[_PRIO_MN_ENV] = "-1"
+    logger.warning(
+        "DLRMV4 multi-node side-stream priority fallback: train pipeline side "
+        "streams keep torchrec's priority -1 (%s)",
+        reason,
+    )
+
+
+def shares_hw_queue(
+    a: "torch.cuda.Stream", b: "torch.cuda.Stream", spin_ms: float = 40.0
+) -> Optional[bool]:
+    """True if stream ``b`` cannot run while stream ``a`` runs, i.e. HIP put
+    both on one hardware queue (in-order). None if the probe could not run.
+
+    A one-block spin kernel (torch.cuda._sleep: one CU) runs ~spin_ms on ``a``;
+    a tiny spin is then issued on ``b``. On separate hardware queues the tiny
+    one finishes long before the spin on ``a`` does; on a shared queue it has
+    to wait for it. Synthetic, no training data; run before RUN_START.
+    """
+    try:
+        if not torch.cuda.is_available() or not hasattr(torch.cuda, "_sleep"):
+            return None
+        e0 = torch.cuda.Event(enable_timing=True)
+        e1 = torch.cuda.Event(enable_timing=True)
+        cycles = 1 << 20
+        with torch.cuda.stream(a):
+            e0.record(a)
+            torch.cuda._sleep(cycles)
+            e1.record(a)
+        e1.synchronize()
+        ms = e0.elapsed_time(e1)
+        if not ms or ms <= 0:
+            return None
+        cycles = max(1, int(cycles * spin_ms / ms))
+        done_a = torch.cuda.Event()
+        done_b = torch.cuda.Event()
+        with torch.cuda.stream(a):
+            torch.cuda._sleep(cycles)
+            done_a.record(a)
+        with torch.cuda.stream(b):
+            torch.cuda._sleep(64)
+            done_b.record(b)
+        done_b.synchronize()
+        shared = bool(done_a.query())
+        done_a.synchronize()
+        return shared
+    except Exception as e:  # never block training on the probe
+        logger.warning("DLRMV4 hw-queue probe skipped: %s", e)
+        return None
 
 
 def dist_init_on_main() -> bool:
@@ -534,6 +689,19 @@ def _lpk_on() -> bool:
     return os.environ.get(_ENV + "_LPK", "1") == "1"
 
 
+_b1pp_mod: Any = None
+
+
+def _b1pp() -> Any:
+    """dlrm_v4/b1pp.py, imported at the first dist_init that needs it."""
+    global _b1pp_mod
+    if _b1pp_mod is None:
+        from generative_recommenders.dlrm_v4 import b1pp as _mod
+
+        _b1pp_mod = _mod
+    return _b1pp_mod
+
+
 def install_kjt_lpk_patch() -> None:
     """Patch torchrec's KJT all_to_all to carry host length_per_key (gated)."""
     import torchrec.distributed.dist_data as dd
@@ -635,6 +803,10 @@ def install_kjt_lpk_patch() -> None:
                     % (len(self._keys), "none" if lpk is None else len(lpk),
                        self._recat is not None)
                 )
+            if self._workers > 1 and _b1pp().recat_on():
+                _b1pp().log_fallback(
+                    "recat", "host-sync-free length_per_key path not taken (torchrec dist_init)"
+                )
             return kjtt_wait(self)
         for aw in self._awaitables:
             aw.wait()
@@ -647,15 +819,34 @@ def install_kjt_lpk_patch() -> None:
             )
         spr = self._stride_per_rank
         stride = spr[0]
+        offsets = None  # None: torchrec computes the KJT offsets when asked (stock)
         with torch.autograd.profiler.record_function("## dist_init:recat_values ##"):
             if all(s == stride for s in spr):
                 if stride > 0:
-                    lengths, values, weights = torch.ops.fbgemm.permute_2D_sparse_data(
-                        self._recat, lengths.view(-1, stride), values, weights,
-                        values.numel(),
-                    )
+                    # Fused KJT recat, dlrm_v4/b1pp.py (DLRM_HSTU_FP8_KJT_RECAT_FUSED,
+                    # absent = off): two Triton kernels give the same permuted
+                    # lengths/values plus the KJT offsets. When the TBE lookup
+                    # takes the whole KJT (one sequence TBE group: 2n/4n RW) its
+                    # offsets cumsum then has nothing to do; KJT.split children
+                    # (1n, several groups) recompute theirs as stock. None = not
+                    # engaged: stock.
+                    fused = _b1pp().kjt_recat(self._recat, lengths, values, weights, stride)
+                    if fused is not None:
+                        lengths, values, offsets = fused
+                    else:
+                        lengths, values, weights = torch.ops.fbgemm.permute_2D_sparse_data(
+                            self._recat, lengths.view(-1, stride), values, weights,
+                            values.numel(),
+                        )
                     lengths = lengths.view(-1)
+                elif _b1pp().recat_on():
+                    _b1pp().log_fallback("recat", "stride 0 (empty batch: no permute in either path)")
             else:
+                if _b1pp().recat_on():
+                    _b1pp().log_fallback(
+                        "recat", "unequal stride per rank (stock permute_1D_sparse_data)",
+                        "strides=%s", spr,
+                    )
                 lengths, values, weights = torch.ops.fbgemm.permute_1D_sparse_data(
                     self._recat, lengths.view(-1), values, weights, values.numel(),
                 )
@@ -664,6 +855,7 @@ def install_kjt_lpk_patch() -> None:
             values=values,
             weights=weights,
             lengths=lengths,
+            offsets=offsets,
             stride=sum(spr),
             length_per_key=list(lpk),
         )

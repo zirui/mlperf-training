@@ -40,6 +40,7 @@ from generative_recommenders.ops.triton.triton_hstu_attention import (
 )
 from generative_recommenders.ops.triton.triton_fp8 import (
     activation_scale_value,
+    b15t_row_major_y,
     calibrate_scale_buffer,
     fp8_scale_tensor,
     fp8_supported,
@@ -47,15 +48,21 @@ from generative_recommenders.ops.triton.triton_fp8 import (
     hstu_fp8_fail_closed,
     hstu_fp8_fuse_ln_enabled,
     hstu_fp8_fuse_qkv_enabled,
+    k512_tiled_a_requested,
+    k512_tiled_a_vk_decline_reason,
+    latch_b15t_off,
+    log_b15t_decline_once,
     packed_weight_for_layout,
     refuse_fp8_with_flydsl_attention_forward,
     record_fp8_capability,
     record_fp8_contract,
     scaled_addmm_fp8_preq,
     scaled_mm_fp8_out_preq,
+    scaled_mm_fp8_out_preq_tiled_a,
 )
 from generative_recommenders.ops.triton import hstu_du_e5m2
 from generative_recommenders.ops.triton import wgrad_ck
+from generative_recommenders.ops.flydsl import hstu_do8_registry
 from generative_recommenders.ops.triton.triton_hstu_linear import (
     HSTU_DUVQK_BUFFER_ATTR,
     HSTU_DUVQK_SITE_ATTR,
@@ -76,6 +83,7 @@ from generative_recommenders.ops.triton.triton_layer_norm import (
     triton_weighted_layer_norm_fwd,
     triton_weighted_layer_norm_fwd_fp8_store_t,
     triton_weighted_layer_norm_recompute_fp8t,
+    store_t_skip_y_decline_reason,
 )
 from torch.nn import functional as F
 from torch.autograd.profiler import record_function
@@ -103,7 +111,7 @@ _EARLY_RELEASE_FP8_UVQK = (
 # compiled/autotuned kernel variant, so their last fp32 bit can differ from
 # the flag-off kernel, exactly as it already differs between autotune configs
 # of the flag-off kernel: a declared reduction-order change, same formula.
-# Costs 2 B per element of x held from forward to backward (~1 KiB/token/layer).
+# Costs 2 B per element of x held from forward to backward.
 _SAVE_BF16_NORMED_X = (
     os.environ.get("DLRM_HSTU_FP8_SAVE_NORMED_X", "0") == "1"
 )
@@ -193,15 +201,15 @@ _GLUE_LAZY_LOGGED = [False]
 
 
 def _attn_glue_lazy() -> bool:
-    """DLRM_HSTU_FP8_ATTN_GLUE_LAZY (read per call, armed only by "1", gin
-    default ON).
+    """DLRM_HSTU_FP8_ATTN_GLUE_LAZY (read per call, armed
+    only by "1", gin default ON).
 
     The saved-FP8 backward builds a (1, 1) fp32 Q/K/V scale tensor that only
     its Triton attention FALLBACK reads (_dequantize_fp8 when FlyDSL
     declines). While FlyDSL serves the backward -- the default -- that fill
     is dead GPU work. Armed, it is built only where the fallback runs; it
     holds the same frozen value. "0"/absent = build it eagerly.
-    The lazy sort_by_length permutation is handled by GLUE_FOLD3 LAZY_SORT
+    The lazy sort_by_length permutation is owned by GLUE_FOLD3 LAZY_SORT
     (ops/glue_fold3.py; kill switch DLRM_HSTU_FP8_GLUE_FOLD3_SORT=0).
     """
     on = os.environ.get("DLRM_HSTU_FP8_ATTN_GLUE_LAZY", "0") == "1"
@@ -253,7 +261,7 @@ def _adopt_duvqk(
 def _dq_sink_diagnostics_on() -> bool:
     """FlyDSL backward diagnostics that read the BF16 dq after the dq-split
     (HSTU_ATTN_BWD_CHECK, DLRM_HSTU_FP8_BWD_FULL_STATS, DLRM_HSTU_FP8_BWD_DUMP):
-    with any of them set the dq producer stays off (it leaves dq unwritten)."""
+    with any of them set the e5m2 dq producer stays off (it leaves dq unwritten)."""
     return (
         int(os.environ.get("HSTU_ATTN_BWD_CHECK", "0") or 0) > 0
         or int(os.environ.get("DLRM_HSTU_FP8_BWD_FULL_STATS", "0") or 0) > 0
@@ -262,7 +270,7 @@ def _dq_sink_diagnostics_on() -> bool:
 
 
 def _dq_sink_layout_ok(ctx, duvqk: torch.Tensor) -> bool:  # pyre-ignore[2]
-    """dq producer layout: duvqk is a contiguous [M, u|v|q|k] buffer whose
+    """e5m2 dq producer layout: duvqk is a contiguous [M, u|v|q|k] buffer whose
     q block is whole 256-column blocks of the cast (the u|v|k-only cast skips
     whole blocks)."""
     bn = bwd_fp8._COLSUM_BLOCK_N
@@ -280,22 +288,22 @@ def _dq_sink_layout_ok(ctx, duvqk: torch.Tensor) -> bool:  # pyre-ignore[2]
 def _log_dq_sink_armed(
     sink, cast: str = "u|v|k only", du_emit: bool = False  # pyre-ignore[2]
 ) -> None:
-    """ARMED line of the dq producer, once per device (and once more when its
-    q block shares dz8 with the du producer's u block: the cast that actually
-    runs then is the multi-range skip kernel over v|k).
+    """ARMED line of the e5m2 dq producer, once per device (and once
+    more when its q block shares dz8 with the e5m2 du u block: the cast that
+    actually runs then is the multi-range skip kernel over v|k).
 
-    `cast`: the columns the single-range skip cast covers ("u only" when the
-    bwd_dkdv sink wrote v|k into the same dz8). With `du_emit` and a
-    non-default `cast` (du producer + dV/dK sink call: u, v|k and q all
-    producer-cast) no cast kernel runs and `cast` says why."""
+    `cast` (dV|dK sink): the columns the single-range skip cast covers ("u
+    only" when the bwd_dkdv sink wrote v|k into the same dz8). With
+    `du_emit` and a non-default `cast` (e5m2 du + dV|dK sink call: u, v|k
+    and q all producer-cast) no cast kernel runs and `cast` says why."""
     if not du_emit:
         key = "dq_e5m2"
         cast = f"_quantize_amax_colsum_skip_kernel ({cast})"
     elif cast == "u|v|k only":
         key = "dq_e5m2_b1a"
         cast = (
-            "_quantize_amax_colsum_skipn_kernel (v|k only; u from the du e5m2 "
-            "producer in the LNMD bwd)"
+            "_quantize_amax_colsum_skipn_kernel (v|k only; u from the e5m2 du "
+            "LNMD bwd)"
         )
     else:
         key = "dq_e5m2_b1a_e1"
@@ -314,13 +322,13 @@ def _log_dq_sink_armed(
     )
 
 
-# DLRM_HSTU_FP8_BWD_DKDV_E5M2 (default off). The
+# DLRM_HSTU_FP8_BWD_DKDV_E5M2 (dV|dK sink, default off). The
 # ordinary layer's bwd_dkdv epilogue writes the e5m2 dV|dK columns (+amax /
 # colsum partials) of the uvqk projection's dz8 itself (no BF16 dV/dK stores).
 # Arms only when the FP8 uvqk backward will take its token-major fp8t wgrad
 # with a published per-layer scale (bwd_fp8.producer_fp8t_inv_scale); every
 # other call runs the knob-off path unchanged. Shared-dz8 contract with the
-# dq sink:
+# dq sink (DLRM_HSTU_FP8_BWD_DQ_E5M2):
 #   * ONE dz8 [Mp, 2048] e5m2 per layer call, allocated here BEFORE the
 #     attention backward, pad rows [M, Mp) zeroed once; the dq sink adopts
 #     it (DqE5m2Sink(dz8=...)) for the q columns.
@@ -339,32 +347,30 @@ def _log_dq_sink_armed(
 #     values) and the call continues exactly like the knob-off path. Q/K/V
 #     and dO of an engaged call therefore stay alive until its projection
 #     backward returns.
-#   * With the du producer (DLRM_HSTU_FP8_BWD_DU_E5M2): when the
-#     LN*U*dropout backward emitted this
+#   * With e5m2 du (DLRM_HSTU_FP8_BWD_DU_E5M2): when the LN*U*dropout backward
+#     emitted this
 #     layer's e5m2 u block and the preprocess backward took a consumable
 #     record, that record's dz8 IS the layer's dz8 (adopted here, no second
 #     allocation; the pad rows of every column are still zeroed once here,
 #     re-zeroing the u block's). The scale epoch is still this call's own
 #     snapshot pair: check_consumable proved the per-layer scale generation
-#     did not move since the emission, so it holds the values the du
-#     producer cast with.
+#     did not move since the emission, so it holds the values the u block was
+#     cast with.
 #     The cast then covers nothing when the dq sink is engaged (no cast
-#     kernel), else q only; amax / colsum also take the du producer's u
-#     maxima and sums.
+#     kernel), else q only; amax / colsum also take the u block's maxima and sums.
 #     A consumer cast / finalize failure after emission happens before the
-#     projection backward runs (scale state untouched) and leaves the u
+#     projection backward runs (scale state untouched) and leaves the e5m2 u
 #     block intact (no other producer writes u columns), so it stays exact:
 #     the attention backward is re-run without sinks (exact BF16 dq/dV/dK)
-#     and the du producer's own consumer finishes the call
-#     (hstu_du_e5m2.consume without a dq sink: v|q|k cast into the same dz8
-#     incl. their pad rows, the u amax / colsum, ONE prequant projection
-#     call; bitwise the call with this knob and the dq sink off). Only if
-#     THAT fails does consume() restore u LOSSY and latch the du producer
-#     off. The projection backward returning None after emission cannot be
-#     exact for u (no BF16 du exists): the du producer's documented LOSSY
-#     restore of the u columns (latched off), then the attention backward
-#     is re-run without sinks (exact BF16 dq/dV/dK) and the BF16-input
-#     projection call follows.
+#     and the e5m2-du consumer finishes the call (hstu_du_e5m2.consume without
+#     a dq sink: v|q|k cast into the same dz8 incl. their pad rows, the u
+#     amax / colsum, ONE prequant projection call; bitwise the call with
+#     this knob and the dq sink off). Only if THAT fails does consume()
+#     restore u LOSSY and latch e5m2 du off. The projection backward returning
+#     None after emission cannot be exact for u (no BF16 du exists): the
+#     e5m2-du path's documented LOSSY restore of the u columns (latched off), then the
+#     attention backward is re-run without sinks (exact BF16 dq/dV/dK) and
+#     the BF16-input projection call follows.
 #   * Latch: every fallback after emission (above)
 #     latches this knob off for the process (_DKDV_E5M2_BROKEN = its reason,
 #     one "DISABLED (latched)" line); later calls take the knob-off path at
@@ -388,13 +394,13 @@ def _dkdv_e5m2_requested() -> bool:
 def dkdv_e5m2_counters() -> Dict[str, int]:
     """This process's DLRM_HSTU_FP8_BWD_DKDV_E5M2 counters: not_planned (knob
     on, no fp8t wgrad this call, e.g. the scale warm-up), armed (sink built),
-    engaged (bwd_dkdv emitted dz8), joint_dq (engaged with the dq sink on
-    the same dz8), consumed (the FP8 projection backward ran on
+    engaged (bwd_dkdv emitted dz8), joint_dq (engaged with the
+    dq sink on the same dz8), consumed (the FP8 projection backward ran on
     it), declined:<reason> (BF16 dV/dK, knob-off path), fallback:<reason>
-    (exact fallback after emission; "<reason> (du e5m2 record kept)": a consumer
-    cast failure finished by the du producer's consumer), latched (calls on
-    the knob-off path because a fallback latched the knob off); with the du
-    producer also adopted_b1a (armed on its dz8) and b1a_u (engaged with its
+    (exact fallback after emission; "<reason> (e5m2 du record kept)": a consumer
+    cast failure finished by the e5m2-du consumer), latched (calls on the
+    knob-off path because a fallback latched the knob off); with e5m2 du also
+    adopted_b1a (armed on the e5m2-du dz8) and b1a_u (engaged with the e5m2
     u block)."""
     return dict(_DKDV_E5M2_COUNTS)
 
@@ -458,9 +464,9 @@ def _dkdv_e5m2_arm(
     """A DkdvE5m2Sink over a fresh dz8 [Mp, 4*H*D] (pad rows zeroed) bound to
     this call's scale epoch, or None (declined). Mp = roundup(M,
     uvqk_tm_pad()), the rows the full cast would allocate for the
-    token-major wgrad. With `du_emit` (a taken, consumable du-producer
-    record) the dz8 is du_emit.dz8 instead (the first producer in backward
-    order allocated it; adopted, its pad rows zeroed here once all the same).
+    token-major wgrad. With `du_emit` (a taken, consumable e5m2-du record) the
+    dz8 is du_emit.dz8 instead (the first producer in backward order
+    allocated it; adopted, its pad rows zeroed here once all the same).
     None without touching anything once a fallback latched the knob off."""
     if _DKDV_E5M2_BROKEN is not None:
         _dkdv_e5m2_count("latched")
@@ -503,7 +509,7 @@ def _dkdv_e5m2_arm(
     if du_emit is None:
         dz8 = torch.empty((rows_out, width), dtype=grad_dtype, device=duvqk.device)
     else:
-        # The du producer's LN*U*dropout backward (the first
+        # The e5m2-du LN*U*dropout backward (the first
         # producer in backward order) allocated this layer's dz8 and wrote its
         # u block; v|k and q go into the same buffer. check_consumable already
         # matched the record to this call (rows, width, u block, site,
@@ -529,7 +535,7 @@ def _dkdv_e5m2_arm(
     if rows_out > rows:
         # The only pad-row fill of this dz8: no producer writes rows >= M and
         # the casts rewrite their own columns' pad rows with the same zeros
-        # (an adopted du-producer dz8: its u pad rows are re-zeroed, same bytes).
+        # (an adopted e5m2-du dz8: its u pad rows are re-zeroed, same bytes).
         dz8[rows:].zero_()
     _dkdv_e5m2_count("armed")
     return DkdvE5m2Sink(dz8, epoch[0], decode_scale=epoch[1])
@@ -560,19 +566,19 @@ def _dkdv_e5m2_prequant(
     columns' bytes, amax partials and column sums are those of the full
     cast. amax = max(cast, q, dV|dK); colsum = [u | v | q | k].
 
-    With `du_emit` (the du producer's record on the same
+    With `du_emit` (the e5m2-du record on the same
     dz8) the u block is producer-cast too, so the cast covers only the
     complement {q if no engaged dq sink}: with the dq sink nothing is cast
     (no cast kernel), else q by the multi-range skip cast (the same tile,
     partial layout and column reduction as the full cast). amax also takes
-    the du producer's u amax and the u colsum is the du producer's."""
+    the record's u amax and the u colsum is the record's."""
     dz8 = sink.dz8
     rows = duvqk.shape[0]
     if du_emit is not None:
         assert du_emit.dz8 is dz8 and du_emit.rows == rows
         assert du_emit.u_cols == (0, hd)
         if dq_sink is not None:
-            # u (du producer), v|k (this sink) and q (dq sink) all producer-cast.
+            # u (e5m2 du), v|k (this sink) and q (dq sink) all producer-cast.
             q_amax, q_col = dq_sink.finish_q()
             amax = torch.maximum(du_emit.u_amax, q_amax)
             colsum = torch.empty(
@@ -632,7 +638,7 @@ def _dkdv_e5m2_projection_backward(
     engaged, cast u or u|q), decoded with the epoch's scale snapshot.
 
     Every fallback continues EXACTLY like this call with the knob off (the
-    twin: DKDV_E5M2 off, the dq sink as engaged here), and never decodes e5m2 where
+    twin: dV|dK sink off, the dq sink as engaged here), and never decodes e5m2 where
     the twin reads BF16:
       * BF16 wgrad inside the FP8 projection backward (token-major wgrad
         failed or off): joint call -> the twin decodes the byte-identical
@@ -643,26 +649,24 @@ def _dkdv_e5m2_projection_backward(
         projection backward returned None): the attention backward is re-run
         with ONLY this sink removed -- a fresh dq sink on the same dz8 and
         scale epoch when one was engaged -- and the twin's own projection
-        call follows (the dq-sink call, else the BF16-input call). Where the
+        call follows (the dq-sink projection call, else the BF16-input call). Where the
         twin would then decode its e5m2 q columns (dq sink restore_bf16), the
         attention backward is re-run without any sink instead (exact BF16 dq,
         same scale state) and the caller's BF16 path follows.
 
-    With `du_emit` (the du producer's u block in the same
+    With `du_emit` (the e5m2-du u block in the same
     dz8, record taken and consumable) the cast shrinks to the complement
     (nothing with the dq sink, else q) and a BF16 wgrad inside the FP8
-    projection backward decodes the payload like the du-producer twin
-    (consume()).
+    projection backward decodes the payload like the e5m2-du twin (consume()).
     A consumer cast / finalize failure (raised before the projection call:
-    scale state untouched, the u block intact) re-runs the attention
-    backward without any sink (exact BF16 dq/dV/dK) and finishes with the du
-    producer's own consumer, hstu_du_e5m2.consume(du_emit, None): v|q|k cast
-    into the same dz8 + the u amax / colsum, ONE prequant projection call
-    (the du-producer twin without the dq sink, bitwise); only if that fails
-    does consume() restore u LOSSY and latch the du producer off. The
-    projection backward returning None after emission restores u LOSSY
-    (hstu_du_e5m2.decline: the du producer's documented class, latched off;
-    no BF16 du exists), re-runs the attention
+    scale state untouched, the e5m2 u block intact) re-runs the attention
+    backward without any sink (exact BF16 dq/dV/dK) and finishes with the
+    e5m2-du consumer, hstu_du_e5m2.consume(du_emit, None): v|q|k cast into the
+    same dz8 + the record's u amax / colsum, ONE prequant projection call (the
+    e5m2-du twin without the dq sink, bitwise); only if that fails does consume()
+    restore u LOSSY and latch e5m2 du off. The projection backward returning
+    None after emission restores u LOSSY (hstu_du_e5m2.decline: the e5m2-du
+    path's documented class, latched off; no BF16 du exists), re-runs the attention
     backward without any sink (exact BF16 dq/dV/dK) and runs the BF16-input
     projection call.
 
@@ -676,22 +680,22 @@ def _dkdv_e5m2_projection_backward(
     if du_emit is not None:
         _dkdv_e5m2_count("b1a_u")
         mode, cast = (
-            ("b1a_joint", "cast none: u from the LN*U*dropout backward (du e5m2 "
-             "producer), q from the dq-split sink")
+            ("b1a_joint", "cast none: u from the LN*U*dropout backward, "
+             "q from the dq-split sink")
             if joint
-            else ("b1a_solo", "cast q only: u from the LN*U*dropout backward "
-                  "(du e5m2 producer)")
+            else ("b1a_solo", "cast q only: u from the LN*U*dropout "
+                  "backward")
         )
         _dkdv_e5m2_log_once(
             "armed:" + mode,
             "[hstu-attn] bwd dkdv e5m2 sink ARMED: mode=only (bwd_dkdv epilogue "
             "writes e5m2 dV|dK + amax/colsum partials into the shared dz8 "
             f"[{sink.dz8.shape[0]}, {sink.dz8.shape[1]}] adopted from the "
-            "LN*U*dropout backward (du e5m2 producer's u block), no BF16 dV/dK; "
+            "LN*U*dropout backward (e5m2 u block), no BF16 dV/dK; "
             + ("dq-split sink adopts it (e5m2 q, no BF16 dq); " if joint else "")
             + cast
             + "; per-layer uvqk_projection scale epoch; a failure after "
-            "emission restores u LOSSY (du e5m2 producer latched off) and re-runs the "
+            "emission restores u LOSSY (e5m2 du latched off) and re-runs the "
             f"attention backward without sinks) M={rows} "
             "(DLRM_HSTU_FP8_BWD_DKDV_E5M2 + DLRM_HSTU_FP8_BWD_DU_E5M2)",
         )
@@ -762,9 +766,8 @@ def _dkdv_e5m2_projection_backward(
             ),
             prequant_scale=sink.decode_scale,
             **(
-                # With the du producer no BF16 du exists, so a BF16 wgrad
-                # inside decodes the payload like the du-producer twin
-                # (consume()).
+                # With e5m2 du no BF16 du exists, so a BF16 wgrad inside
+                # decodes the payload like the e5m2-du twin (consume()).
                 {}
                 if joint or du_emit is not None
                 else {
@@ -778,12 +781,12 @@ def _dkdv_e5m2_projection_backward(
         if joint and du_emit is not None:
             _log_dq_sink_armed(
                 dq_sink,
-                "u from the du e5m2 producer, v|k from the dkdv e5m2 dV|dK sink",
+                "u from the e5m2 du LNMD bwd, v|k from the dV|dK sink",
                 du_emit=True,
             )
         elif joint:
             _log_dq_sink_armed(
-                dq_sink, "u only: shared dz8 with the dkdv e5m2 dV|dK sink"
+                dq_sink, "u only: shared dz8 with the dV|dK sink"
             )
         if fp8_grads is None:
             why = "FP8 projection backward returned None after emission"
@@ -791,7 +794,7 @@ def _dkdv_e5m2_projection_backward(
     if fp8_grads is not None:
         _dkdv_e5m2_count("consumed")
         if du_emit is not None:
-            # The du producer's ARMED line for this call (its consume() is not
+            # The e5m2-du ARMED line for the shared-dz8 call (its consume() is not
             # called here), then drop the record's payload reference.
             lo, hi = du_emit.u_cols
             rows_out, device = du_emit.rows_out, du_emit.device
@@ -801,7 +804,7 @@ def _dkdv_e5m2_projection_backward(
                 lambda: (
                     f"ARMED du_e5m2 on {device}: _ln_mul_dropout_bwd_dx_du_rng_v3 "
                     f"(diet, e5m2 u cols {lo}:{hi} + amax/colsum partials, no "
-                    "bf16 du) -> dz8 shared with the dkdv e5m2 dV|dK sink"
+                    "bf16 du) -> dz8 shared with the dV|dK sink"
                     + (" and the dq-split sink, no cast" if joint else ", q-only cast")
                     + f"; payload/amax bitwise, u colsum fp32-order, M={rows} "
                     f"Mp={rows_out}"
@@ -809,31 +812,30 @@ def _dkdv_e5m2_projection_backward(
             )
             du_emit.release()
     elif du_emit is not None and cast_failed:
-        # Cast-failure sub-case: the consumer cast / finalize raised BEFORE
-        # the projection backward ran (delayed-scale state untouched) and the
-        # du producer's e5m2 u block in dz8 is intact (the dV/dK sink and the
-        # dq sink never write u columns), so no LOSSY restore: drop the dq
-        # sink's dz8 / partials, re-run the attention backward without sinks
-        # (exact BF16 dq/dV/dK in duvqk) and let the du producer's own
-        # consumer finish the call (finish_u_only: v|q|k cast from the exact
-        # BF16 dz into the same dz8 incl. their pad rows, the u amax / colsum
-        # merged, ONE prequant projection call -- the call with this knob and
-        # the dq sink off, bitwise). Only if THAT fails does consume() restore
-        # u LOSSY and latch the du producer (its documented class); the caller
-        # then runs BF16. consume() without a dq sink runs neither the dV/dK
-        # nor the dq-sink finalizer, so a failure of either one does not
-        # repeat inside it.
+        # Cast-failure case: the consumer cast / finalize raised BEFORE the projection
+        # backward ran (delayed-scale state untouched) and the e5m2 u block
+        # in dz8 is intact (the dV|dK and dq sinks never write u columns), so no
+        # LOSSY restore: drop the dq sink's dz8 / partials, re-run the
+        # attention backward without sinks (exact BF16 dq/dV/dK in duvqk) and
+        # let the e5m2-du consumer finish the call (finish_u_only: v|q|k cast
+        # from the exact BF16 dz into the same dz8 incl. their pad rows, the
+        # record's u amax / colsum merged, ONE prequant projection call -- the call
+        # with this knob and the dq sink off, bitwise). Only if THAT fails
+        # does consume() restore u LOSSY and latch e5m2 du off (its documented
+        # class); the caller then runs BF16. consume() without a dq sink runs neither
+        # the dV|dK nor the dq-sink finalizer, so a failure of either one does
+        # not repeat inside it.
         if joint:
             dq_sink.dz8 = None
             dq_sink.partials = None
         dz8 = None
-        why = f"{why} (du e5m2 record kept)"
+        why = f"{why} (e5m2 du record kept)"
         _dkdv_e5m2_fallback(
             why,
             "attention backward re-run without the sinks (exact BF16 "
-            "dq/dV/dK), then the du e5m2 consumer (hstu_du_e5m2.consume: v|q|k "
+            "dq/dV/dK), then the e5m2-du consumer (hstu_du_e5m2.consume: v|q|k "
             "cast into its dz8 + its u amax/colsum, one FP8 projection call; "
-            "LOSSY u and du e5m2 producer latched off only if that fails)",
+            "LOSSY u and e5m2 du latched off only if that fails)",
         )
         if not rerun_attention_backward():
             raise RuntimeError(
@@ -853,12 +855,12 @@ def _dkdv_e5m2_projection_backward(
             recompute_normed_x=recompute_normed_x,
         )
     elif du_emit is not None:
-        # Projection-None sub-case: the FP8
+        # Projection-None case: the FP8
         # projection backward returned None after the emission, and u has no
-        # BF16 source (the du producer wrote only e5m2), so its documented
-        # LOSSY restore (latched off) first; then the attention backward
-        # without any sink (exact BF16 dq/dV/dK) and the BF16-input projection
-        # call, as the dV/dK-sink fallback without a dq sink. The dq sink's dz8 / partials are
+        # BF16 source (only e5m2 was written), so its documented LOSSY restore
+        # (latched off) first; then the attention backward without any sink
+        # (exact BF16 dq/dV/dK) and the BF16-input projection call, as the
+        # dV|dK-sink fallback without a dq sink. The dq sink's dz8 / partials are
         # dropped first.
         if joint:
             dq_sink.dz8 = None
@@ -869,7 +871,7 @@ def _dkdv_e5m2_projection_backward(
             du_emit,
             duvqk[:, lo:hi],
             "declined",
-            f"dkdv e5m2 merged call: {why}",
+            f"dV|dK sink call: {why}",
         )
         exact_dz(why)
         fp8_grads = bwd_fp8.uvqk_projection_backward(
@@ -975,6 +977,17 @@ def _flydsl_bwd() -> Callable[..., bool]:
     )
 
     return try_flydsl_attention_bwd
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_do8_planned() -> Callable[..., bool]:
+    """hstu_flydsl_mha.c8_do_blk_planned, the forward's dO8 site gate
+    (only the import is cached, as in _flydsl_bwd)."""
+    from generative_recommenders.ops.flydsl.hstu_flydsl_mha import (
+        c8_do_blk_planned,
+    )
+
+    return c8_do_blk_planned
 
 
 @functools.lru_cache(maxsize=1)
@@ -1093,7 +1106,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             install_for_tokens(num_tokens)
         saved_normed_x_bf16 = None
         stored_x_fp8_t = None
-        fp8t_planned = False  # also read at the d(uvqk) tag below
+        fp8t_planned = False  # e5m2 du: also read at the d(uvqk) tag below
         if use_fp8 and fp8_scale_value is not None:
             assert fp8_scale is not None
             # Only worth storing when backward would otherwise take the plain
@@ -1465,6 +1478,34 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 # handle per call, shared with the compute-output context.
                 ctx.du_e5m2_site = hstu_du_e5m2.DuE5m2Site(uvqk_weight.data_ptr())
                 setattr(silu_u, HSTU_DUVQK_SITE_ATTR, ctx.du_e5m2_site)
+        if (
+            hstu_do8_registry.sites_enabled()
+            and bool(ctx.needs_input_grad[0])
+            and _flydsl_do8_planned()(
+                q=q,
+                k=k,
+                v=v,
+                out=out,
+                num_targets=num_targets,
+                max_attn_len=max_attn_len,
+                contextual_seq_len=contextual_seq_len,
+                num_softmax_heads=num_softmax_heads,
+                qkv_scale=attention_qkv_scale,
+            )
+        ):
+            # dO8 site (hstu_do8_registry; DLRM_HSTU_FP8_BWD_DO8=1, default
+            # off, gin apply_env_bootstrap.DLRM_HSTU_FP8_BWD_DO8): this
+            # training call's FlyDSL backward plans the C8 do_blk dO
+            # quantization (the backward's own predicates,
+            # hstu_flydsl_mha.c8_do_blk_planned), so the d(attn) producer
+            # (L11 'plus') may emit those dO8/E8 bytes. Eval/no_grad
+            # forwards get no site (needs_input_grad[0], x, is False there,
+            # as for the e5m2-du site above). One site handle per call, tagged on `out`
+            # (ops/hstu_compute.py carries it to the [T, H*D] view the
+            # compute-output context reads) and bound to dout by the backward
+            # below. Separate from the DuE5m2Site above (the u columns'
+            # site, on silu_u).
+            ctx.do8_site = hstu_do8_registry.new_site(out, seq_offsets, max_seq_len)
         return silu_u, out, x
 
     @staticmethod
@@ -1811,21 +1852,21 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         dq = dq.view(-1, ctx.num_heads, ctx.attn_dim)
         dk = dk.view(-1, ctx.num_heads, ctx.attn_dim)
         dv = dv.view(-1, ctx.num_heads, ctx.hidden_dim)
-        # DLRM_HSTU_FP8_BWD_DQ_E5M2 (default off): the
+        # DLRM_HSTU_FP8_BWD_DQ_E5M2 (default off): the C8
         # dq-split emits the e5m2 q columns of dz (+ amax/colsum partials)
         # through the FlyDSL backward's dq_fp8_sink hook and leaves the BF16
         # dq columns of duvqk unwritten; the cast below then covers u|v|k
         # only. Only on calls whose fp8t projection backward will run with a
         # published per-layer scale (warm-up / decline calls keep the default
         # path). The sink reports whether the dq-split actually used it.
-        # DLRM_HSTU_FP8_BWD_DKDV_E5M2 (default off):
+        # The dV|dK sink (DLRM_HSTU_FP8_BWD_DKDV_E5M2, default off) is
         # armed FIRST so the dq sink below adopts its dz8 and scale epoch (see
         # _dkdv_e5m2_arm). fp8t_wgrad already implies the FP8 uvqk backward
         # with a published per-layer scale; the helper re-checks all of it.
         # With the knob off nothing below changes. With a taken, consumable
-        # du-producer record (du_emit) it adopts that record's dz8 instead of
-        # allocating one; when it declines, the du-producer path below runs
-        # exactly as without the knob.
+        # e5m2-du record (du_emit) it adopts that
+        # record's dz8 instead of allocating one; when it declines, the e5m2-du
+        # path below runs exactly as without the knob.
         dkdv_sink = None
         dq_sink_fresh = None
         if _dkdv_e5m2_requested():
@@ -1855,7 +1896,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             dq_scale = (
                 bwd_fp8.producer_inv_scale("uvqk_projection", uvqk_weight.data_ptr())
                 if dkdv_sink is None
-                # DKDV_E5M2: the layer call's ONE scale epoch (same inv tensor)
+                # dV|dK sink: the layer call's ONE scale epoch (same inv tensor)
                 else (dkdv_sink.inv_scale, dkdv_sink.decode_scale)
             )
             if dq_scale is not None:
@@ -1876,9 +1917,8 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                     limit=grad_limit,
                     device=duvqk.device,
                     # Shared dz8 (one DqE5m2Sink contract for both owners):
-                    # DKDV_E5M2 armed -> its dz8 (allocated, or the du
-                    # producer's adopted), pad rows already zeroed; else
-                    # with the du producer: q lands in the
+                    # dV|dK sink armed -> its dz8 (allocated, or the e5m2-du one
+                    # adopted), pad rows already zeroed; else with e5m2 du: q lands in the
                     # LNMD producer's dz8 and this sink zeroes its q pad rows.
                     **(
                         {"dz8": dkdv_sink.dz8, "pad_zeroed": True}
@@ -1887,7 +1927,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                     ),
                 )
                 if dkdv_sink is not None:
-                    # DKDV_E5M2 fallback: a fresh dq sink, same arguments and
+                    # dV|dK-sink fallback: a fresh dq sink, same arguments and
                     # scale epoch (the knob-off twin's q bytes); dz8 is passed
                     # at call time (no reference held here).
                     dq_sink_fresh = functools.partial(
@@ -1909,9 +1949,15 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         # so the Triton call below is still both the opt-out and the fallback.
         # It is *not* the fallback for an unsupported host: that raises inside.
         vqk_bf16 = None
+        # dO8 hook: a dO8 record that the d(attn) producer published on
+        # this call's site is bound to the dO autograd delivered (a new view
+        # of the producer's dx); the C8 branch takes it or quantizes. A site
+        # without a record is counted (unbound), so partial arming shows.
+        do8_site = getattr(ctx, "do8_site", None)
+        hstu_do8_registry.bind(do8_site, dout)
 
         def _flydsl_attention_bwd(dq_fp8_sink=None, dkdv_fp8_sink=None) -> bool:  # pyre-ignore[2]
-            # One call site for the FlyDSL backward, so an engaged DKDV_E5M2
+            # One call site for the FlyDSL backward, so an engaged dV|dK-sink
             # call can re-run it with identical arguments and no sinks.
             return _flydsl_bwd()(
                 dout=dout,
@@ -1939,10 +1985,12 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
 
         try:
             served = _flydsl_attention_bwd(dq_sink, dkdv_sink)
+            # dO8: no record stays pending past the first call.
+            hstu_do8_registry.discard(do8_site, "not_taken")
             if dkdv_sink is not None:
                 dkdv_sink = _dkdv_e5m2_engaged(dkdv_sink, served)
             if dq_sink is not None and (not served or not dq_sink.filled):
-                # The dq-split never used the sink (Triton fallback, no
+                # The dq-split never used the sink (Triton fallback, no C8
                 # dq-split this call, uncovered config): BF16 dq was written.
                 bwd_fp8.log_uvqk_once(
                     f"dq_e5m2_unused:{served}:{dq_sink.declined}",
@@ -1952,7 +2000,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 dq_sink = None
             if not served:
                 if vqk_fp8 is not None:
-                    if qkv_scale is None:  # ATTN_GLUE_LAZY: built on demand
+                    if qkv_scale is None:  # DLRM_HSTU_FP8_ATTN_GLUE_LAZY: built on demand
                         qkv_scale = torch.full(
                             (1, 1),
                             ctx.fp8_qkv_scale_value,
@@ -2002,13 +2050,13 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             if ctx.early_release_fp8_uvqk:
                 ctx._ephemeral_fp8_vqk = None
         if ctx.fuse_silu:
-            # With a taken du-producer record dsilu_u is the producer's
+            # e5m2 du: with a taken emission record dsilu_u is the producer's
             # placeholder; the u columns are producer-cast (or restored above).
             if not du_in_place and not du_taken:
                 du.copy_(dsilu_u)
         else:
             torch.ops.aten.silu_backward(dsilu_u, u, grad_input=du)
-        # DKDV_E5M2: an engaged call (dkdv_sink) releases after its projection
+        # dV|dK sink: an engaged call (dkdv_sink) releases after its projection
         # backward instead: its exact fallback re-runs the attention backward.
         if release_fp8_after_attention and dkdv_sink is None:
             # Q/K/V are dead after attention backward. Releasing their packed
@@ -2024,7 +2072,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             vqk_fp8 = None
             vqk_bf16 = None
         assert normed_x is not None or wgrad_x_fp8_t is not None
-        # An engaged DKDV_E5M2 sink implies fp8t_wgrad, hence uvqk_fp8_bwd, so
+        # An engaged dV|dK sink implies fp8t_wgrad, hence uvqk_fp8_bwd, so
         # the BF16 triton_addmm_bwd below never reads its unwritten dV/dK.
         assert dkdv_sink is None or uvqk_fp8_bwd
         with record_function("## hstu_ordinary_uvqk_backward ##"):
@@ -2042,11 +2090,11 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                     )[0]
 
                 if dkdv_sink is not None:
-                    # DKDV_E5M2 engaged call: v|k from the bwd_dkdv epilogue
-                    # (+ q from the dq sink, + u from the du producer when its
-                    # record was taken) in the shared dz8; exact fallbacks
-                    # re-run the attention backward without sinks (the du
-                    # producer's u: its LOSSY restore).
+                    # Engaged dV|dK-sink call: v|k from the bwd_dkdv epilogue
+                    # (+ q from the dq sink, + u from the e5m2-du record when it was
+                    # taken) in the shared dz8;
+                    # exact fallbacks re-run the attention backward without
+                    # sinks (the e5m2-du u block: its LOSSY restore).
                     fp8_grads = _dkdv_e5m2_projection_backward(
                         dkdv_sink,
                         duvqk,
@@ -2085,10 +2133,10 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                         recompute_normed_x=_recompute_normed_x,
                     )
                 elif du_emit is not None:
-                    # The u block (and the q block when the dq sink
+                    # e5m2 du: the u block (and the q block when the dq sink
                     # filled the same dz8) is producer-cast; the cast covers
                     # the rest. On None the bf16 u (and q) columns are
-                    # restored (lossy) and the du producer is latched off.
+                    # restored (lossy) and e5m2 du is latched off.
                     fp8_grads = hstu_du_e5m2.consume(
                         du_emit,
                         dq_sink,
@@ -2131,7 +2179,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                     # skipped for it: rebuild it for the default path.
                     normed_x = _recompute_normed_x()
             if du_emit is not None:
-                # Not reached (check_consumable requires the fp8t
+                # e5m2 du: not reached (check_consumable requires the fp8t
                 # wgrad, i.e. the branch above); no path reads unwritten du.
                 hstu_du_e5m2.decline(
                     du_emit,
@@ -2205,6 +2253,31 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             None,  # num_softmax_heads
             None,  # dropout_handoff
         )
+
+
+def _b15t_skip_y(
+    x: torch.Tensor, tiled_xt: bool, pad_to: int, vk_columns: int
+) -> bool:
+    """DLRM_HSTU_FP8_FWD_K512_TILED_A:
+    whether the targets-only store_t may run with store_y=False because the
+    V/K projection will read the step-tiled yT on K512's tiled-A entry. The
+    unmodified Triton v2 store_t kernel then still WRITES y's bytes, but into
+    a dedicated 1/32-size scratch that is discarded (no [M, 512] y is
+    allocated; fewer DRAM write-backs, not fewer stores), and the yT must be
+    step-tiled (`tiled_xt` is the one wgrad_ck.tiled_active value the store_t
+    call gets too). Host only (no tensor read); with the knob on, a "no" is
+    logged once per reason (kind and detail)."""
+    if not k512_tiled_a_requested():
+        return False
+    reason = store_t_skip_y_decline_reason(x, pad_to, tiled_xt)
+    if reason is None:
+        reason = k512_tiled_a_vk_decline_reason(
+            x.device, int(x.shape[1]), vk_columns, int(x.shape[0])
+        )
+    if reason is not None:
+        log_b15t_decline_once(*reason)
+        return False
+    return True
 
 
 class _HSTUPreprocessAndAttentionTargetsOnlyFunction(torch.autograd.Function):
@@ -2295,6 +2368,19 @@ class _HSTUPreprocessAndAttentionTargetsOnlyFunction(torch.autograd.Function):
             )
         if vk_fp8t_planned and bwd_fp8.uvqk_store_fp8t():
             assert fp8_scale is not None
+            tiled_xt = wgrad_ck.tiled_active(x.device)
+            tm_pad = bwd_fp8.uvqk_tm_pad()
+            # DLRM_HSTU_FP8_FWD_K512_TILED_A: this LayerNorm's row-major output
+            # y has one reader, the e4m3 V/K projection below (it is not saved
+            # for backward, and the compact U/Q rows are normalized from x and
+            # mean/rstd), so when that projection will read the step-tiled yT
+            # on K512's tiled-A entry, the store_t runs with store_y=False: the
+            # unmodified v2 kernel still writes y's bytes, but into a
+            # dedicated 1/32-size scratch that is discarded (y is None; fewer
+            # DRAM write-backs, not fewer stores). Decided on the host.
+            skip_y = qkv_fp8_forward and _b15t_skip_y(
+                x, tiled_xt, tm_pad, v_dim + k_dim
+            )
             (
                 normed_x,
                 x_mean,
@@ -2306,9 +2392,18 @@ class _HSTUPreprocessAndAttentionTargetsOnlyFunction(torch.autograd.Function):
                 bias=norm_bias,
                 eps=norm_eps,
                 inv_scale=1.0 / fp8_scale_value,
-                pad_to=bwd_fp8.uvqk_tm_pad(),
-                tiled_xt=wgrad_ck.tiled_active(x.device),
+                pad_to=tm_pad,
+                tiled_xt=tiled_xt,
+                store_y=not skip_y,
             )
+            if skip_y and normed_x is not None:
+                # Not expected (the pre-check mirrors the store_t's choice);
+                # y was written, so this call is the knob-off path as is.
+                latch_b15t_off(
+                    "store_t",
+                    "the store_t wrote y although store_y=False (not the v2 "
+                    "kernel for this call)",
+                )
         elif (
             input_fp8_forward
             and _SAVE_BF16_NORMED_X
@@ -2378,19 +2473,44 @@ class _HSTUPreprocessAndAttentionTargetsOnlyFunction(torch.autograd.Function):
         if qkv_fp8_forward:
             assert fp8_scale is not None
             assert fp8_qkv_scale is not None
-            vk = scaled_mm_fp8_out_preq(
-                activation_fp8=normed_x,
-                scale_a=fp8_scale,
-                weight=uvqk_weight,
-                bias=b_vk,
-                weight_layout=(
-                    (u_dim, u_dim + v_dim),
-                    (u_dim + v_dim + q_dim, uvqk_weight.shape[1]),
-                ),
-                output_scale=fp8_qkv_scale,
-                scale_a_value=fp8_scale_value,
-                output_scale_value=qkv_scale_value,
-            ).contiguous()
+            vk_layout = (
+                (u_dim, u_dim + v_dim),
+                (u_dim + v_dim + q_dim, uvqk_weight.shape[1]),
+            )
+            vk = None
+            if normed_x is None:
+                # Tiled-A V/K: the store_t skipped y; the projection reads y's
+                # bytes from the step-tiled yT (K512 tiled-A entry). A decline
+                # there (logged once; B15T then latches off) rebuilds y from
+                # yT, bit for bit, for the row-major projection.
+                assert stored_vk_x_fp8_t is not None
+                vk = scaled_mm_fp8_out_preq_tiled_a(
+                    stored_vk_x_fp8_t,
+                    int(x.shape[0]),
+                    fp8_scale,
+                    uvqk_weight,
+                    b_vk,
+                    weight_layout=vk_layout,
+                    output_scale=fp8_qkv_scale,
+                    scale_a_value=fp8_scale_value,
+                    output_scale_value=qkv_scale_value,
+                )
+                if vk is None:
+                    normed_x = b15t_row_major_y(
+                        stored_vk_x_fp8_t, int(x.shape[0])
+                    )
+            if vk is None:
+                vk = scaled_mm_fp8_out_preq(
+                    activation_fp8=normed_x,
+                    scale_a=fp8_scale,
+                    weight=uvqk_weight,
+                    bias=b_vk,
+                    weight_layout=vk_layout,
+                    output_scale=fp8_qkv_scale,
+                    scale_a_value=fp8_scale_value,
+                    output_scale_value=qkv_scale_value,
+                )
+            vk = vk.contiguous()
             assert candidate_normed_x_bf16 is not None
             candidate_normed_x = candidate_normed_x_bf16
         elif input_fp8_forward:
@@ -2493,7 +2613,16 @@ class _HSTUPreprocessAndAttentionTargetsOnlyFunction(torch.autograd.Function):
                 "phi1_targets_input_ln",
                 compact_q=q,
                 compact_u=u,
-                normed_x=normed_x,
+                normed_x=(
+                    normed_x
+                    if normed_x is not None
+                    # Tiled-A V/K: no [M, 512] y (its bytes went to the discarded
+                    # scratch). The contract records only dtype and shape:
+                    # those of the e4m3 y the yT holds.
+                    else torch.empty(
+                        x.shape, dtype=torch.float8_e4m3fn, device="meta"
+                    )
+                ),
             )
         if qkv_fp8_forward:
             record_fp8_capability("phi2_targets_vk_attention")

@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from generative_recommenders.common import HammerModule
+from generative_recommenders.ops.eval_fwd_hygiene import eval_fwd_hygiene_loss_enabled
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -270,14 +271,20 @@ class DefaultMultitaskModule(MultitaskModule):
                 task_configs=self._task_configs,
                 device=encoded_user_embeddings.device,
             )
-            mt_losses = _compute_loss(
-                task_offsets=self._task_offsets,
-                causal_multitask_weights=self._causal_multitask_weights,
-                mt_logits=mt_logits.to(mt_labels.dtype),
-                mt_labels=mt_labels,
-                mt_weights=mt_weights,
-                has_multiple_task_types=self._has_multiple_task_types,
-            )
+            # The loss is read only as the training aux loss (DlrmHSTU
+            # main_forward); DLRM_HSTU_FP8_EVAL_FWD_HYGIENE_LOSS=1 (with
+            # DLRM_HSTU_FP8_EVAL_FWD_HYGIENE=1) skips it in eval. Labels and
+            # weights feed the eval metrics and stay. Training never reads the
+            # switches (self.training short-circuits).
+            if self.training or not eval_fwd_hygiene_loss_enabled():
+                mt_losses = _compute_loss(
+                    task_offsets=self._task_offsets,
+                    causal_multitask_weights=self._causal_multitask_weights,
+                    mt_logits=mt_logits.to(mt_labels.dtype),
+                    mt_labels=mt_labels,
+                    mt_weights=mt_weights,
+                    has_multiple_task_types=self._has_multiple_task_types,
+                )
             mt_preds = mt_preds.to(orig_dtype)
 
         return (

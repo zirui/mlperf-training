@@ -41,6 +41,10 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
+from generative_recommenders.ops.eval_fwd_hygiene import (
+    backward_possible,
+    eval_fwd_hygiene_enabled,
+)
 from generative_recommenders.ops.input_dropout_fold import (
     DROPOUT_HANDOFF_ATTR,
     dropout_handoff_backward,
@@ -110,7 +114,7 @@ _POSENC_DROP_STAGES: int = _posenc_env_int("DLRM_HSTU_FP8_POSENC_DROP_STAGES", 1
 # tiles of all sequences (grid axis 0) gather the same fp32 pos-table rows (pos
 # index = distance from the end); (4) 8-row x 128-column tiles, 2 warps, 1 stage.
 # Element -> Philox mapping, all per-element ops, outputs and generator state
-# are the same as design A (bitwise). Fail-closed: the first use per (device, D, ctx_len,
+# are unchanged (bitwise). Fail-closed: the first use per (device, D, ctx_len,
 # kernel constexprs, p) runs _posenc_drop_v2_verified (V2 vs design A, and V2's
 # mask vs aten::native_dropout; RNG-neutral); a mismatch, or a V2 compile /
 # launch exception, logs a WARNING and launches design A instead. Geometry
@@ -136,8 +140,9 @@ _POSENC_DROP_V2_STAGES: int = _posenc_env_int("DLRM_HSTU_FP8_POSENC_DROP_V2_STAG
 # on, both fused posenc+dropout kernels (design A and V2) store
 # the input-dropout mask as packed bits, uint8 [N, D / 8] with bit k of byte j
 # of a row = column 8 * j + k (input_dropout_fold.pack_dropout_mask_bits),
-# instead of bool [N, D], which the layer-0 LN-backward mask/scale fold
-# (_weighted_layer_norm_bwd_dx_v2, MASK_BITS) reads. Same keep decisions (each bit is the kernel's
+# instead of bool [N, D]: the forward writes and the
+# layer-0 LN-backward mask/scale fold (_weighted_layer_norm_bwd_dx_v2,
+# MASK_BITS) reads 1/8 of the bytes. Same keep decisions (each bit is the kernel's
 # own r < KEEP_BELOW test), y, generator offset and gradients: bitwise. The
 # forward packs only when that fold will consume the packed mask
 # (_dropout_mask_bits_why_not: a handoff, the FP8 arm's fused residual, the LN
@@ -150,10 +155,10 @@ _DROPOUT_MASK_BITS: bool = _env_true("DLRM_HSTU_FP8_DROPOUT_MASK_BITS")
 # DLRM_HSTU_FP8_POSENC_DROP_HWEPI (default OFF in code: on only for an
 # explicit 1/true/on/yes; the gin binding
 # apply_env_bootstrap.DLRM_HSTU_FP8_POSENC_DROP_HWEPI turns it on and =0 is the
-# kill switch = the plain V2 kernel; read once at import). A
+# kill switch = the V2 kernel's software epilogue; read once at import). A
 # refinement of DLRM_HSTU_FP8_POSENC_DROPOUT_V2 (inert while V2 is off or has
 # fallen back to design A), gfx950 only (gcnArchName gfx950*; any other arch
-# keeps the plain V2 binary, with one WARNING). The V2 kernel is VALU-bound
+# keeps the V2 binary as before, with one WARNING). The V2 kernel is VALU-bound
 # (Philox rounds + the software fp32 -> bf16 epilogue). Its HW_EPI compile (1) converts y with f.to(tl.bfloat16), which
 # gfx950 lowers to v_cvt_pk_bf16_f32 (round to nearest even, NaN quieted with
 # its payload: equal to _f32_to_bf16_bits_hip on all 2^32 fp32 inputs), and
@@ -218,7 +223,7 @@ def _dropout_mask_bits_why_not(
 # LN-backward fold equals the bool fold bit for bit only while Triton gives
 # both compiles of _weighted_layer_norm_bwd_dx_v2 (MASK_SCALE with and without
 # MASK_BITS) the same tt.reduce layouts (validated on Triton 3.6 / gfx950).
-# The first packing forward per (device, D, POW2) checks it here: the
+# So the first packing forward per (device, D, POW2) checks it here: the
 # production launch (triton_layer_norm._wln_bwd_dx_partials with the residual
 # mscale config) runs with the bool and with the packed mask on synthetic
 # batches of N = 4099 and 4096 rows (both Triton specializations of N). dx, the
@@ -361,7 +366,7 @@ def _mask_bits_fold_verified(device: torch.device, D: int) -> str:
 
 # DLRM_HSTU_FP8_POSENC_SORT16 (default OFF in code; the gin binding turns it
 # on, =0 is the kill switch: int32 sort keys and the torch.arange values of the
-# hammer sort attempt). Acts on the concat-folded position kernel
+# hammer sort attempt, as before). Acts on the concat-folded position kernel
 # (DLRM_HSTU_FP8_POSENC_CONCAT_FOLD), fused with the dropout or not. That
 # kernel writes pos/ts indices as int16 when their static range fits (host-side
 # proof from the table sizes), so the two torch.sort calls run a 16-bit radix
@@ -374,15 +379,15 @@ _HAMMER_SORT_KV: Optional[bool] = None
 _LOGGED: set = set()
 
 # (a)/(b): the two posenc forward sorts without torch.sort. Both default OFF in code (the
-# gin bindings turn them on; =0 is each one's kill switch), both act only inside the POSENC_SORT16 branch of
-# _posenc_sort_pairs (int16 keys, hammer sort absent) above torch's 4096-element small-sort cutoff, where
-# torch.sort runs its stable radix sort, so the stable permutation is torch.sort's permutation.
+# gin bindings in yambda_5b.gin turn them on; =0 is each one's kill switch), both act only inside the POSENC_SORT16
+# branch of _posenc_sort_pairs (int16 keys, hammer sort absent) above torch's 4096-element small-sort cutoff, where
+# torch.sort runs its stable radix sort, so the stable permutation is exactly torch.sort's permutation.
 # (a) DLRM_HSTU_FP8_POSENC_POS_ARITH: the pos keys are a function of the sequence lengths / targets only, so
 # their stable sorted order (keys + int64 indices) is written by one Triton kernel from the jagged metadata
-# (ops/triton/triton_pos_perm.py) instead of a 2-pass radix sort of pos_inds (11 launches).
+# (ops/triton/triton_pos_perm.py) instead of a 2-pass radix sort of pos_inds.
 # (b) DLRM_HSTU_FP8_POSENC_TS_ONESWEEP: the timestamp-bucket keys (<= ts table rows - 1) are sorted by
 # ops/onesweep_sort.py: rocPRIM's onesweep device code over the 12 key bits in two 6-bit digit passes, a
-# counting-iterator index, one fill (torch.sort: copy, iota, 5 fills, 2 histogram kernels, two 8-bit passes).
+# counting-iterator index, one fill.
 # Both are self-checked against torch.sort at their first _POSENC_ITEM34_CHECKS uses per process (raw bits of
 # keys and indices); a mismatch, a raising call or an unavailable extension restores torch.sort for the
 # process with one log line.
@@ -399,10 +404,11 @@ _POSENC_ITEM34_STATE: Dict[str, int] = {"pos": _POSENC_ITEM34_CHECKS, "ts": _POS
 # programs walk SUB-row sub-tiles of the sorted order and carry a running fp32
 # sum per key across NSUB sub-tiles, flushing one D-wide atomic per (program,
 # key); the one-warp tiles keep the gathers in flight without the 64x512 tile's
-# register footprint. Programs of SUB*NSUB rows: 64 for pos/split (NSUB=8)
-# and 1024 / 512 for ts (NSUB 128 / 64). For
-# small N, NSUB drops further (programs under 64 rows) and V2 can issue more
-# atomics than the tiled kernels.
+# register footprint. Programs of SUB*NSUB rows: 64 for pos/split (NSUB=8:
+# about the tiled kernel's atomic count, with finer program granularity) and
+# 1024 / 512 for ts (NSUB 128 / 64: far fewer fp32 atomics than the tiled
+# kernel). For small N, NSUB drops further (programs under 64 rows) and V2 can
+# issue more atomics than the tiled kernels.
 # NUMERICS (declared): d_left/d_right are bitwise those of the tiled kernel
 # (same per-element op); d_pos/d_ts are fp32-order -- only the fp32 summation
 # order changes (the tiled kernel's atomic order is already run-to-run
@@ -410,9 +416,8 @@ _POSENC_ITEM34_STATE: Dict[str, int] = {"pos": _POSENC_ITEM34_CHECKS, "ts": _POS
 # d_pos/d_ts (fp32-order)". Geometry (MI350X, D=512): SUB=8, 1 warp, NSUB 8
 # for pos/split; NSUB for ts is 128 when d_out > 2 GiB and 64 when d_out <=
 # 2 GiB, the same test as the Triton AMD backend's 'S' argument specialization
-# (tt.pointer_range=32, buffer ops). The 'S' build of the ts kernel fits in 128
-# VGPRs (occupancy 4) and uses NSUB=64; the non-'S' build needs 130
-# (occupancy 3) and uses 128. Because NSUB only changes where every
+# (tt.pointer_range=32, buffer ops); the 'S' and non-'S' builds of the ts
+# kernel have different register footprints. Because NSUB only changes where every
 # kernel here (the tiled ones included) already recompiles for 'S', V2 adds no
 # compile variant of its own at production N. NSUB shrinks further for small N
 # so the grid keeps >= _POSENC_BWD_V2_MIN_PROGRAMS programs. Any
@@ -489,8 +494,9 @@ def _item34_raw(t: torch.Tensor) -> torch.Tensor:
 def _item34_checked(
     part: str, got: Tuple[torch.Tensor, torch.Tensor], ref_fn, what: str
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Self-check of sort part `part` against torch.sort for its first uses (raw bits, dtype, shape); a
-    mismatch logs one ERROR, returns the torch.sort result and turns the part off for the process."""
+    """Self-check of sort replacement `part` ("pos" or "ts") against torch.sort for its first uses (raw bits,
+    dtype, shape); a mismatch logs one ERROR, returns the torch.sort result and turns the part off for the
+    process."""
     global _POSENC_POS_ARITH, _POSENC_TS_ONESWEEP
     left = _POSENC_ITEM34_STATE[part]
     if left <= 0:
@@ -533,7 +539,7 @@ def _posenc_item34_off(part: str, why: str) -> None:
 def _posenc_pos_arith(
     pos_inds: torch.Tensor, N: int, pos_meta: Optional[Tuple]
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """(a) DLRM_HSTU_FP8_POSENC_POS_ARITH: torch.sort(pos_inds) written from the jagged metadata, or
+    """DLRM_HSTU_FP8_POSENC_POS_ARITH: torch.sort(pos_inds) written from the jagged metadata, or
     None (off / out of scope -> torch.sort)."""
     if not _POSENC_POS_ARITH or pos_meta is None:
         return None
@@ -571,7 +577,7 @@ def _posenc_pos_arith(
 def _posenc_ts_onesweep(
     ts_inds: torch.Tensor, N: int, ts_max_key: Optional[int]
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """(b) DLRM_HSTU_FP8_POSENC_TS_ONESWEEP: torch.sort(ts_inds) on the key-bound onesweep extension, or
+    """DLRM_HSTU_FP8_POSENC_TS_ONESWEEP: torch.sort(ts_inds) on the key-bound onesweep extension, or
     None (off / out of scope / extension unavailable -> torch.sort)."""
     if not _POSENC_TS_ONESWEEP or ts_max_key is None:
         return None
@@ -757,8 +763,8 @@ def _add_timestamp_position_embeddings_kernel(
         mask = (offs_n[:, None] < seq_len) and offs_d[None, :] < D
         seq_emb = tl.load(SeqEmb + seq_emb_offsets, mask=mask)
         if HAS_ALPHA:
-            # == a separate `seq_embeddings * alpha` pass: fp32 opmath
-            # product rounded once to the storage dtype.
+            # == a separate `seq_embeddings * alpha` pass: fp32 opmath product
+            # rounded once to the storage dtype.
             seq_emb = (seq_emb.to(tl.float32) * alpha).to(seq_emb.dtype)
         pos_emb = tl.load(PosEmb + pos_emb_offsets, mask=mask)
         ts_emb = tl.load(TsEmb + ts_emb_offsets, mask=mask)
@@ -867,11 +873,12 @@ def _add_embeddings_bwd_tiled_kernel(
 ):
     """Tiled segmented reduction of sorted (key, value) rows (DLRM_HSTU_FP8_POSENC_FAST).
 
-    The untiled kernel walks its BLOCK rows one at a time; every row load
-    depends on the index load before it.  Here a program gathers its BLOCK
+    _add_embeddings_bwd_kernel walks its BLOCK rows one at a time; every row
+    load depends on the index load before it.  Here a program gathers its BLOCK
     rows as one [BLOCK, D] tile (BLOCK independent loads in flight), then
     folds each distinct key in the tile (keys are sorted, so usually 1-2) with
-    tl.sum in fp32 and issues one fp32 atomic per key, like the untiled kernel.
+    tl.sum in fp32 and issues one fp32 atomic per key, like
+    _add_embeddings_bwd_kernel.
 
     WRITE_DSEQ: the pos pass visits every row exactly once (sorted_value_inds
     is a permutation), so it also writes d_seq = (d_out * alpha) -> the
@@ -963,7 +970,8 @@ def _add_timestamp_position_embeddings_concat_kernel(
     exactly what concat_2D_jagged(dense left, jagged right) would have copied
     there.  SrcInds[row] records the source (-(left_row + 1) or right_row) so
     the backward pos pass can write d_left / d_right without a split.
-    The arithmetic per element is identical to the unfolded kernel.
+    The arithmetic per element is identical to
+    _add_timestamp_position_embeddings_kernel.
     """
     off_b = tl.program_id(0)
     off_n = tl.program_id(1)
@@ -1502,8 +1510,8 @@ def _posenc_concat_dropout_v2_kernel(
         tl.store(Y + out_offsets, y16.to(tl.int16), mask=mask, cache_modifier=".cs")
         if MASK_BITS:
             # mask byte (_d >> 3) + v of a row <- chunk v: call 2 * it (bits
-            # 0-3), call 2 * it + 1 (bits 4-7). Default cache policy: a row's
-            # bytes arrive in BLOCK_D / 8-byte pieces.
+            # 0-3), call 2 * it + 1 (bits 4-7). Default cache policy (no .cs):
+            # a row's bytes arrive in BLOCK_D / 8-byte pieces.
             offs_b = (_d >> 3) + offs_v
             tl.store(
                 Mask + offs_n[:, None] * (D >> 3) + offs_b[None, :],
@@ -1623,8 +1631,8 @@ def _add_embeddings_bwd_rowloop_body(
     writes the rows' (In * alpha) to DLeft / DRight (each row exactly once;
     same per-element op as _add_embeddings_bwd_tiled_split_kernel).
     KEY_I16: see _add_embeddings_bwd_tiled_kernel. NSUB stays a constexpr: a
-    runtime loop bound costs the ts kernel 4 VGPRs (128 -> 132, occupancy
-    4 -> 3 in its d_out <= 2 GiB build)."""
+    runtime loop bound raises the ts kernel's VGPR count past the occupancy-4
+    limit in its d_out <= 2 GiB build."""
     pid = tl.program_id(0)
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < D
@@ -1857,6 +1865,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
         interleave_targets: bool,
         time_bucket_fn: str,
         alpha: Optional[float] = None,
+        need_bwd: bool = True,
     ):
         seq_embeddings = switch_to_contiguous_if_needed(seq_embeddings)
         pos_embeddings = switch_to_contiguous_if_needed(pos_embeddings)
@@ -1916,6 +1925,11 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
             BLOCK_D=BLOCK_D,
             HAS_ALPHA=alpha is not None,
         )
+        if not need_bwd:
+            # DLRM_HSTU_FP8_EVAL_FWD_HYGIENE (decided by the wrapper): no
+            # backward can run, and the arange + sorts below feed only its
+            # table-gradient reduction. Nothing is saved.
+            return out
         try:
             values = torch.arange(0, N, dtype=torch.int32, device=timestamps.device)
             sorted_ts_key_inds, sorted_ts_value_inds = torch.ops.hammer.sort_kv_pairs(
@@ -1952,6 +1966,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
         None,
         torch.Tensor,
         torch.Tensor,
+        None,
         None,
         None,
         None,
@@ -2018,6 +2033,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # need_bwd
         )
 
     @staticmethod
@@ -2075,6 +2091,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # need_bwd
         )
 
 
@@ -2211,6 +2228,7 @@ class _AddTimestampPositionEmbeddingsConcatFunction(torch.autograd.Function):
         interleave_targets: bool,
         time_bucket_fn: str,
         alpha: float,
+        need_bwd: bool = True,
     ):
         values_left = switch_to_contiguous_if_needed(values_left)
         values_right = switch_to_contiguous_if_needed(values_right)
@@ -2275,6 +2293,11 @@ class _AddTimestampPositionEmbeddingsConcatFunction(torch.autograd.Function):
             TIME_BUCKET_FN=time_bucket_fn,
             BLOCK_D=BLOCK_D,
         )
+        if not need_bwd:
+            # DLRM_HSTU_FP8_EVAL_FWD_HYGIENE (decided by the wrapper): no
+            # backward can run, and the index sorts below (_posenc_sort_pairs)
+            # feed only its table-gradient reduction. Nothing is saved.
+            return out
         (
             sorted_ts_key_inds,
             sorted_ts_value_inds,
@@ -2332,6 +2355,7 @@ class _AddTimestampPositionEmbeddingsConcatFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # need_bwd
         )
 
 
@@ -2369,7 +2393,7 @@ def _dropout_keep_params(p: float) -> Tuple[int, float]:
     f32 round-to-nearest-even; the product is exact) and the element is kept
     iff u < (float)p1m. u is monotone non-decreasing in r, so keep <=>
     r < KEEP_BELOW with KEEP_BELOW the smallest dropped r, found by bisection on
-    the same fp32 expression. scale = (float)(1.0 / (double)(float)p1m)."""
+    the same fp32 expression (exhaustive over all 2^32 r). scale = (float)(1.0 / (double)(float)p1m)."""
     hit = _DROPOUT_KEEP_PARAMS.get(p)
     if hit is not None:
         return hit
@@ -2514,12 +2538,12 @@ def _posenc_concat_dropout_launch(
     N_left, D = values_left.shape
     keep_below, scale = _dropout_keep_params(dropout_p)
     log2_t = T.bit_length() - 1 if T & (T - 1) == 0 else -1
-    # MASK_BITS is passed only for the packed mask (the bool launch is unchanged)
+    # MASK_BITS is passed only for the packed mask (the bool launch omits it)
     bits_kwargs = {}
     if mask.dtype == torch.uint8:
         assert mask.shape == (out.shape[0], D // 8) and mask.is_contiguous()
         bits_kwargs["MASK_BITS"] = True
-    # HW_EPI likewise only when on: without it V2 compiles unchanged
+    # HW_EPI likewise only when on: without it V2 compiles its default specialization
     if hw_epi:
         assert v2, "HW_EPI is a V2 compile"
         bits_kwargs["HW_EPI"] = True
@@ -3378,6 +3402,18 @@ def triton_concat_add_timestamp_positional_embeddings(
     time_bucket_fn: str,
     alpha: float,
 ) -> torch.Tensor:
+    # DLRM_HSTU_FP8_EVAL_FWD_HYGIENE: decided here, not in the Function's
+    # forward (grad mode is off in there). Training forwards never read it.
+    need_bwd = backward_possible(
+        values_left,
+        values_right,
+        seq_offsets,
+        pos_embeddings,
+        ts_embeddings,
+        timestamps,
+        seq_lengths,
+        num_targets,
+    ) or not eval_fwd_hygiene_enabled()
     return _AddTimestampPositionEmbeddingsConcatFunction.apply(
         values_left,
         values_right,
@@ -3392,6 +3428,7 @@ def triton_concat_add_timestamp_positional_embeddings(
         interleave_targets,
         time_bucket_fn,
         alpha,
+        need_bwd,
     )
 
 
@@ -3411,6 +3448,16 @@ def triton_add_timestamp_positional_embeddings(
     time_bucket_fn: str,
     alpha: Optional[float] = None,
 ) -> torch.Tensor:
+    # DLRM_HSTU_FP8_EVAL_FWD_HYGIENE: see triton_concat_add_timestamp_positional_embeddings.
+    need_bwd = backward_possible(
+        seq_embeddings,
+        seq_offsets,
+        pos_embeddings,
+        ts_embeddings,
+        timestamps,
+        seq_lengths,
+        num_targets,
+    ) or not eval_fwd_hygiene_enabled()
     return _AddTimestampPositionEmbeddingsFunction.apply(
         seq_embeddings,
         seq_offsets,
@@ -3424,4 +3471,5 @@ def triton_add_timestamp_positional_embeddings(
         interleave_targets,
         time_bucket_fn,
         alpha,
+        need_bwd,
     )

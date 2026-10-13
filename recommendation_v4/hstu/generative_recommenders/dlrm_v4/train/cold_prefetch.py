@@ -40,6 +40,46 @@ then leaves the workers faulting on regions nothing has touched yet, and every
 local rank hits the device at once. Stream mode preads the index levels inline
 (``_gather``) rather than on the thread pool.
 
+``DL_COLD_PREFETCH_STREAM=auto`` runs the walk only when the run spans more
+than one node, decided in ``start()`` (``resolve_stream``) from ``$NNODES``
+(the launcher exports it to every rank; train_ranker sizes the world
+as NNODES x GPUS_PER_NODE and treats a missing NNODES as one node): on when it
+is an integer > 1, off when it is 1, unset or not a positive integer. One node
+keeps the one-shot prefetch only.
+``1``/``true``/``on``/``yes`` force the walk on at any node count (e.g. I/O
+emulators that run one node's ranks of a larger world); unset (the
+default), ``0``/``off``/``false``/``no`` or any other value keep it off. Rank 0
+names the outcome of ``auto``: the armed line's stream fields end with
+``auto=multi-node(...)``, or one ``stream=auto resolved off: ...`` line is
+logged and the armed line carries no stream fields.
+
+Eval holdout read-ahead (part of the streaming walk; ``DL_COLD_PREFETCH_EVAL``,
+default on whenever the walk runs). Without the walk, the workers' faults on
+the train data read the mmap read-around, and over the run that caches
+most of the store, including the history ranges of the fixed eval holdout
+(its anchors sit at the end of the timeline, past every train window). The
+walk caches only the exact train ranges, so without more the first holdout
+eval pass reads its data cold. So when the loop hands the walk an eval plan (``set_eval_plan``:
+the fixed holdout anchors, the eval batch size, an optional per-pass batch
+cap, and the training steps from the stream start to the first data-fraction
+eval), the walk also issues the exact ranges of this rank's eval batches
+(``StreamingWindowSampler.set_window`` slice, drop_last, cap; the same
+``_ranges`` as a train batch). It starts once the consumer is within
+``DL_COLD_PREFETCH_EVAL_LEAD`` pulled batches (default 1024) of that eval and
+issues one group of ``DL_COLD_PREFETCH_GROUP`` eval batches at most every
+``DL_COLD_PREFETCH_EVAL_GAP_S`` seconds (default 1.0), only while the train
+read-ahead waits on the consumer (the train read-ahead keeps priority), so the
+holdout reads are spread out instead of issued in one burst; when the eval is
+fewer than ``_EvalWalk.URGENT`` (64) pulled batches away, or the train walk
+reaches the end of the stream first, the rest is issued at once
+(the eval that ends the run follows). A walk cut short by
+``DL_COLD_PREFETCH_HORIZON`` does not: the read-around takes over again after
+it. The holdout is the same at every pass, so one walk covers the run. Rank 0
+logs one ``[cold-prefetch] eval holdout walk ...`` line when it is done
+(``bytes=`` there, as in the train lines, counts the ranges this rank
+requested; a node's ranks overlap). An exception in the eval read-ahead turns
+only it off (one warning); the train walk goes on.
+
 Rules (MLPerf):
   * Nothing here runs before ``release()``, which the loader calls when the
     sampler windows are installed, i.e. after RUN_START (inside the timed
@@ -52,8 +92,9 @@ Rules (MLPerf):
     pread), or by ``DL_PRESTART=2`` (pre-start + cold prefetch, for launchers
     that forward DL_PRESTART but not DL_COLD_PREFETCH). Optional
     ``DL_COLD_PREFETCH_BATCHES`` (default 8) and ``DL_COLD_PREFETCH_THREADS``
-    (default 16). ``DL_COLD_PREFETCH_STREAM=1`` adds the streaming read-ahead
-    to an armed prefetcher; it has no effect when the prefetcher is off.
+    (default 16). ``DL_COLD_PREFETCH_STREAM=1`` (or ``auto`` on more than one
+    node) adds the streaming read-ahead to an armed prefetcher; it has no
+    effect when the prefetcher is off.
 Failures are swallowed with one warning line; the run is unaffected.
 """
 
@@ -102,6 +143,105 @@ _WAIT_S: float = 0.05  # pacing poll interval
 # mid-run stop hurts). $DL_COLD_PREFETCH_HORIZON caps it in per-rank batches.
 HORIZON_ALL: int = 1 << 62
 
+# Eval holdout read-ahead (module docstring). _EVAL_PLAN[0] is set by the
+# training (main) thread before the train stream starts (set_eval_plan) and
+# only read by the prefetch thread; _STREAM_P0[0] is _PULLED at the stream's
+# start (start()), the origin of the plan's step count.
+_EVAL_PLAN: List[Optional[Dict[str, Any]]] = [None]
+_STREAM_P0: List[int] = [0]
+_EVAL_ON: Tuple[str, ...] = ("", "1", "true", "on", "yes")
+_EVAL_OFF: Tuple[str, ...] = ("0", "off", "false", "no")
+
+
+def _eval_env() -> str:
+    return os.environ.get("DL_COLD_PREFETCH_EVAL", "").strip().lower()
+
+
+def eval_prefetch_on() -> bool:
+    """$DL_COLD_PREFETCH_EVAL: the eval holdout read-ahead (default on: unset or
+    1/true/on/yes; it acts only together with the streaming walk).
+    0/off/false/no turn it off, and so does any other value (fail closed; the
+    armed line names it)."""
+    return _eval_env() in _EVAL_ON
+
+
+def set_eval_plan(
+    indices: Any,
+    batch_size: int,
+    steps_to_first_eval: int,
+    num_batches_cap: Optional[int] = None,
+) -> None:
+    """The fixed eval holdout the next eval pass reads (global anchor indices,
+    as installed on the eval sampler), the eval batch size, the training steps
+    from the start of the train stream to the first data-fraction eval, and
+    the per-pass batch cap (None or <= 0: every batch). Called on the main
+    thread before the train stream starts; it only stores the arguments (no
+    file access). An unusable plan clears it (no eval read-ahead)."""
+    try:
+        bs = int(batch_size)
+        at = int(steps_to_first_eval)
+        cap = int(num_batches_cap or 0)
+    except (TypeError, ValueError):
+        _EVAL_PLAN[0] = None
+        return
+    if indices is None or bs <= 0 or at <= 0:
+        _EVAL_PLAN[0] = None
+        return
+    _EVAL_PLAN[0] = {"indices": indices, "bs": bs, "at": at, "cap": max(0, cap)}
+
+
+def _eval_rank_slice(indices: Any, rank: int, world_size: int) -> np.ndarray:
+    """This rank's anchors of one eval pass: StreamingWindowSampler.set_window's
+    round-robin slice ``g[:n][rank::W]`` of the multiple-of-``world_size``
+    prefix (rank_eval_batches)."""
+    g = np.asarray(indices, dtype=np.int64).reshape(-1)
+    ws = max(1, int(world_size))
+    n = (len(g) // ws) * ws
+    return g[:n][int(rank)::ws]
+
+
+def rank_eval_batches(
+    indices: Any, rank: int, world_size: int, batch_size: int, cap: int = 0
+) -> Tuple[np.ndarray, int]:
+    """(per-rank anchor indices, batch count) of the batches one eval pass
+    consumes: StreamingWindowSampler.set_window's round-robin slice of the
+    multiple-of-world_size prefix, DataLoader drop_last, and the pass's
+    num_eval_batches cap (with a cap, the eval pipeline and its workers still
+    prefetch a few batches past it; those are not walked)."""
+    per_rank = _eval_rank_slice(indices, rank, world_size)
+    nb = len(per_rank) // max(1, int(batch_size))
+    if cap and int(cap) > 0:
+        nb = min(nb, int(cap))
+    return per_rank, nb
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, "") or default)
+    except ValueError:
+        return default
+
+
+def _eval_armed_fields(plan: Optional[Dict[str, Any]]) -> str:
+    """The armed line's eval read-ahead fields (streaming walk only) for the
+    plan snapshot the walk uses."""
+    if not eval_prefetch_on():
+        raw = _eval_env()
+        return (" eval=off(DL_COLD_PREFETCH_EVAL)" if raw in _EVAL_OFF
+                else f" eval=off(DL_COLD_PREFETCH_EVAL={raw!r} not 0/1)")
+    if plan is None:
+        return " eval=off(no plan)"
+    try:
+        _, nb = rank_eval_batches(plan["indices"], 0, 1, int(plan["bs"]), plan["cap"])
+    except Exception:
+        nb = -1
+    if nb == 0:
+        return " eval=off(empty holdout)"
+    return (f" eval=on at={int(plan['at'])}"
+            f" lead={max(0, _env_int('DL_COLD_PREFETCH_EVAL_LEAD', 1024))}"
+            f" gap_s={max(0.0, _env_float('DL_COLD_PREFETCH_EVAL_GAP_S', 1.0)):g}"
+            f" cap={int(plan['cap'])}")
+
 
 def note_pull() -> None:
     """One batch pulled by the training pipeline (hot path: one int add)."""
@@ -115,14 +255,62 @@ def note_window_done(n_done: int) -> None:
 
 
 def stop() -> None:
-    """End of the window stream: the streaming read-ahead exits."""
+    """End of the window stream: the streaming read-ahead exits (the stream's
+    ``finally`` and the loader's teardown_close() both call this)."""
     _STOP.set()
 
 
+_STREAM_FORCE_ON: Tuple[str, ...] = ("1", "true", "on", "yes")
+
+
+def _stream_env() -> str:
+    return os.environ.get("DL_COLD_PREFETCH_STREAM", "").strip().lower()
+
+
 def stream_on() -> bool:
-    return os.environ.get("DL_COLD_PREFETCH_STREAM", "").strip().lower() in (
-        "1", "true", "on", "yes",
-    )
+    """$DL_COLD_PREFETCH_STREAM forces the walk on (1/true/on/yes). ``auto`` is
+    resolved per run by ``resolve_stream``."""
+    return _stream_env() in _STREAM_FORCE_ON
+
+
+def _pos_int_env(key: str) -> Tuple[int, str]:
+    """(value, raw text) of ``$key``; value 0 unless a positive integer."""
+    raw = os.environ.get(key, "").strip()
+    try:
+        val = int(raw)
+    except ValueError:
+        val = 0
+    return max(0, val), raw
+
+
+def _multi_node() -> Tuple[Optional[bool], str]:
+    """Does the run span more than one node? (answer, evidence); the answer is
+    None when unknown. Only $NNODES decides: the launcher exports it
+    to every rank, and train_ranker treats a missing NNODES as one node, so no
+    other variable (e.g. a stray $LOCAL_WORLD_SIZE) can turn the walk on."""
+    nnodes, n_raw = _pos_int_env("NNODES")
+    if nnodes:
+        return nnodes > 1, f"nnodes={nnodes}"
+    return None, (f"NNODES={n_raw!r} not a positive integer" if n_raw else "NNODES unset")
+
+
+def resolve_stream() -> Tuple[bool, str]:
+    """Streaming read-ahead for this run: (on, auto reason). The reason is empty
+    unless $DL_COLD_PREFETCH_STREAM=auto; then it is ``multi-node(<evidence>)``
+    when the walk runs, otherwise why it stays off (one node, or unknown)."""
+    raw = _stream_env()
+    if raw != "auto":
+        return raw in _STREAM_FORCE_ON, ""
+    multi, why = _multi_node()
+    if multi:
+        return True, f"multi-node({why})"
+    return False, f"{'single node' if multi is False else 'node count unknown'} ({why})"
+
+
+def stream_lead() -> int:
+    """$DL_COLD_PREFETCH_LEAD: batches the streaming walk stays ahead of the
+    batches the training pipeline has pulled (default 64; read by start())."""
+    return max(1, _env_int("DL_COLD_PREFETCH_LEAD", 64))
 
 # yambda flat-store columns: (name, touched as the scan window [ss, pos] or the
 # scalar [pos, pos]).
@@ -487,22 +675,142 @@ def _ahead(cum_at: Dict[int, int], i: int, b: int) -> Optional[int]:
     return cum_at[i] + b - (cum_at.get(d, cum_at[i]) + p)
 
 
+def _run_start_wall() -> Optional[float]:
+    try:
+        from generative_recommenders.dlrm_v4.train import dl_prestart as _dls
+
+        return _dls.run_start_wall()
+    except Exception:
+        return None
+
+
+class _EvalWalk:
+    """Read-ahead of this rank's eval holdout batches (module docstring), driven
+    by the streaming walk's thread. ``pump()`` runs while the walk waits on the
+    consumer: once the consumer is within ``lead`` pulled batches of the first
+    data-fraction eval it issues one group of eval batches at most every
+    ``gap_s`` seconds. ``pump(urgent=True)`` runs at the top of every train
+    group and issues every remaining group at once when the eval is less than
+    ``URGENT`` pulled batches away (the walk had no wait to use, e.g. a resume
+    right before an eval). ``pump(force=True)`` does the same when the train
+    walk reached the end of the stream. Inert without a plan or with
+    $DL_COLD_PREFETCH_EVAL=0; a failure here only turns it off (one warning)
+    and never stops the train walk."""
+
+    URGENT: int = 64  # pulled batches before the eval: issue the rest at once
+
+    def __init__(self, plan: Optional[Dict[str, Any]], pool, files, rank: int,
+                 world_size: int, how: int, scan_window: int, group: int) -> None:
+        self.on = False
+        self.nb = 0
+        self.b = 0
+        self.rank = int(rank)
+        if plan is None or not files or not eval_prefetch_on():
+            return
+        try:
+            self.plan = plan
+            self.pool, self.files = pool, files
+            self.how, self.scan_window = how, int(scan_window)
+            self.group = max(1, int(group))
+            self.bs = int(plan["bs"])
+            self.at = int(plan["at"])
+            self.per_rank, self.nb = rank_eval_batches(
+                plan["indices"], rank, world_size, self.bs, plan["cap"])
+            if self.nb <= 0:
+                return  # nothing to read ahead (the armed line says so)
+            self.lead = max(0, _env_int("DL_COLD_PREFETCH_EVAL_LEAD", 1024))
+            self.gap_s = max(0.0, _env_float("DL_COLD_PREFETCH_EVAL_GAP_S", 1.0))
+            self.next_t = 0.0  # time.monotonic() of the next lead-paced group
+            self.t_first: Optional[float] = None
+            self.issue_s = 0.0
+            self.at_pulled = -1
+            self.trigger = ""
+            self.st: Dict[str, int] = {"ranges": 0, "bytes": 0, "index_runs": 0,
+                                       "index_bytes": 0}
+            self.on = True
+        except Exception as e:  # advisory only: the train walk goes on
+            self._fail(e)
+
+    def _fail(self, e: BaseException) -> None:
+        self.on = False
+        logger.warning("[cold-prefetch] eval holdout walk failed (ignored) rank=%d: %r",
+                       self.rank, e)
+
+    def pending(self) -> bool:
+        return self.on and self.b < self.nb
+
+    def pump(self, urgent: bool = False, force: bool = False) -> None:
+        if not self.pending():
+            return
+        try:
+            self._pump(urgent, force)
+        except Exception as e:  # advisory only: the train walk goes on
+            self._fail(e)
+
+    def _pump(self, urgent: bool, force: bool) -> None:
+        pulled = _PULLED[0] - _STREAM_P0[0]
+        rest = force or pulled >= self.at - self.URGENT
+        if urgent and not rest:
+            return  # top of a train group: only an imminent eval
+        if not rest:
+            if pulled < self.at - self.lead:
+                return
+            if time.monotonic() < self.next_t:
+                return
+        if self.t_first is None:
+            self.t_first = time.time()
+            self.at_pulled = pulled
+            self.trigger = "stream_end" if force else ("urgent" if rest else "lead")
+        while self.b < self.nb and not _STOP.is_set():
+            k = min(self.group, self.nb - self.b)
+            t1 = time.time()
+            _ranges(self.pool, self.files,
+                    self.per_rank[self.b * self.bs:(self.b + k) * self.bs],
+                    self.scan_window, self.how, self.st,
+                    gap_pages=_STREAM_GAP_PAGES, serial=True)
+            self.issue_s += time.time() - t1
+            self.b += k
+            if not rest:
+                self.next_t = time.monotonic() + self.gap_s
+                break
+        if self.b >= self.nb and self.rank == 0:
+            rs = _run_start_wall()
+            logger.warning(
+                "[cold-prefetch] eval holdout walk rank=%d batches=%d bs=%d ranges=%d "
+                "bytes=%d index_runs=%d index_bytes=%d issue_s=%.3f trigger=%s "
+                "at_pulled=%d first_eval_at=%d lead=%d gap_s=%.2f span_s=%.1f%s",
+                self.rank, self.nb, self.bs, self.st["ranges"], self.st["bytes"],
+                self.st["index_runs"], self.st["index_bytes"], self.issue_s,
+                self.trigger, self.at_pulled, self.at, self.lead,
+                self.gap_s, time.time() - (self.t_first or time.time()),
+                f" t_rel_run_start={time.time() - rs:+.3f}" if rs else "",
+            )
+
+
 def _stream(pool, files, ds, ts_list, rank, world_size, batch_size,
             first_skip_samples, window_cap, how, scan_window, start_batch,
-            horizon, lead, group, st: Dict[str, Any]) -> None:
+            horizon, lead, group, st: Dict[str, Any],
+            eval_plan: Optional[Dict[str, Any]] = None) -> None:
     """Paced read-ahead of the stream's batches [start_batch, horizon), in the
-    order the training pipeline pulls them (see the module docstring)."""
+    order the training pipeline pulls them (see the module docstring), plus the
+    eval holdout read-ahead when the loop gave an eval plan (``_EvalWalk``)."""
     cum_at: Dict[int, int] = {}
     walked = 0  # batches walked (issued or found already pulled), the horizon budget
     skip_left = int(start_batch)  # leading batches the first wave already issued
     pulled0 = _PULLED[0]
+    ev = _EvalWalk(eval_plan, pool, files, rank, world_size, how, scan_window, group)
+    st["eval_batches"] = ev.nb if ev.on else -1
+    cut = False  # the horizon stopped the walk (the read-around takes over again)
     # A mid-window resume re-enters window 0 at batch K: the stream pulls only
     # cap - K of its batches under a per-window cap (_WarmWindowStream._open_next).
     k0 = int(first_skip_samples) // max(1, int(batch_size))
     for i, ts in enumerate(ts_list):
         # Horizon: batches walked, or batches the consumer pulled (late windows
         # are skipped without being walked).
-        if _STOP.is_set() or walked >= horizon or _PULLED[0] - pulled0 >= horizon:
+        if _STOP.is_set():
+            break
+        if walked >= horizon or _PULLED[0] - pulled0 >= horizon:
+            cut = True
             break
         if i < _DONE[0]:  # pulled completely before we got here
             st["late_windows"] += 1
@@ -520,6 +828,7 @@ def _stream(pool, files, ds, ts_list, rank, world_size, batch_size,
         skip_left -= b
         walked += b
         while b < nb and walked < horizon and not _STOP.is_set():
+            ev.pump(urgent=True)  # eval holdout: the rest, if the eval is imminent
             k = min(group, nb - b, horizon - walked)
             ahead = _ahead(cum_at, i, b)
             if ahead is None:  # the consumer finished this window meanwhile
@@ -531,12 +840,15 @@ def _stream(pool, files, ds, ts_list, rank, world_size, batch_size,
             else:
                 if ahead > lead:  # far enough ahead: wait for the consumer
                     w0 = time.time()
+                    e0 = ev.issue_s if ev.on else 0.0
                     while not _STOP.is_set():
                         ahead = _ahead(cum_at, i, b)
                         if ahead is None or ahead <= lead:
                             break
+                        ev.pump()  # eval holdout: one group when due (gap-paced)
                         _STOP.wait(_WAIT_S)
-                    st["wait_s"] += time.time() - w0
+                    # eval issue time is reported by the eval line, not as waiting
+                    st["wait_s"] += time.time() - w0 - ((ev.issue_s if ev.on else 0.0) - e0)
                     if _STOP.is_set():
                         break
                     if ahead is None:
@@ -549,15 +861,25 @@ def _stream(pool, files, ds, ts_list, rank, world_size, batch_size,
                 st["stream_batches"] += k
             b += k
             walked += k
+        if b < nb and walked >= horizon:  # the horizon stopped this window
+            cut = True
+            break
+    # The train walk reached the end of the stream (not stopped, not cut by the
+    # horizon) before the eval read-ahead finished: issue the rest now, the eval
+    # that ends the run follows.
+    if not _STOP.is_set() and not cut and ev.pending():
+        ev.pump(force=True)
+    st["eval_walked"] = ev.b if ev.on else -1
 
 
 def _run(ds, ts_list, rank, world_size, batch_size, first_skip_samples, how,
          k_batches, threads, stream=False, window_cap=None, lead=64, horizon=1024,
-         group=4) -> None:
+         group=4, stream_auto="") -> None:
     t0 = time.time()
     c0 = time.thread_time()
     rel = _RELEASE_WALL[0] if _RELEASE_WALL else t0
     files: Dict[str, _NpyFile] = {}
+    eval_plan = _EVAL_PLAN[0]  # one snapshot for the armed line and the walk
 
     def _rs() -> Optional[float]:
         try:
@@ -612,7 +934,9 @@ def _run(ds, ts_list, rank, world_size, batch_size, first_skip_samples, how,
                     f" t_rel_run_start={time.time() - rs:+.3f}" if rs else "",
                     (f" stream=on lead={lead}"
                      f" horizon={'all' if horizon >= HORIZON_ALL else horizon} group={group}"
-                     f" cap={window_cap or 0}") if stream else "",
+                     f" cap={window_cap or 0}"
+                     + (f" auto={stream_auto}" if stream_auto else "")
+                     + _eval_armed_fields(eval_plan)) if stream else "",
                 )
             if stream:
                 st: Dict[str, Any] = {
@@ -624,19 +948,23 @@ def _run(ds, ts_list, rank, world_size, batch_size, first_skip_samples, how,
                 ts0 = time.time()
                 _stream(pool, files, ds, ts_list, rank, world_size, batch_size,
                         first_skip_samples, window_cap, how, scan_window, len(batches),
-                        horizon, lead, group, st)
+                        horizon, lead, group, st,
+                        eval_plan=eval_plan)
                 if rank == 0:
                     rs = _rs()
                     logger.warning(
                         "[cold-prefetch] stream done rank=%d batches=%d windows=%d "
                         "last_ts=%d late_windows=%d late_batches=%d ranges=%d bytes=%d "
                         "index_runs=%d index_bytes=%d issue_s=%.3f wait_s=%.1f "
-                        "walk_s=%.1f cpu_s=%.2f pulled=%d stopped=%d%s",
+                        "walk_s=%.1f cpu_s=%.2f pulled=%d stopped=%d "
+                        "eval_batches=%d eval_walked=%d%s",
                         rank, st["stream_batches"], st["windows"], st["last_ts"],
                         st["late_windows"], st["late_batches"], st["ranges"],
                         st["bytes"], st["index_runs"], st["index_bytes"],
-                        st["stream_issue_s"], st["wait_s"], time.time() - ts0,
+                        st["stream_issue_s"], st["wait_s"],
+                        time.time() - ts0,
                         time.thread_time() - c0, _PULLED[0], int(_STOP.is_set()),
+                        int(st.get("eval_batches", -1)), int(st.get("eval_walked", -1)),
                         f" t_rel_run_start={time.time() - rs:+.3f}" if rs else "",
                     )
     except Exception as e:  # advisory only: never fail or slow the run
@@ -656,16 +984,21 @@ def start(
     window_cap: Optional[int] = None,
 ) -> Optional[threading.Thread]:
     """Launch the background prefetch (one-shot, plus the paced streaming
-    read-ahead under DL_COLD_PREFETCH_STREAM=1) if armed and released.
-    ``window_cap`` is the stream's per-window batch cap (num_train_batches)."""
+    read-ahead under DL_COLD_PREFETCH_STREAM=1, or =auto when the run spans
+    more than one node) if armed and released. ``window_cap`` is the stream's
+    per-window batch cap (num_train_batches)."""
     how = mode()
     if not how:
         return None
     if not _RELEASED.is_set():
         logger.warning("[cold-prefetch] start() before release ignored (rank=%d)", rank)
         return None
+    stream, auto = resolve_stream()
+    if auto and not stream and rank == 0:
+        logger.warning("[cold-prefetch] stream=auto resolved off: %s", auto)
     _STOP.clear()
     _DONE[0], _DONE[1] = 0, _PULLED[0]  # the pacing counts from this stream's start
+    _STREAM_P0[0] = _PULLED[0]  # origin of the eval plan's step count
     # Horizon: the whole stream by default (see the module docstring for why a
     # mid-run stop hurts); $DL_COLD_PREFETCH_HORIZON caps it in per-rank batches.
     horizon = _env_int("DL_COLD_PREFETCH_HORIZON", HORIZON_ALL)
@@ -675,11 +1008,12 @@ def start(
               max(1, _env_int("DL_COLD_PREFETCH_BATCHES", 8)),
               max(1, _env_int("DL_COLD_PREFETCH_THREADS", 16))),
         kwargs=dict(
-            stream=stream_on(),
+            stream=stream,
             window_cap=window_cap,
-            lead=max(1, _env_int("DL_COLD_PREFETCH_LEAD", 64)),
+            lead=stream_lead(),
             horizon=max(1, horizon),
             group=max(1, _env_int("DL_COLD_PREFETCH_GROUP", 4)),
+            stream_auto=auto if stream else "",
         ),
         name="cold-prefetch",
         daemon=True,
@@ -731,6 +1065,8 @@ def warm_samples(
 
 
 def _reset_for_tests() -> None:
+    _EVAL_PLAN[0] = None
+    _STREAM_P0[0] = 0
     _STOP.set()
     _RELEASED.clear()
     _RELEASE_WALL.clear()

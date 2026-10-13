@@ -42,9 +42,9 @@ The data directory is ~227 GB. To verify every file against the published checks
 DLRM_DATA_PATH=/data/mlperf_dlrmv4/data bash scripts/verify_dataset.sh
 ```
 
-## Prebuild the Time-Window Index [Optional]
+## Build the Time-Window Index
 
-The first training run builds an ~18 GB time-window index in the data directory. To build it once ahead of time:
+Training reads an ~18 GB time-window index from the data directory. It is not part of the download, and a timed run will not start without it. Build it once before the first run:
 
 ```bash
 docker run --rm -v /data/mlperf_dlrmv4/data:/data rocm/amd-mlperf:dlrmv4_training_6.1 \

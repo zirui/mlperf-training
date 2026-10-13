@@ -20,8 +20,7 @@
 // split = xcd*(NSPLIT/8) + cohort, NT = 2 * (1536/192) = 16 output tiles of 256 x 192, NSPLIT = 16. A cohort owns a
 // contiguous token range [KT*s/16, KT*(s+1)/16) (KT = ceil(M/128) steps of 128 tokens) and computes ALL 16 tiles over
 // it, so a token chunk of both operands is fetched from HBM once per cohort and re-served from the XCD L2. Each WG
-// writes its fp32 tile
-// partial to part[split]; a second kernel sums the 16 partials in the fixed order 0..15 and multiplies by gs*as.
+// writes its fp32 tile partial to part[split]; a second kernel sums the 16 partials in the fixed order 0..15 and multiplies by gs*as.
 //
 // Numerics class: fp32-order. e4m3 x e4m3 products are exact in fp32; only the fp32 accumulation order (MFMA K-chunks
 // within a split, then the fixed-order split sum) differs from hipBLASLt's. Deterministic: no atomics, fixed reduction
@@ -457,6 +456,181 @@ __global__ __launch_bounds__(256) void wgrad_ck_w3_reduce(const float* __restric
     reinterpret_cast<f32x4*>(out)[i] = s * sc;
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------------
+// DLRM_HSTU_FP8_BWD_WGRAD_CK_W3_T256S=1 (default off): wgrad_ck_w3.py binds the entry wgrad_ck_w3_t256s (MAP 2) for a
+// step-tiled dout_t; wgrad_ck_w3_t256s_m1 (MAP 1, same bits) is not bound by wgrad_ck_w3.py. "t256s" = the W1 8-wave
+// 256x256-tile step-tiled kernel (wgrad_tm_ck.cu wgrad_ck_kernel XT=1) at N=1536 with e4m3 G (cbsz 0), NSPLIT=21 splits
+// x 12 tiles = 252 WGs. A 256x192 tile issues as many 128-B L2 line requests per K step as a 256x256 one (A 256 +
+// B 256: the 192-B G rows straddle 2 lines) for fewer FLOPs; 256x256 tiles keep W1's request/FLOP ratio, and NSPLIT=21
+// uses 252 of 256 CUs. Cohort map: 2 XCD-local cohorts per XCD (splits 0..15) + 5 cohorts spilled over the leftover
+// 7-8 slots of each XCD (MAP 1: tile order e % 12; MAP 2: column-major inside a spilled cohort so an XCD part
+// duplicates X (a quarter of the bytes) instead of G).
+// Numerics: same 128-token MFMA chunks, sequential fp32 accumulation within a split, fixed-order 21-way reduce:
+// fp32-order class (NOT bitwise to the 16-split kernels).
+// Scratch: part fp32 [21, 512, 1536] (63 MiB).
+// MAP 0: NSPLIT % 8 == 0, XCD-local cohorts (split = xcd*NSPLIT/8 + cohort). MAP 1 ("spill", any NSPLIT >= 16 with
+// NSPLIT*NT <= 256): each XCD (WG b -> XCD b%8) hosts LPX = 32/NT full local cohorts (splits 0..8*LPX-1, XCD-local);
+// the remaining splits fill the leftover slots of all XCDs in XCD-major order (a spilled cohort spans 2-3 XCDs, so
+// its token chunks are fetched by more than one L2).
+template <int N, int NSPLIT, int MAP>
+__global__ __launch_bounds__(512, 2) void wgrad_ck_w3_t256s_kernel(const uint8_t* __restrict__ G, const uint8_t* __restrict__ X,
+                                                          float* __restrict__ part, int M) {
+    using namespace wgck3;
+    constexpr int NTN = N / 256;
+    constexpr int NT = 2 * NTN;
+    constexpr int FMT_G = 0;
+    __shared__ __attribute__((aligned(4096))) uint8_t smem[2 * A_ST + 2 * B_ST];
+
+    const int lane = (int)(threadIdx.x & 63);
+    const int w = __builtin_amdgcn_readfirstlane((int)(threadIdx.x >> 6));
+    const int b = (int)blockIdx.x;
+    const int xcd = b & 7, loc = b >> 3;
+    int split, tile;
+    if constexpr (MAP == 0) {
+        static_assert(NSPLIT % 8 == 0, "MAP 0 needs NSPLIT % 8 == 0");
+        constexpr int CPX = NSPLIT / 8;
+        split = xcd * CPX + loc / NT;
+        tile = loc % NT;
+    } else {
+        constexpr int NWG = NSPLIT * NT;
+        constexpr int LPX = 32 / NT;  // local cohorts per XCD
+        static_assert(NWG <= 256 && NSPLIT >= 8 * LPX, "spill map");
+        if (loc < LPX * NT) {
+            split = xcd * LPX + loc / NT;
+            tile = loc % NT;
+        } else {
+            int e = loc - LPX * NT;
+            for (int x = 0; x < xcd; ++x) e += (NWG - x + 7) / 8 - LPX * NT;
+            split = 8 * LPX + e / NT;
+            if constexpr (MAP == 2) {
+                // column-major order inside a spilled cohort (both row tiles of a column tile adjacent): an XCD's part
+                // of the cohort then needs only its columns of G (3/4 of the bytes) and all of X (1/4), so the
+                // cross-XCD duplication is mostly X instead of G. Same (split, tile) set -> bitwise equal to MAP 1.
+                const int tp = e % NT;
+                tile = (tp & 1) * NTN + (tp >> 1);
+            } else {
+                tile = e % NT;
+            }
+        }
+    }
+    const int kx0 = (tile / NTN) * 256, n0 = (tile % NTN) * 256;
+    const int KT = (M + KS - 1) / KS;
+    const int kb = (int)(((long long)KT * split) / NSPLIT);
+    const int ke = (int)(((long long)KT * (split + 1)) / NSPLIT);
+    const uint32_t lds0 = (uint32_t)reinterpret_cast<uintptr_t>(&smem[0]);
+
+    const uint32_t chunkA = (uint32_t)((lane & 7) ^ ((4 * (w & 1) + (lane >> 4)) & 7));
+    const uint32_t voffA = (uint32_t)((8 * w + (lane >> 3)) * KS) + chunkA * 16u;
+    const int fB = 4 * (w & 1) + (lane >> 4) + 8 * ((w >> 2) & 1);
+    const uint32_t chunkB = (uint32_t)((lane & 15) ^ fB);
+    uint32_t voffB[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) voffB[i] = (uint32_t)((32 * i + 4 * w + (lane >> 4)) * N) + chunkB * 16u;
+    const uint32_t ldsA_w = lds0 + 1024u * (uint32_t)w;
+    const uint32_t ldsB_w = lds0 + (uint32_t)B_OFF + 1024u * (uint32_t)w;
+
+    const int r16 = lane & 15, q4 = lane >> 4;
+    const uint32_t swz = (uint32_t)(r16 >> 1) << 4;
+    const uint32_t rowA = lds0 + 16384u * (uint32_t)(w >> 2) + (uint32_t)r16 * 128u;
+    const uint32_t lpA0 = rowA + (((uint32_t)(16 * q4)) ^ swz);
+    const uint32_t lpA1 = rowA + (((uint32_t)(16 * q4 + 64)) ^ swz);
+    uint32_t qB[4];
+    {
+        const int s = r16, g = q4;
+        const int t0 = 16 * g + (s >> 1);
+        const int f = (s >> 1) + 8 * (g & 1);
+        const int cw = 4 * (w & 3);
+        const uint32_t q = lds0 + (uint32_t)B_OFF + (uint32_t)t0 * 256u + 8u * (uint32_t)(s & 1) + ((uint32_t)(cw ^ f) << 4);
+#pragma unroll
+        for (int fb = 0; fb < 4; ++fb) qB[fb] = q ^ ((uint32_t)fb << 4);
+    }
+
+    f32x4 acc[8][4];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = f32x4{0.f, 0.f, 0.f, 0.f};
+
+    auto issue = [&](int k, uint32_t st) {
+        const i32x4 rA = make_rsrc(X + (long long)k * (KX * KS) + (long long)kx0 * KS, (uint32_t)(256 * KS));
+        const int vt = min(KS, M - k * KS);
+        const i32x4 rB = make_rsrc(G + (long long)k * KS * N + n0, (uint32_t)(vt * N));
+#pragma unroll
+        for (int i = 0; i < 4; ++i) g2l(rA, (ldsA_w ^ st) + (uint32_t)(8192 * i), voffA, (uint32_t)(64 * i * KS));
+#pragma unroll
+        for (int i = 0; i < 4; ++i) g2l(rB, (ldsB_w ^ st) + (uint32_t)(8192 * i), voffB[i], 0u);
+    };
+
+    uint32_t pA0 = lpA0, pA1 = lpA1;
+    uint32_t q0 = qB[0], q1 = qB[1], q2 = qB[2], q3 = qB[3];
+    uint32_t st = 0;
+    if (kb < ke) issue(kb, 0u);
+    for (int k = kb; k < ke; ++k) {
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        WGCK3_BARRIER();
+        if (k + 1 < ke) issue(k + 1, st ^ 0x8000u);
+        WGCK3_SB();
+        i32x8 bf[4];
+        i32x8 a[2];
+        auto mma = [&](int fa, int fb, const i32x8& av) {
+            acc[fa][fb] = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(bf[fb], av, acc[fa][fb], FMT_G, 0, 0, 0, 0, 0);
+        };
+        bf[0] = fragB<0>(q0);
+        a[0] = fragA<0>(pA0, pA1);
+        bf[1] = fragB<0>(q1);
+        asm volatile("s_waitcnt lgkmcnt(4)" ::: "memory");
+        bf[2] = fragB<0>(q2);
+        WGCK3_SB();
+        mma(0, 0, a[0]);
+        WGCK3_SB();
+        asm volatile("s_waitcnt lgkmcnt(4)" ::: "memory");
+        bf[3] = fragB<0>(q3);
+        WGCK3_SB();
+        mma(0, 1, a[0]);
+        WGCK3_SB();
+        asm volatile("s_waitcnt lgkmcnt(4)" ::: "memory");
+        a[1] = fragA<2048>(pA0, pA1);
+        WGCK3_SB();
+        mma(0, 2, a[0]);
+        WGCK3_SB();
+        asm volatile("s_waitcnt lgkmcnt(2)" ::: "memory");
+        WGCK3_SB();
+        mma(0, 3, a[0]);
+        WGCK3_SB();
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        WGCK3_SB();
+        [&]<int... FB>(std::integer_sequence<int, FB...>) {
+            (([&] {
+                 constexpr int FA = FB + 1;
+                 if constexpr (FA < 7) a[(FA + 1) & 1] = fragA<(FA + 1) * 2048>(pA0, pA1);
+                 WGCK3_SB();
+#pragma unroll
+                 for (int fb = 0; fb < 4; ++fb) mma(FA, fb, a[FA & 1]);
+                 WGCK3_SB();
+                 asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+                 WGCK3_SB();
+             }()),
+             ...);
+        }(std::make_integer_sequence<int, 7>{});
+        st ^= 0x8000u;
+        pA0 ^= 0x8000u;
+        pA1 ^= 0x8000u;
+        q0 ^= 0x8000u;
+        q1 ^= 0x8000u;
+        q2 ^= 0x8000u;
+        q3 ^= 0x8000u;
+    }
+
+    float* P = part + ((long long)split * KX + kx0 + 128 * (w >> 2) + r16) * N + n0 + 64 * (w & 3) + 4 * q4;
+#pragma unroll
+    for (int fa = 0; fa < 8; ++fa)
+#pragma unroll
+        for (int fb = 0; fb < 4; ++fb)
+            *reinterpret_cast<f32x4*>(P + (long long)(16 * fa) * N + 16 * fb) = acc[fa][fb];
+}
+
+
 // ldm: any multiple of 16 >= roundup(M,16) (X chunks at token >= ldm are masked); 256*ldm must fit the 31-bit
 // num_records so the 0x80000000 out-of-range offset stays out of range (ldm < 8388608 tokens per call; production ~3M).
 static constexpr long long WGCK3_LDM_MAX = 0x7fffffffLL / 256;
@@ -527,3 +701,34 @@ extern "C" int wgrad_ck_w3_t_nsplit(void) { return 16; }
 // Drain (return and clear) this thread's sticky HIP last error: wgrad_ck_w3.py calls it before its own torch padding
 // fill, so a stale error from an earlier unrelated call is reported once instead of failing that fill.
 extern "C" int wgrad_ck_w3_drain_last_error(void) { return (int)hipGetLastError(); }
+
+template <int MAP>
+static int wgrad_ck_w3_t256s_launch(const void* G, const void* X, long long ldm, void* part, void* out, const float* gs,
+                                    const float* as, int M, void* stream) {
+    constexpr int N = 1536, NS = 21;
+    if (M <= 0 || ldm != (long long)wgck3::KX * wgck3::KS) return (int)hipErrorInvalidValue;
+    if (((uintptr_t)G | (uintptr_t)X | (uintptr_t)part | (uintptr_t)out) & 15) return (int)hipErrorInvalidValue;
+    if (gs == nullptr || as == nullptr) return (int)hipErrorInvalidValue;
+    const hipError_t stale = hipGetLastError();
+    hipLaunchKernelGGL((wgrad_ck_w3_t256s_kernel<N, NS, MAP>), dim3(NS * 12), dim3(512), 0, (hipStream_t)stream,
+                       (const uint8_t*)G, (const uint8_t*)X, (float*)part, M);
+    hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return (int)e;
+    hipLaunchKernelGGL((wgrad_ck_w3_reduce<N, NS>), dim3((wgck3::KX * N / 4) / 256), dim3(256), 0, (hipStream_t)stream,
+                       (const float*)part, (float*)out, gs, as);
+    e = hipGetLastError();
+    if (e != hipSuccess) return (int)e;
+    return stale == hipSuccess ? 0 : -(int)stale;
+}
+// Same ABI as wgrad_ck_w3_t (X step-tiled, ldm = 65536); part must be fp32 [21, 512, 1536].
+extern "C" int wgrad_ck_w3_t256s(const void* G, const void* X, long long ldm, void* part, void* out, const float* gs,
+                                 const float* as, int M, void* stream) {
+    return wgrad_ck_w3_t256s_launch<2>(G, X, ldm, part, out, gs, as, M, stream);
+}
+extern "C" int wgrad_ck_w3_t256s_nsplit(void) { return 21; }
+extern "C" int wgrad_ck_w3_t256s_m1(const void* G, const void* X, long long ldm, void* part, void* out, const float* gs,
+                                    const float* as, int M, void* stream) {
+    return wgrad_ck_w3_t256s_launch<1>(G, X, ldm, part, out, gs, as, M, stream);
+}
+extern "C" int wgrad_ck_w3_t256s_m1_nsplit(void) { return 21; }
+

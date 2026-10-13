@@ -384,6 +384,18 @@ class STULayer(STU):
         return names
 
     @torch.jit.unused
+    def _tag_lnmd_layer(self) -> None:
+        """DLRM_HSTU_FP8_MASKGEN_PK_LAYERS layer list: tell the
+        LN*U*dropout forward of the compute output that follows which STUStack
+        layer it serves (-1 when this layer is not owned by a stack). A host
+        integer only; it chooses between two kernels that write the same bytes."""
+        from generative_recommenders.ops.triton.triton_hstu_linear import (
+            set_lnmd_layer_tag,
+        )
+
+        set_lnmd_layer_tag(self._stack_layer_index)
+
+    @torch.jit.unused
     def _g3_fresh(self, names: Tuple[str, ...]) -> bool:
         """The stack's shadows exist for `names` and no parameter was modified
         in place since they were cast."""
@@ -605,6 +617,7 @@ class STULayer(STU):
             g3_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
             if not torch.jit.is_scripting():
                 g3_out = self._g3_pair("_output_norm_weight", "_output_norm_bias")
+                self._tag_lnmd_layer()
             return hstu_compute_output(
                 attn=attn_output,
                 u=u,
@@ -743,6 +756,7 @@ class STULayer(STU):
             # Shipped node order: norm weight, norm bias, output weight.
             g3_out = self._g3_pair("_output_norm_weight", "_output_norm_bias")
             g3_ow = self._g3_one("_output_weight") if g3_out is not None else None
+            self._tag_lnmd_layer()
             output = hstu_compute_output(
                 attn=attn_output,
                 u=u,

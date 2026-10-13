@@ -341,11 +341,28 @@ def _merged_construct(
                 casts.append(name not in kept_set)
                 premerged.append(False)
             names.append(name)
-        outs = list(
-            _ECExpandGroup.apply(embeddings, out_dtype, tuple(casts), *idxs)
-        )
+        # Indexed-X L1 (ops/ec_indexed_l1.py; DLRM_HSTU_FP8_EC_INDEXED_L1, default off): None -> unchanged.
+        ix = _ix_plan(embeddings, out_dtype, casts, idxs, cat_slot, w, names, premerged)
+        if ix is not None:  # the two hoisted members' casts become (truthy) records
+            casts[ix.cat.member], casts[ix.item.member] = ix.cat, ix.item
+        # dh ports (dlrm_v4/train/ec_dgrad_ports.py; DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE,
+        # default off): None -> the shipped call, unchanged.
+        ex2b = _ex2b_plan(embeddings, out_dtype, casts, idxs, cat_slot, w)
+        if ex2b is None:
+            outs = list(
+                _ECExpandGroup.apply(embeddings, out_dtype, tuple(casts), *idxs)
+            )
+        else:
+            outs = ex2b.apply(embeddings, out_dtype, tuple(casts), idxs)
+        if ix is not None:
+            ix.tag_item(outs[ix.item.member])  # pre-pop member index, as ec_dgrad_ports._Plan.apply
         if cat_slot >= 0:
-            cat_views(outs.pop(cat_slot), grouped=True)
+            flat = outs.pop(cat_slot)
+            cat_views(flat, grouped=True)
+            if ex2b is not None:
+                ex2b.tag_cat(flat, getattr(fused_vals[grp[0]], CATFUSED_ATTR)[0])
+            if ix is not None:
+                ix.tag_cat(getattr(fused_vals[grp[0]], CATFUSED_ATTR)[0])  # `big`
         for name, values, pm in zip(names, outs, premerged):
             if pm:
                 setattr(values, PREMERGED_ATTR, True)
@@ -668,6 +685,85 @@ def _ec_group_enabled() -> bool:
     )
 
 
+_EX2B_ENV = "DLRM_HSTU_FP8_EC_DGRAD_SEGREDUCE"
+_EX2B_ON: Optional[bool] = None
+
+
+def _ex2b_plan(embeddings, out_dtype, casts, idxs, cat_slot: int, w: int):
+    """Preprocessor L1 dgrads fused into this backward: the
+    dh-port plan for one grouped call, or None -> the shipped _ECExpandGroup
+    call. Off (absent) by default; read once, at the first grouped call. The
+    module is imported only with the knob on."""
+    global _EX2B_ON
+    if _EX2B_ON is None:
+        _EX2B_ON = os.environ.get(_EX2B_ENV, "").strip().lower() in (
+            "1", "true", "on", "yes",
+        )
+    if not _EX2B_ON:
+        return None
+    from generative_recommenders.dlrm_v4.train import ec_dgrad_ports as _xp
+
+    return _xp.plan(embeddings, out_dtype, casts, idxs, cat_slot, w)
+
+
+# Indexed-X L1 (ops/ec_indexed_l1.py, ops/triton/triton_ec_indexed_l1.py;
+# DLRM_HSTU_FP8_EC_INDEXED_L1, default off): the two hoisted members go to the preprocessor L1 as (U, idx)
+# placeholders and the L1 forward / wgrad read X through the index. Read once, at the first grouped call; the
+# protocol module is imported only with the knob on. Fail-closed.
+_IX_ENV = "DLRM_HSTU_FP8_EC_INDEXED_L1"
+_IX_ON: Optional[bool] = None
+# make_model's consumer-chain registration: None = not registered, "" = Indexed-X-aware, else what is missing.
+_IX_CHAIN: Optional[str] = None
+# The uih_post_id feature (make_model): the merged item member the content MLP's pair 0 reads.
+_IX_UIH_POST_ID: Optional[str] = None
+
+
+def note_ec_indexed_l1_chain(fuse_linear_norm: bool, fuse_ln_residual: bool, bf16_training: bool,
+                             transducer_bf16_dtype: bool, uih_post_id: str) -> None:
+    """make_model, after the merge and CAT_FUSE registrations: whether every consumer of the hoisted members is
+    Indexed-X-aware (FusedLinearNormMLP pairs under the grouped tail and the FP8 L2, autocast(bf16), the transducer's
+    .to() an identity, the uih_post_id pair merged in the expand so main_forward skips its concat, the 2-key
+    CAT_FUSE group so the additional MLP reads `big`). Registration only: nothing changes unless
+    DLRM_HSTU_FP8_EC_INDEXED_L1 is on."""
+    global _IX_CHAIN, _IX_UIH_POST_ID
+    tail = os.environ.get("DLRM_HSTU_FP8_PREPROC_GROUPED_TAIL", "0") == "1"  # == preprocessors.py:49-51
+    merged = any(u == uih_post_id for (u, _c) in _MERGE_PAIRS)  # enable_ec_merge_uih_candidate registered it
+    missing = [name for name, ok in (
+        ("fuse_linear_norm", fuse_linear_norm), ("fuse_ln_residual", fuse_ln_residual),
+        ("bf16_training", bf16_training), ("transducer_bf16_dtype", transducer_bf16_dtype),
+        ("DLRM_HSTU_FP8_PREPROC_GROUPED_TAIL", tail),
+        (f"ec_merge_uih_candidate ({uih_post_id})", merged),
+        ("DLRM_HSTU_FP8_EC_CAT_FUSE (2-key group)", len(_CAT_GROUP) == 2)) if not ok]
+    _IX_CHAIN = ", ".join(missing) + " off" if missing else ""
+    _IX_UIH_POST_ID = str(uih_post_id)
+
+
+def _ix_plan(embeddings, out_dtype, casts, idxs, cat_slot: int, w: int, names, premerged):
+    """Indexed-X records for one grouped call (ops/ec_indexed_l1.plan), or None -> the shipped expand.
+    names / premerged: _merged_construct's lists (no entry for the cat member)."""
+    global _IX_ON
+    if _IX_ON is None:
+        _IX_ON = os.environ.get(_IX_ENV, "").strip().lower() in ("1", "true", "on", "yes")
+    if not _IX_ON:
+        return None
+    try:
+        from generative_recommenders.ops import ec_indexed_l1 as _ixp
+    except Exception as exc:  # fail closed: the shipped expand for the rest of the run
+        _IX_ON = False
+        from generative_recommenders.ops.utils import arm_print_all_ranks
+
+        arm_print_all_ranks(f"[ec-indexed-l1] FAILED CLOSED (DISABLED for the rest of the run) -> shipped EC "
+                            f"expand + L1 GEMMs (import: {type(exc).__name__}: {str(exc)[:300]})")
+        return None
+    try:
+        return _ixp.plan(embeddings, out_dtype, casts, idxs, cat_slot, w, cat_group=len(_CAT_GROUP),
+                         chain=_IX_CHAIN, names=names, premerged=premerged, uih_post_id=_IX_UIH_POST_ID,
+                         expand=_expand)
+    except Exception as exc:  # fail closed
+        _ixp.K.latch_off("ec plan", exc)
+        return None
+
+
 def _ec_joint_segments(hoisted, U: int):
     """DLRM_HSTU_FP8_EC_JOINT_SORT (default OFF in code; the gin binding turns
     it on): both hoisted members' (order, offsets) from ONE stable
@@ -776,9 +872,24 @@ class _ECExpandGroup(torch.autograd.Function):
         w = embeddings.size(-1)
         emb_c = embeddings.to(out_dtype) if any(casts) else None
         outs = []
+        # Indexed-X (ops/ec_indexed_l1.py): a casts entry may be an IXRecord (truthy; never with the knob
+        # off). It issues the member's stride-0 placeholder (or, latched off, the shipped expand) and keeps
+        # emb_c / idx for the preprocessor L1. ctx then holds only bools and the consumer ledgers.
+        ix_ledgers = []
+        has_ix = False
         for c, idx in zip(casts, idxs):
+            if getattr(c, "ix_record", False):
+                has_ix = True
+                outs.append(c.issue(emb_c, idx, w, out_dtype))
+                if c.issued:
+                    ix_ledgers.append((len(outs) - 1, c.ledger))
+                continue
             src = emb_c if c else embeddings
             outs.append(_expand(src, idx, w))
+        if has_ix:
+            ctx.casts = tuple(bool(c) for c in casts)  # the node keeps no record (and so no emb_c)
+            if ix_ledgers:
+                ctx.ix_ledgers = tuple(ix_ledgers)  # consumer accounting only, no tensors
         return tuple(outs)
 
     @staticmethod
@@ -791,7 +902,17 @@ class _ECExpandGroup(torch.autograd.Function):
 
         idxs = ctx.saved_tensors
         U, w = ctx.num_rows, ctx.width
-        acc: Optional[torch.Tensor] = None
+        # Indexed-X (ops/ec_indexed_l1.py): each issued member's gradient must come from an Indexed-X-aware
+        # consumer in this backward (raises on a NaN reader or a lost gradient). Absent when off.
+        ixl = getattr(ctx, "ix_ledgers", None)
+        if ixl is not None:
+            from generative_recommenders.ops import ec_indexed_l1 as _ixp
+
+            _ixp.ec_backward_check(ixl, grads)
+        # ec_dgrad_ports.ECExpandGroupPorts seeds the accumulator with
+        # the hoisted members' fused sums and passes their grads as None; the
+        # shipped class never sets ex2b_acc.
+        acc: Optional[torch.Tensor] = getattr(ctx, "ex2b_acc", None)
         n_seg = n_sc = 0
         # Hoisted (large) keys first: the first segment reduce allocates the
         # accumulator, later ones accumulate in-kernel.
@@ -818,8 +939,13 @@ class _ECExpandGroup(torch.autograd.Function):
                 )
         # DLRM_HSTU_FP8_EC_REDUCE_FUSED: all hoisted members in one grouped
         # launch (None -> the per-member calls below, on the same segments).
-        acc, segs = _ec_reduce_fused(hoisted, segs, U)
-        if acc is not None:
+        # Never over a dh-port seed: then `hoisted` is empty, and the per-member
+        # loop below would accumulate into the seed anyway.
+        acc_f = None
+        if acc is None:
+            acc_f, segs = _ec_reduce_fused(hoisted, segs, U)
+        if acc_f is not None:
+            acc = acc_f
             n_seg = len(hoisted)
         else:
             for i, (idx, g) in enumerate(hoisted):

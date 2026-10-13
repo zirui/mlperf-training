@@ -34,6 +34,7 @@ from generative_recommenders.common import (
     init_mlp_weights_optional_bias,
     set_static_max_seq_lens,
 )
+from generative_recommenders.modules import action_prefill
 from generative_recommenders.modules.hstu_transducer import HSTUTransducer
 from generative_recommenders.modules.multitask_module import (
     DefaultMultitaskModule,
@@ -48,6 +49,7 @@ from generative_recommenders.modules.postprocessors import (
 from generative_recommenders.modules.preprocessors import ContextualPreprocessor
 from generative_recommenders.modules.stu import STU, STULayer, STULayerConfig, STUStack
 from generative_recommenders.ops.blas_solution_pins import install_for_tokens
+from generative_recommenders.ops.eval_fwd_hygiene import eval_fwd_hygiene_enabled
 from generative_recommenders.ops.jagged_tensors import concat_2D_jagged
 from generative_recommenders.ops.layer_norm import LayerNorm, SwishLayerNorm
 from torch.autograd.profiler import record_function
@@ -114,6 +116,14 @@ def fx_total_targets(num_candidates: torch.Tensor) -> int:
     if cached is num_candidates and version == num_candidates._version:
         return value
     return int(num_candidates.sum().item())
+
+
+def _memoized_total_targets(num_candidates: torch.Tensor) -> Optional[int]:
+    """fx_total_targets' memo hit, or None -- never a device-to-host read."""
+    cached, version, value = _total_targets_memo
+    if cached is num_candidates and version == num_candidates._version:
+        return value
+    return None
 
 
 def fx_length_stats(
@@ -921,6 +931,61 @@ class DlrmHSTU(HammerModule):
         item_embeddings = self._item_embedding_mlp(all_embeddings)
         return item_embeddings
 
+    @torch.jit.unused
+    def _issue_action_prefill(
+        self,
+        max_uih_len: int,
+        max_num_candidates: int,
+        uih_seq_lengths: torch.Tensor,
+        num_candidates: torch.Tensor,
+        payload_features: Dict[str, torch.Tensor],
+    ) -> None:
+        """DLRM_HSTU_FP8_ACTION_PREFILL (modules/action_prefill.py).
+
+        Issues the preprocessor's action branch with exactly the inputs
+        main_forward -> _user_forward will hand it (same payload tensors,
+        num_targets=num_candidates, seq_lengths=uih_seq_lengths+num_candidates,
+        total_targets from fx_length_stats' memo) under _user_forward's
+        autocast. Training with grad only; the preprocessor re-checks the
+        inputs and falls back to the original order on any mismatch.
+        """
+        action_prefill.clear()
+        if not action_prefill.enabled():
+            return
+        if (
+            self.is_inference
+            or not self.training
+            or not torch.is_grad_enabled()
+            or is_fx_tracing()
+            or torch.compiler.is_compiling()
+        ):
+            return
+        pre = self._hstu_transducer._input_preprocessor
+        if not isinstance(pre, ContextualPreprocessor) or pre._action_weights is None:
+            return action_prefill.decline("no ContextualPreprocessor action branch")
+        if self._hstu_configs.uih_post_id_feature_name not in [
+            u for u, _ in self._hstu_configs.merge_uih_candidate_feature_mapping
+        ]:
+            return action_prefill.decline("uih_post_id feature is not merged")
+        total_targets = _memoized_total_targets(num_candidates)
+        if total_targets is None:
+            return action_prefill.decline(
+                "sum(num_candidates) is not on the host without a sync"
+            )
+        with torch.autocast(
+            "cuda",
+            dtype=torch.bfloat16,
+            enabled=(not self.is_inference) and self._bf16_training,
+        ):
+            pre.prefill_action(
+                max_uih_len=max_uih_len,
+                max_targets=max_num_candidates,
+                total_targets=total_targets,
+                uih_seq_lengths=uih_seq_lengths,
+                num_targets=num_candidates,
+                seq_payloads=payload_features,
+            )
+
     def preprocess(
         self,
         uih_features: KeyedJaggedTensor,
@@ -1017,6 +1082,21 @@ class DlrmHSTU(HammerModule):
                 torch.ops.fbgemm.asynchronous_complete_cumsum(num_candidates)
             )
 
+        # The comprehension below is the first touch of the EC output. With
+        # the pipelined (sharded) EC that output is a LazyAwaitable, and this
+        # touch is where the main stream starts waiting on the forward
+        # embedding all-to-all (All2All_Seq_Req_Wait). DLRM_HSTU_FP8_ACTION_
+        # PREFILL issues the embedding-independent action branch of the input
+        # preprocessor before it, so it runs in that window.
+        if not torch.jit.is_scripting():
+            self._issue_action_prefill(
+                max_uih_len=max_uih_len,
+                max_num_candidates=max_num_candidates,
+                uih_seq_lengths=uih_seq_lengths,
+                num_candidates=num_candidates,
+                payload_features=payload_features,
+            )
+
         seq_embeddings = {
             k: SequenceEmbedding(
                 lengths=seq_embeddings_dict[k].lengths(),
@@ -1106,10 +1186,20 @@ class DlrmHSTU(HammerModule):
         # Stash this batch's jagged FLOPs/sample for MetricsLogger to read.
         # No D->H sync: the .item() happens once per metric_log_frequency in
         # the trainer, not on every step. Eval-mode batches also produce a
-        # stash but the trainer only consumes it on train batches. Stashed
+        # stash but the trainer only consumes it on train batches
+        # (DLRM_HSTU_FP8_EVAL_FWD_HYGIENE=1: so eval batches skip it). Stashed
         # after the transducer ran so it can be priced against the path that
         # was actually taken, not the one the env flag asked for.
-        if not torch.jit.is_scripting() and _LAZY_FLOPS_STASH:
+        if (
+            not torch.jit.is_scripting()
+            and not self.training
+            and eval_fwd_hygiene_enabled()
+        ):
+            # Eval batch, hygiene on: no stash, lazy or eager (the trainer's
+            # perf line reads only train batches). Training never reads the
+            # switch (self.training short-circuits).
+            pass
+        elif not torch.jit.is_scripting() and _LAZY_FLOPS_STASH:
             # The add is kept eager so the stash owns a fresh tensor and never
             # aliases batch buffers a pipeline might recycle.
             self._flops_stash_pending = (

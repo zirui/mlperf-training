@@ -113,6 +113,11 @@ KERNEL_NAME: str = "l11_outproj_lnmd_bwd"
 FAMILY: str = "L11 out-proj dgrad + LN*U*dropout bwd fused"
 
 _SOURCE: Path = Path(__file__).with_name("l11_outproj_lnmd.cu")
+# DLRM_HSTU_FP8_L11_VD (code default off, yambda_5b.gin binds it on): only "1" builds this reduced-instruction
+# consumer source instead of _SOURCE (same kernel name, ABI, launch and outputs, bit for bit). Absent, "0" or any
+# other value: _SOURCE.
+VD_KNOB: str = "DLRM_HSTU_FP8_L11_VD"
+_SOURCE_VD: Path = Path(__file__).with_name("l11_outproj_lnmd_vd.cu")
 _ARCH: str = "gfx950"
 # Build flags, INCLUDING --save-temps: with it, hipcc runs the classic per-step device compile, which is the flow
 # that prints the -Rpass-analysis resource remarks the 0-spill / 0-scratch check below parses (ROCm 7.2.1 prints
@@ -306,10 +311,21 @@ def _toolchain(hipcc: str) -> str:
     return version
 
 
+def vd_requested() -> bool:
+    """DLRM_HSTU_FP8_L11_VD == "1" (default off) selects the reduced-instruction consumer source
+    l11_outproj_lnmd_vd.cu; absent, "0" or any other value keeps l11_outproj_lnmd.cu."""
+    return os.environ.get(VD_KNOB, "0").strip() == "1"
+
+
 def _source() -> Path:
-    """The kernel source; DLRM_HSTU_FP8_BWD_OUTPROJ_LNMD_FUSED_SRC overrides it."""
+    """The kernel source; DLRM_HSTU_FP8_BWD_OUTPROJ_LNMD_FUSED_SRC overrides it.
+    Otherwise l11_outproj_lnmd.cu, or l11_outproj_lnmd_vd.cu when DLRM_HSTU_FP8_L11_VD=1. Both sources
+    produce byte-identical outputs (dx, du, amax, column-sum and dW/dB partials, NaN payloads included); the cache key
+    covers the source bytes, so each one builds its own .so."""
     override = os.environ.get(KNOB + "_SRC", "").strip()
-    return Path(override) if override else _SOURCE
+    if override:
+        return Path(override)
+    return _SOURCE_VD if vd_requested() else _SOURCE
 
 
 def _flags(src: bytes) -> List[str]:

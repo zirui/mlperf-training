@@ -34,7 +34,12 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
+from generative_recommenders.ops.eval_fwd_hygiene import (
+    backward_possible,
+    eval_fwd_hygiene_enabled,
+)
 from generative_recommenders.ops.hip import l11_outproj_lnmd
+from generative_recommenders.ops.hip import l11_do8
 from generative_recommenders.ops.triton import bwd_fp8
 from generative_recommenders.ops.triton import fp8_tm_alloc
 from generative_recommenders.ops.triton import fp8_wgrad_snr
@@ -73,6 +78,11 @@ from generative_recommenders.ops.utils import (
     arm_print_all_ranks,
     use_separated_rng_ln_mul_dropout,
 )
+from generative_recommenders.ops.eval_lnmd_v3 import (
+    eval_lnmd_v3_enabled,
+    log_eval_lnmd_v3_armed,
+    log_eval_lnmd_v3_ignored,
+)
 
 # FP8 output-projection wgrad. Default OFF (DLRM_HSTU_FP8_BWD_OUT_WGRAD absent or
 # not "1" = the default bf16 wgrad, same kernels and saved tensors). When on, a
@@ -83,7 +93,7 @@ from generative_recommenders.ops.utils import (
 # the LN-mul-dropout backward, and the wgrad reuses the dout cast of the FP8
 # output-projection dgrad (one cast serves both). Engages only with the FP8
 # backward scale controller (DLRM_HSTU_FP8_BWD=1) published; warmup calls take
-# the bf16 path. Arming line: one "[fp8-out-wgrad] armed impl=... path=..."
+# the bf16 path. Armed proof: one "[fp8-out-wgrad] armed impl=... path=..."
 # line per process on the first FP8 wgrad call.
 _FP8_OUT_WGRAD: bool = os.environ.get("DLRM_HSTU_FP8_BWD_OUT_WGRAD", "0") == "1"
 # Sub-mode (DLRM_HSTU_FP8_BWD_OUT_WGRAD_IMPL), read only when the knob is on:
@@ -830,7 +840,7 @@ def _ln_mul_dropout_fwd_rng_v2(
     exact sigmoid via _sigmoid_ieee_fast (wave-uniform fallback to tl.sigmoid
     for rows with any d > 2^126 or NaN); dropout keep via bit masks.
     Gate: DLRM_HSTU_FP8_LNMD_FWD_V2 (gin default on in yambda_5b.gin;
-    absent or =0 = the old kernel)."""
+    absent or =0 = _ln_mul_dropout_fwd_rng)."""
     pid = tl.program_id(0)
     nprog = tl.num_programs(0)
     cols = tl.arange(0, BLOCK_D)
@@ -1795,10 +1805,9 @@ def _ln_mul_dropout_bwd_dx_du_rng_v2(
     assignment as _ln_mul_dropout_bwd_dx_du_rng. Differences: index-addressed
     raw pointer loads, a tl.range row loop, streaming (.cs) stores, and it is
     launched with half the warps (1 at D=512), which changes the row reduction
-    tree for c1/c2. Vs the old kernel: du and y bitwise; dx can differ by
-    reduction-order rounding; dw/db can differ by 1 bf16 ulp in rare elements
-    (compiler FMA contraction of the fp32 partial sums). Deterministic.
-    Gate: DLRM_HSTU_FP8_LNMD_BWD_V2 (gin default on in yambda_5b.gin; absent or =0 = the old kernel)."""
+    tree for c1/c2. du and y are bitwise equal to _ln_mul_dropout_bwd_dx_du_rng;
+    dx and dw/db can differ by reduction-order rounding. Deterministic.
+    Gate: DLRM_HSTU_FP8_LNMD_BWD_V2 (gin default on in yambda_5b.gin; absent or =0 = _ln_mul_dropout_bwd_dx_du_rng)."""
     pid = tl.program_id(0)
     tile_num = tl.num_programs(0)
     rows_per_tile = N // tile_num
@@ -1945,14 +1954,14 @@ def _ln_mul_dropout_bwd_dx_du_rng_v3(
     LEV: tl.constexpr = "",
     SCM8: tl.constexpr = ".cs",
 ):
-    """DLRM_HSTU_FP8_BWD_DU_E5M2 (default off): the e5m2 du producer for the
-    ordinary layer (hstu_du_e5m2.py).
+    """DLRM_HSTU_FP8_BWD_DU_E5M2 (default off): the e5m2 du
+    producer for the ordinary layer (hstu_du_e5m2.py).
 
     `_ln_mul_dropout_bwd_dx_du_rng_v2` specialised to the production contract
     (TRAINING, CONCAT_U and CONCAT_X, MUL_U_ACTIVATION_TYPE "silu", COMPUTE_Y
     False, int8 mask16 mask: bit0 y, bit1 x, bit2 u; BLOCK_D == D, EVEN_D,
-    NUM_STAGES 1, CONTIG False), with:
-      * value-preserving instruction changes: the exact
+    NUM_STAGES 1, CONTIG False) with these fixed choices:
+      * diet (value-preserving instruction changes): the exact
         `_sigmoid_ieee_fast` with the wave-uniform `tl.sigmoid` fallback when
         any d = 1 + exp(-u) is > 2^126 / inf / NaN (as the v2 forward),
         `_keep_bit_and` for the keep bits, the y-plane loaded first and the
@@ -1967,8 +1976,8 @@ def _ln_mul_dropout_bwd_dx_du_rng_v3(
       * rows [N, N_PAD) of the u block are zeroed by a grid-stride tail loop
         (pid, pid + tile_num, ...), so any N_PAD - N is covered.
     Same row -> program assignment as v2 at the same tile_num, so dx and the
-    DW/DB partials are bitwise v2's; payload / amax are byte-equal to
-    bwd_fp8's cast.
+    DW/DB partials are bitwise v2's; the e5m2 payload and amax are bitwise
+    those of `bwd_fp8._quantize_amax_colsum_kernel`.
     """
     pid = tl.program_id(0)
     tile_num = tl.num_programs(0)
@@ -2022,7 +2031,7 @@ def _ln_mul_dropout_bwd_dx_du_rng_v3(
         if SILU_U:
             du_u *= dsilu_u
         du = du_y + du_u
-        # The bf16 value v2 stores, then bwd_fp8's cast ops on it.
+        # The bf16 value v2 stores, then _quantize_amax_colsum_kernel's ops on it.
         du_b = du.to(tl.bfloat16)
         duf = du_b.to(tl.float32)
         acc_col += duf
@@ -2050,7 +2059,7 @@ def _ln_mul_dropout_bwd_dx_du_rng_v3(
     tl.store(PARTIAL_COL + pid64 * D + cols, acc_col, mask=mask)
     mi = tl.max(acc_amax_i, axis=0).to(tl.int32) << 16
     tl.store(PARTIAL_AMAX + pid, mi.to(tl.float32, bitcast=True))
-    # Pad rows [N, N_PAD) of the u block: zero, as bwd_fp8's cast writes them.
+    # Pad rows [N, N_PAD) of the u block: zero, as _quantize_amax_colsum_kernel writes them.
     zero8 = tl.zeros((BLOCK_D,), dtype=tl.float32).to(DZ8.dtype.element_ty)
     for zr in range(N + pid, N_PAD, tile_num):
         tl.store(DZ8 + zr.to(tl.int64) * stride_dz8 + cols, zero8, mask=mask)
@@ -2373,11 +2382,11 @@ def _use_lnmd_bwd_v2() -> bool:
 
 def _use_lnmd_fwd_v2(N: int, needs_sigmoid: bool = True) -> bool:
     """LN*U*dropout forward v2 kernel (separated-mask path, AMD only). Gin
-    default on (yambda_5b.gin); absent or "0" = the old kernel. Used
+    default on (yambda_5b.gin); absent or "0" = _ln_mul_dropout_fwd_rng. Used
     for N >= 2^20 rows when the kernel computes sigmoid(u) (silu/sigmoid
-    activation or silu_u with concat_u): below 2^20 rows the old kernel is
-    already at the copy-bandwidth floor, and without sigmoid v2 has nothing
-    to save and its rstd is not bitwise equal to the old kernel's.
+    activation or silu_u with concat_u): below 2^20 rows _ln_mul_dropout_fwd_rng
+    is bandwidth bound, and without sigmoid v2's rstd is not bitwise equal to
+    _ln_mul_dropout_fwd_rng's.
     DLRM_HSTU_FP8_LNMD_FWD_V2=0 restores _ln_mul_dropout_fwd_rng everywhere."""
     return (
         needs_sigmoid
@@ -2450,15 +2459,15 @@ def _use_lnmd_fwd_maskgen(
     """DLRM_HSTU_FP8_LNMD_FWD_MASKGEN (gin default on): run
     _ln_mul_dropout_fwd_maskgen (one launch, byte-identical int8 mask / e4m3 y /
     mean / rstd) instead of _generate_random_mask16 + _ln_mul_dropout_fwd_rng_v3
-    (or _v2). Arms only where the unfused code would run exactly that pair for
-    the configuration the kernel implements: the separated-RNG training branch
-    with the full-row generator (no rng_row_indices), mask16, the v2
-    (_use_lnmd_fwd_v2) condition, concat_u and concat_x, silu_u either way (the STU layers pass
+    (or _v2). Arms only where the knob-off code would run exactly that pair for the
+    configuration the kernel implements: the separated-RNG training branch with
+    the full-row generator (no rng_row_indices), mask16, _use_lnmd_fwd_v2's
+    condition, concat_u and concat_x, silu_u either way (the STU layers pass
     True; SILU_U constexpr), 'silu' activation, e4m3 output, D == BLOCK_D ==
     512, unit column strides, bf16 x/u, 1 <= K16 <= 65535, N < 11,184,810
     (int32 Philox counter base; see _LNMD_FWD_MASKGEN_MAX_N) and a gfx950
     device (the kernel's asm). Anything else returns False and the caller runs
-    the unfused code unchanged; =0 (or absent) restores generator + v3 / v2
+    the generator + v3 / v2 launches unchanged; =0 (or absent) restores generator + v3 / v2
     everywhere (any other value arms). This gate does not consult
     _use_lnmd_fwd_v3: with DLRM_HSTU_FP8_LNMD_FWD_V3=0 it still arms and runs
     v3's row arithmetic. y/mean/rstd equal v3's bytes, and v2's for a
@@ -2631,6 +2640,52 @@ def _create_indexed_dropout_mask(
     return random_mask
 
 
+def _eval_lnmd_fwd_v3(
+    N: int,
+    D: int,
+    BLOCK_D: int,
+    silu_u: bool,
+    concat_u: bool,
+    mul_u_activation_type: str,
+) -> bool:
+    """DLRM_HSTU_FP8_EVAL_LNMD_V3 (ops/eval_lnmd_v3.py; default OFF, a declared
+    eval-only numerics change): whether a training=False call runs
+    _ln_mul_dropout_fwd_rng_v3 with TRAINING=False instead of the
+    per-row _ln_mul_dropout_fwd. Called only with training=False. The
+    eligibility is the one the training branch requires to reach its v3
+    launch: not FUSE_OUTPUT_LN_RNG_BLACKWELL, a separated-RNG GPU,
+    _use_lnmd_fwd_v2's condition, BLOCK_D == D and
+    _use_lnmd_fwd_v3 (the maskgen kernel is training-only: it generates the
+    dropout mask). With the switch off nothing after the env read runs."""
+    if not eval_lnmd_v3_enabled():
+        return False
+    if (
+        not FUSE_OUTPUT_LN_RNG_BLACKWELL
+        and use_separated_rng_ln_mul_dropout()
+        and _use_lnmd_fwd_v2(
+            N,
+            mul_u_activation_type in ("silu", "sigmoid") or (concat_u and silu_u),
+        )
+        and BLOCK_D == D
+        and _use_lnmd_fwd_v3()
+    ):
+        log_eval_lnmd_v3_armed()
+        return True
+    # Reported once when v3 cannot run on this configuration at all. A call
+    # refused only by its shape (N < 2^20 rows, no sigmoid activation, BLOCK_D
+    # != D) takes _ln_mul_dropout_fwd silently, as its training forward keeps
+    # the non-v3 launches.
+    if FUSE_OUTPUT_LN_RNG_BLACKWELL:
+        log_eval_lnmd_v3_ignored("FUSE_OUTPUT_LN_RNG_BLACKWELL is set")
+    elif not use_separated_rng_ln_mul_dropout():
+        log_eval_lnmd_v3_ignored("not a separated-RNG GPU (gfx950 / sm_100)")
+    elif not _use_lnmd_fwd_v2(1 << 20, True):
+        log_eval_lnmd_v3_ignored("DLRM_HSTU_FP8_LNMD_FWD_V2 off or not ROCm")
+    elif not _use_lnmd_fwd_v3():
+        log_eval_lnmd_v3_ignored("DLRM_HSTU_FP8_LNMD_FWD_V3 off")
+    return False
+
+
 @maybe_register_custom_op(
     "generative_recommenders::_triton_layer_norm_mul_dropout_fwd_impl", mutates_args=()
 )
@@ -2703,7 +2758,7 @@ def _triton_layer_norm_mul_dropout_fwd_impl(
             rng_row_indices,
             output_fp8,
         ):
-            # MASKGEN: one launch writes the int8 mask (the bytes
+            # One launch writes the int8 mask (the bytes
             # _create_dropout_mask's _generate_random_mask16 would write, from
             # the same seed) and y/mean/rstd (the bytes v3/v2 would write).
             random_mask = torch.empty([N, D], dtype=torch.int8, device=x.device)
@@ -2711,7 +2766,7 @@ def _triton_layer_norm_mul_dropout_fwd_impl(
             kk2 = (keep_min16 - 1) * 0x10001  # both u16 halves, as int32
             if kk2 >= 2**31:
                 kk2 -= 2**32
-            # pyre-ignore[28]
+            if _lnmd_fwd_maskgen_pk_try(x, u, y, weight, bias, mean, rstd, random_mask, N, D, eps, dropout_ratio, inv_scale, keep_min16, kk2, seed, BLOCK_D, concat_u, concat_x, mul_u_activation_type, output_fp8, silu_u): return y, mean, rstd, random_mask  # noqa: E501,E701  DLRM_HSTU_FP8_MASKGEN_PK, default off (defined at module end)
             _ln_mul_dropout_fwd_maskgen[(triton.cdiv(N, 8),)](
                 x,
                 u,
@@ -2870,6 +2925,45 @@ def _triton_layer_norm_mul_dropout_fwd_impl(
     else:
         if rng_row_indices.numel() > 0 and training:
             raise RuntimeError("indexed output dropout requires separated RNG masks")
+        if not training and _eval_lnmd_fwd_v3(
+            N, D, BLOCK_D, silu_u, concat_u, mul_u_activation_type
+        ):
+            # DLRM_HSTU_FP8_EVAL_LNMD_V3: the training branch's v3 launch with
+            # TRAINING=False (no dropout step). RANDOM_MASK is never read with
+            # TRAINING=False; the empty placeholder and its stride are passed
+            # where the training branch passes its mask.
+            # pyre-ignore[28]
+            _ln_mul_dropout_fwd_rng_v3[(min(N, _LNMD_FWD_V3_GRID_MULT * _num_cus(x.device.index if x.device.index is not None else torch.cuda.current_device())),)](
+                x,
+                u,
+                y,
+                weight,
+                bias,
+                mean,
+                rstd,
+                random_mask,
+                N,
+                D,
+                eps,
+                dropout_ratio,
+                x.stride(0),
+                u.stride(0),
+                y.stride(0),
+                random_mask.stride(0),
+                float(inv_scale),
+                SILU_U=silu_u,
+                BLOCK_D=BLOCK_D,
+                TRAINING=False,
+                CONCAT_U=concat_u,
+                CONCAT_X=concat_x,
+                MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
+                OUTPUT_FP8=output_fp8,
+                PF2=False,
+                PF_MASK=False,
+                EVEN_D=BLOCK_D == D,
+                num_warps=1,
+            )
+            return y, mean, rstd, random_mask
         # Default path: fused RNG generation
         # Mask cannot be saved with fused RNG - it's generated inline in the kernel
         # pyre-ignore[28]
@@ -3663,8 +3757,7 @@ def _du_e5m2_plan(
     du_row_width: int,
     compute_y: bool,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, Tuple[object, int]]]:
-    """du-producer (DLRM_HSTU_FP8_BWD_DU_E5M2) eligibility, decided BEFORE the
-    bf16 du store is given up.
+    """e5m2-du eligibility, decided BEFORE the bf16 du store is given up.
 
     (inv_scale, cast_scale snapshot, scale generation) when the LN*U*dropout
     backward of this ordinary-layer call may emit e5m2 du, else None (the
@@ -3761,14 +3854,13 @@ def _triton_layer_norm_mul_dropout_bwd_du_e5m2(
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, "hstu_du_e5m2.DuE5m2Emit"
 ]:
-    """du-producer host side of `_ln_mul_dropout_bwd_dx_du_rng_v3` (contract
-    checked by `_du_e5m2_plan`) -> (dx, du, dweight, dbias, emission record).
+    """e5m2-du host side of `_ln_mul_dropout_bwd_dx_du_rng_v3` (contract checked
+    by `_du_e5m2_plan`) -> (dx, du, dweight, dbias, emission record).
 
     `du` is `hstu_du_e5m2.placeholder_du` (N, D), a stride-0 view of one
     cached NaN element: NO bf16 du is written and NO (N, du_row_width) d(uvqk)
-    buffer is allocated (it would coexist with dz8 and raise the step peak;
-    the preprocess backward allocates its d(uvqk) later, outside this
-    window). Only the returned
+    buffer is allocated here (it would coexist with dz8 at the step peak; the
+    preprocess backward allocates its d(uvqk) later). Only the returned
     record (dz8 [Mp, du_row_width] e5m2 with the u block and its pad rows
     written, u amax, u colsum; buffer_ptr 0) may be consumed. Same tile_num,
     launch width and stock `_ln_mul_dropout_bwd_dwdb` finalize as the v2
@@ -4563,18 +4655,16 @@ def _l11_self_check(e5: Optional[bool] = None) -> Tuple[bool, str]:
     most 1e-4 of its elements; dW/dB relL2 vs the chain <= 1e-3; all outputs
     finite; du columns 512..2047 of the d(uvqk) buffer untouched.
 
-    e5 (None = when the du producer DLRM_HSTU_FP8_BWD_DU_E5M2 is enabled, i.e.
-    when the backward can route a call to the e5m2-du mode): the same for the
-    E5 instantiation of the same .so, against the du producer
-    _triton_layer_norm_mul_dropout_bwd_du_e5m2 with a synthetic
-    non-power-of-two inv_scale (no FP8 scale state is read or written; the
-    records are never consumed): the e5m2 u block of dz8 incl. its pad rows,
-    the u amax and dx bitwise vs the du producer on L11's own dy; the u block
-    bitwise vs the du producer on hipBLASLt's dy on the data-parallel rows;
-    dz8 columns 512..2047 untouched (a raw launch into a prefilled dz8, bitwise
-    equal to the entry's record); u colsum relL2 vs the du producer <= 1e-5
-    (declared fp32 order); dW/dB relL2 vs the chain <= 1e-3; the record's
-    fields as the du producer's; finite."""
+    e5 (None = when DLRM_HSTU_FP8_BWD_DU_E5M2 is enabled, i.e. when the backward can
+    route a call to the e5m2-du mode): the same for the E5 instantiation of the
+    same .so, against the e5m2-du producer _triton_layer_norm_mul_dropout_bwd_du_e5m2
+    with a synthetic non-power-of-two inv_scale (no FP8 scale state is read or
+    written; the records are never consumed): the e5m2 u block of dz8 incl. its
+    pad rows, the u amax and dx bitwise vs the producer on L11's own dy; the u block
+    bitwise vs the producer on hipBLASLt's dy on the data-parallel rows; dz8 columns
+    512..2047 untouched (a raw launch into a prefilled dz8, bitwise equal to the
+    entry's record); u colsum relL2 vs the producer <= 1e-5 (declared fp32 order); dW/dB
+    relL2 vs the chain <= 1e-3; the record's fields as the producer's; finite."""
     dev = torch.device("cuda", torch.cuda.current_device())
     M, Dm, p = _L11_SELF_CHECK_M, 512, 0.1
     g = torch.Generator(device=dev)
@@ -4697,7 +4787,7 @@ def _l11_self_check(e5: Optional[bool] = None) -> Tuple[bool, str]:
         e5 = bwd_fp8.du_producer_enabled() and hstu_du_e5m2.broken() is None
     if not e5:
         return ok, detail + "; e5 not checked (du e5m2 producer off)"
-    # E5 mode (du-producer contract), same inputs. inv_scale: 0.7371 * 2^floor(log2(
+    # E5 mode (e5m2-du contract), same inputs. inv_scale: 0.7371 * 2^floor(log2(
     # 57344 / max|bf16 du|)) (not a power of two: the multiply rounds).
     grad_dtype, limit = bwd_fp8.grad_dtype_and_limit()
     pad = bwd_fp8.uvqk_tm_pad()
@@ -4828,6 +4918,21 @@ def prebuild_l11() -> bool:
     return l11_outproj_lnmd.prebuild(_l11_self_check, static_ok)
 
 
+def prebuild_l11_do8() -> bool:
+    """DLRM_HSTU_FP8_L11_DO8: build + load + self-check L11's
+    dO8/E8 emission variant before RUN_START (triton_fp8.prebuild_extensions,
+    right after prebuild_l11). Its own .so, flags, resource gate, self-check and
+    latch (ops/hip/l11_do8.py): a failure latches DO8 off, never L11. No-op
+    without the knob; INERT line without a prebuilt L11 or without the
+    e5m2-du mode (the only mode DO8 has a variant for)."""
+    if not l11_do8.requested():
+        return False
+    return l11_do8.prebuild(
+        l11_ready=l11_outproj_lnmd.enabled() and l11_outproj_lnmd.prebuilt(),
+        e5_expected=bwd_fp8.du_producer_enabled() and hstu_du_e5m2.broken() is None,
+    )
+
+
 def _l11_du_e5m2_or_none(
     g8: torch.Tensor,
     w8: torch.Tensor,
@@ -4859,15 +4964,15 @@ def _l11_du_e5m2_or_none(
         "hstu_du_e5m2.DuE5m2Emit",
     ]
 ]:
-    """L11 e5m2-du mode (together with the du producer DLRM_HSTU_FP8_BWD_DU_E5M2).
+    """L11 e5m2-du mode (L11 together with DLRM_HSTU_FP8_BWD_DU_E5M2).
 
     Called by HSTUComputeOutputFunction.backward on an L11-eligible call
-    (decline_reason None, FP8 operands cast) for which the du producer's
-    `_du_e5m2_plan` returned its plan, i.e. the du producer would emit this
-    call's e5m2 u block. The keyword arguments are EXACTLY those the backward
-    passes to `_triton_layer_norm_mul_dropout_bwd_du_e5m2` for this call
-    (x = attn, weight/bias = the LN weight/bias, ctx.BLOCK_D / num_warps /
-    dropout_ratio / silu_u, site_key = the du-producer site key, inv_scale /
+    (decline_reason None, FP8 operands cast) for which `_du_e5m2_plan`
+    returned its plan, i.e. the e5m2-du path would emit this call's e5m2 u block. The
+    keyword arguments are EXACTLY those the backward passes to
+    `_triton_layer_norm_mul_dropout_bwd_du_e5m2` for this call (x = attn,
+    weight/bias = the LN weight/bias, ctx.BLOCK_D / num_warps /
+    dropout_ratio / silu_u, site_key = the e5m2-du site key, inv_scale /
     cast_scale / generation = the plan), with the dgrad operands (g8, w8,
     g8_scale, w8_scale: e5m2 dout [M, 512], e4m3 W [1536, 512] and their
     decode scales, the cast's outputs) in place of dy.
@@ -4886,16 +4991,15 @@ def _l11_du_e5m2_or_none(
     rows written with inv_scale), u_cols (0, 512), u_amax, u_colsum [512]
     fp32, inv_scale, cast_scale, rows M, width du_row_width, site_key,
     generation, buffer_ptr 0). The caller then skips the dgrad GEMM and
-    attaches the record exactly as on the du producer's path. Numerics vs
-    that chain: payload (incl. pad rows), amax and dx bitwise on hipBLASLt's
-    data-parallel rows (bitwise vs the du producer on the same dy
-    everywhere), SK3-tail rows in dy's
-    fp32 order; u colsum and dW/dB a declared fp32 reduction order.
+    attaches the record exactly as on the e5m2-du path. Numerics vs that chain:
+    payload (incl. pad rows), amax and dx bitwise on hipBLASLt's data-parallel
+    rows (bitwise vs the e5m2-du producer on the same dy everywhere), stream-K
+    tail rows in dy's fp32 order; u colsum and dW/dB a declared fp32 reduction order.
 
     None = nothing emitted and no state touched (all outputs are the entry's
     own fresh buffers; no FP8 scale state is read or written beyond the
     plan): the caller runs the dgrad GEMM on the same operands and then the
-    du producer's unchanged path. That happens with the knob off, without the prebuild,
+    unchanged e5m2-du path. That happens with the knob off, without the prebuild,
     after a latch, or when run_e5 declines (its own E5 checks, one NOT armed
     line per reason) or fails (it latches L11 off for the process with one
     DISABLED line and returns None; it never raises unless
@@ -4929,6 +5033,79 @@ def _l11_du_e5m2_or_none(
         )
 
 
+def _l11_do8_e5_or_none(
+    g8: torch.Tensor,
+    w8: torch.Tensor,
+    g8_scale: torch.Tensor,
+    w8_scale: torch.Tensor,
+    *,
+    site: object,
+    x: torch.Tensor,
+    u: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    BLOCK_D: int,
+    num_warps: int,
+    dropout_ratio: float,
+    silu_u: bool,
+    random_mask: torch.Tensor,
+    du_row_width: int,
+    site_key: int,
+    inv_scale: torch.Tensor,
+    cast_scale: torch.Tensor,
+    generation: Optional[Tuple[object, int]],
+) -> Optional[
+    Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        "hstu_du_e5m2.DuE5m2Emit",
+        torch.Tensor,
+        torch.Tensor,
+    ]
+]:
+    """DO8 (DLRM_HSTU_FP8_L11_DO8) in place of
+    _l11_du_e5m2_or_none on an e5m2-du call whose attention backward plans the
+    C8 do_blk dO quantization (`site`: l11_do8.emission_site, decided before
+    the launch). Same keywords and the same first five return values as
+    _l11_du_e5m2_or_none (one l11_outproj_lnmd_bwd_do8 launch instead of L11's
+    E5 launch), plus (dO8 [M, 512] e4m3fn, E8 [M, 4] uint8) for the caller to
+    publish after its last write to d(attn). None = nothing emitted, nothing
+    visible (fresh buffers only): DO8 declined or failed (latched off: DO8
+    only), and the caller runs _l11_du_e5m2_or_none on the same operands."""
+    if site is None or not (
+        l11_outproj_lnmd.enabled() and l11_outproj_lnmd.prebuilt()
+    ):
+        return None
+    with record_function("## hstu_l11_outproj_lnmd_bwd ##"):
+        return l11_do8.run_e5_plus(
+            g8,
+            w8,
+            g8_scale,
+            w8_scale,
+            x,
+            u,
+            weight,
+            bias,
+            mean,
+            rstd,
+            BLOCK_D,
+            num_warps,
+            dropout_ratio,
+            silu_u,
+            random_mask,
+            du_row_width,
+            site_key,
+            inv_scale,
+            cast_scale,
+            generation,
+            site,
+        )
+
+
 class HSTUComputeOutputFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
@@ -4954,6 +5131,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         recompute_y_in_backward: bool = False,
         rng_row_indices: Optional[torch.Tensor] = None,
         fp8_output_scale: Optional[torch.Tensor] = None,
+        need_bwd: bool = True,
     ) -> torch.Tensor:
         if dropout_ratio == 0.0:
             training = False
@@ -5115,9 +5293,11 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
             saved_tensors.append(y)
         # FP8 output wgrad: keep the e4m3 y the forward GEMM consumed, plus its
         # dequant scale as a device value (fp8_scale_value is the host float the
-        # cast used; a fill launches no sync).
+        # cast used; a fill launches no sync). Not when no backward can run
+        # (need_bwd=False: DLRM_HSTU_FP8_EVAL_FWD_HYGIENE, decided by the wrapper).
         fp8_y_saved = (
-            _FP8_OUT_WGRAD
+            need_bwd
+            and _FP8_OUT_WGRAD
             and use_fp8
             and fp8_scale_value is not None
             and bwd_fp8.scale_controller_enabled()
@@ -5172,6 +5352,12 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
             # The layer's uvqk site handle (hstu_du_e5m2.DuE5m2Site)
             # the preprocess forward tagged when it planned the fp8t wgrad.
             ctx.du_e5m2_site = getattr(u, HSTU_DUVQK_SITE_ATTR, None)
+        # DO8 (DLRM_HSTU_FP8_L11_DO8): the dO8 site the
+        # attention forward tagged on this call's attention output (carried to
+        # the `attn` view; hstu_do8_registry.site_of). None with the knob off,
+        # without the registry, or when the attention backward does not plan
+        # the C8 do_blk dO quantization (e.g. the targets-only layer).
+        ctx.do8_site = l11_do8.site_of(attn)
         return out
 
     @staticmethod
@@ -5199,6 +5385,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         None,  # recompute_y_in_backward
         None,  # rng_row_indices
         None,  # fp8_output_scale
+        None,  # need_bwd
     ]:
         attn, u, norm_weight, norm_bias, mean, rstd, output_weight = ctx.saved_tensors[
             :7
@@ -5223,19 +5410,22 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         # L11 (DLRM_HSTU_FP8_BWD_OUTPROJ_LNMD_FUSED): the FP8 dgrad
         # and the LN*U*dropout backward below run as ONE fused kernel (dy never
         # in HBM). Every dispatch condition is host metadata checked BEFORE the
-        # cast; a decline runs the unfused code unchanged, a latched failure
-        # runs the unfused dgrad on the already-cast operands, then the unfused
-        # LN*U*dropout backward. With the du producer (DLRM_HSTU_FP8_BWD_DU_E5M2),
-        # its plan for this call is evaluated once, between the cast and the
-        # GEMM: no plan (du producer off or declined) -> L11's bf16-du mode; a
-        # plan -> L11's e5m2-du mode (_l11_du_e5m2_or_none -> run_e5: the du
-        # producer's emission contract, no GEMM; None if it declines or
-        # latched: the GEMM, then the du producer's path unchanged).
+        # cast; a decline runs the unfused code unchanged, a latched failure runs
+        # the unfused dgrad on the already-cast operands, then the unfused LN*U*dropout
+        # backward. With DLRM_HSTU_FP8_BWD_DU_E5M2, the e5m2-du plan for this call is
+        # evaluated once, between the cast and the GEMM: no plan (e5m2 du off or
+        # declined) -> L11's bf16-du mode; a plan -> L11's e5m2-du mode
+        # (_l11_du_e5m2_or_none -> run_e5: the e5m2-du emission contract, no GEMM;
+        # None if it declines or latched: the GEMM, then the e5m2-du path unchanged).
         l11_out = None
         l11_e5 = None
         l11_go = False
         l11_du_planned = False
         du_plan = None
+        # DO8: (site, dO8, E8) of an emitting e5m2-du call,
+        # published below after the last write to dattn.
+        l11_do8_pair = None
+        l11_do8_out = None
         if fp8_y_saved and l11_outproj_lnmd.requested():
             l11_why = l11_outproj_lnmd.decline_reason(
                 ctx,
@@ -5272,7 +5462,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                     g8, g8_scale, dout_fp8, dout_fp8_scale, w8, w8_scale = l11_ops
                     l11_site = getattr(ctx, "du_e5m2_site", None)
                     if l11_site is not None:
-                        # The du producer's plan for this call, decided here instead of
+                        # The e5m2-du plan for this call, decided here instead of
                         # after the GEMM (it reads host state and dy's
                         # metadata only: [M, 1536] in dout's dtype, as the
                         # GEMM returns). compute_y is False: dout_fp8 is set
@@ -5293,6 +5483,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                         )
                         l11_du_planned = True
                     if du_plan is None:
+                        l11_do8.note_bf16_mode(ctx)  # DO8: no bf16-du variant
                         with record_function("## hstu_l11_outproj_lnmd_bwd ##"):
                             l11_out = l11_outproj_lnmd.run(
                                 g8,
@@ -5309,8 +5500,44 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                                 ctx.dropout_ratio,
                                 _alloc_du,
                             )
+                    elif l11_do8.requested() and (
+                        l11_do8_out := _l11_do8_e5_or_none(
+                            g8,
+                            w8,
+                            g8_scale,
+                            w8_scale,
+                            # DO8: decided here, before the launch (host
+                            # metadata only); None -> L11's own e5 launch below
+                            site=l11_do8.emission_site(ctx, attn),
+                            x=attn,
+                            u=u,
+                            weight=norm_weight,
+                            bias=norm_bias,
+                            mean=mean,
+                            rstd=rstd,
+                            BLOCK_D=ctx.BLOCK_D,
+                            num_warps=ctx.num_warps,
+                            dropout_ratio=ctx.dropout_ratio,
+                            silu_u=ctx.silu_u,
+                            random_mask=random_mask,
+                            du_row_width=getattr(ctx, "du_row_width", 0),
+                            site_key=l11_site.key,
+                            inv_scale=du_plan[0],
+                            cast_scale=du_plan[1],
+                            generation=du_plan[2],
+                        )
+                    ) is not None:
+                        # DO8: the e5m2-du mode's record + d(attn) as from
+                        # _l11_du_e5m2_or_none, and dO8/E8 to publish below.
+                        l11_e5 = l11_do8_out[:5]
+                        l11_do8_pair = (
+                            ctx.do8_site,
+                            l11_do8_out[5],
+                            l11_do8_out[6],
+                        )
+                        l11_do8_out = None
                     else:
-                        # The keywords of the du producer's call below, the cast's
+                        # The keywords of the e5m2-du call below, the cast's
                         # operands instead of dy.
                         l11_e5 = _l11_du_e5m2_or_none(
                             g8,
@@ -5419,8 +5646,8 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
             du_site = getattr(ctx, "du_e5m2_site", None)
             du_emit = None
             if l11_e5 is not None:
-                # L11 e5m2-du mode: the du producer's emission contract,
-                # produced without the dgrad GEMM.
+                # L11 e5m2-du mode: the e5m2-du
+                # emission contract, produced without the dgrad GEMM.
                 dattn, du, d_norm_weight, d_norm_bias, du_emit = l11_e5
                 y = None
                 du_plan = None
@@ -5500,7 +5727,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                 )
             _tag_duvqk_buffer(du, du_row_width)
             if du_emit is not None:
-                # du is the stride-0 placeholder (no bf16 du, no d(uvqk)
+                # e5m2 du: du is the stride-0 placeholder (no bf16 du, no d(uvqk)
                 # buffer, hence no BUFFER tag above: stride(0) == 0); the
                 # record is the only valid u gradient. The preprocess backward
                 # allocates its own d(uvqk) and never reads du.
@@ -5508,6 +5735,15 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                 setattr(du, HSTU_DU_E5M2_ATTR, du_emit)
                 du_site.emitted = du_emit.token
                 du_emit = None
+            if l11_do8_pair is not None:
+                # DO8: dattn is final here (nothing below
+                # writes it; it is returned as d(attn)): hand dO8/E8 to the C8
+                # attention backward (hstu_do8_registry.publish, 'plus';
+                # a refusal is counted and the attention backward quantizes).
+                l11_do8.publish(
+                    l11_do8_pair[0], dattn, l11_do8_pair[1], l11_do8_pair[2]
+                )
+                l11_do8_pair = None
         if not ctx.recompute_y_in_backward:
             y = saved_y
         with record_function("## hstu_output_projection_backward ##"):
@@ -5659,6 +5895,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
             None,  # recompute_y_in_backward
             None,  # rng_row_indices
             None,  # fp8_output_scale
+            None,  # need_bwd
         )
 
 
@@ -6276,6 +6513,18 @@ def triton_hstu_compute_output(
     rng_row_indices: Optional[torch.Tensor] = None,
     fp8_output_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    # DLRM_HSTU_FP8_EVAL_FWD_HYGIENE: decided here, not in the Function's
+    # forward (grad mode is off in there). Training forwards never read it.
+    need_bwd = backward_possible(
+        attn,
+        u,
+        x,
+        norm_weight,
+        norm_bias,
+        output_weight,
+        rng_row_indices,
+        fp8_output_scale,
+    ) or not eval_fwd_hygiene_enabled()
     return HSTUComputeOutputFunction.apply(
         attn,
         u,
@@ -6297,4 +6546,604 @@ def triton_hstu_compute_output(
         recompute_y_in_backward,
         rng_row_indices,
         fp8_output_scale,
+        need_bwd,
     )
+
+
+# =============================================================================
+# DLRM_HSTU_FP8_MASKGEN_PK (set in yambda_5b.gin; code default off). The hook
+# in _triton_layer_norm_mul_dropout_fwd_impl calls _lnmd_fwd_maskgen_pk_try below.
+# With DLRM_HSTU_FP8_MASKGEN_PK absent or "0" that call returns False after
+# one lazy environment read per process and the
+# _ln_mul_dropout_fwd_maskgen launch runs unchanged; the kernels below are
+# defined (triton.jit wrappers) but never compiled or launched.
+# =============================================================================
+import math  # noqa: E402
+import struct  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# DLRM_HSTU_FP8_MASKGEN_PK (absent or =0 = _ln_mul_dropout_fwd_maskgen above).
+# _ln_mul_dropout_fwd_maskgen_pk is a bitwise-equal, fewer-VALU variant of that
+# kernel: same launch arguments, grid, Philox counters and per-row arithmetic,
+# same int8 mask / e4m3 y / mean / rstd bytes. The dropout is applied on the
+# e4m3 bytes instead of in the fp32 domain.
+# Gate: _use_lnmd_fwd_maskgen_pk, consulted only on calls _use_lnmd_fwd_maskgen
+# armed.
+
+
+@triton.jit
+def _mg_sp(t, H: tl.constexpr):
+    """[1, 2H] -> ([1, H] even columns, [1, H] odd columns): a register split inside each lane."""
+    return tl.split(tl.reshape(t, [1, H, 2]))
+
+
+@triton.jit
+def _mg_p2(lo, hi):
+    """two fp32 tensors -> uint64 (lo in bits 0-31): one 64-bit VGPR pair."""
+    return lo.to(tl.uint32, bitcast=True).to(tl.uint64) | (hi.to(tl.uint32, bitcast=True).to(tl.uint64) << 32)
+
+
+@triton.jit
+def _mg_bc(s):
+    """fp32 scalar -> uint64 with the value in the low dword (consumers broadcast it with op_sel_hi)."""
+    return s.to(tl.uint32, bitcast=True).to(tl.uint64)
+
+
+@triton.jit
+def _mg_lo(p):
+    return p.to(tl.uint32).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _mg_hi(p):
+    return (p >> 32).to(tl.uint32).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _mg_pk_mul(a, b):
+    """(a.lo * b.lo, a.hi * b.hi): IEEE RNE per half, the bits of two v_mul_f32."""
+    return tl.inline_asm_elementwise("v_pk_mul_f32 $0, $1, $2", "=v,v,v", [a, b],
+                                     dtype=tl.uint64, is_pure=True, pack=1)
+
+
+@triton.jit
+def _mg_pk_mul_b(a, s):
+    """(a.lo * s.lo, a.hi * s.lo)"""
+    return tl.inline_asm_elementwise("v_pk_mul_f32 $0, $1, $2 op_sel_hi:[1,0]", "=v,v,v", [a, s],
+                                     dtype=tl.uint64, is_pure=True, pack=1)
+
+
+@triton.jit
+def _mg_pk_nmul_b(a, s):
+    """((-a.lo) * s.lo, (-a.hi) * s.lo): _ln_mul_dropout_fwd_maskgen's -u * log2(e) (v_mul_f32_e64 -u, c) per half."""
+    return tl.inline_asm_elementwise("v_pk_mul_f32 $0, $1, $2 op_sel_hi:[1,0] neg_lo:[1,0] neg_hi:[1,0]",
+                                     "=v,v,v", [a, s], dtype=tl.uint64, is_pure=True, pack=1)
+
+
+@triton.jit
+def _mg_pk_fma(a, b, c):
+    return tl.inline_asm_elementwise("v_pk_fma_f32 $0, $1, $2, $3", "=v,v,v,v", [a, b, c],
+                                     dtype=tl.uint64, is_pure=True, pack=1)
+
+
+@triton.jit
+def _mg_pk_add1(a):
+    """a + 1.0 per half (_ln_mul_dropout_fwd_maskgen: the same v_pk_add_f32 ..., 1.0 op_sel_hi:[1,0])."""
+    return tl.inline_asm_elementwise("v_pk_add_f32 $0, $1, 1.0 op_sel_hi:[1,0]", "=v,v", [a],
+                                     dtype=tl.uint64, is_pure=True, pack=1)
+
+
+@triton.jit
+def _mg_pk_nfma1(d, r):
+    """fma(-d, r, 1.0) per half with -d as a neg modifier. _ln_mul_dropout_fwd_maskgen materializes 0 - d first (one
+    more v_pk_add_f32); identical for every d the fast path keeps (d in [1, 2^126]); any other d takes the
+    wave-uniform tl.sigmoid fallback, which discards this chain."""
+    return tl.inline_asm_elementwise(
+        "v_pk_fma_f32 $0, $1, $2, 1.0 op_sel_hi:[1,1,0] neg_lo:[1,0,0] neg_hi:[1,0,0]", "=v,v,v", [d, r],
+        dtype=tl.uint64, is_pure=True, pack=1)
+
+
+@triton.jit
+def _mg_perm(s0, s1, sel):
+    return tl.inline_asm_elementwise("v_perm_b32 $0, $1, $2, $3", "=v,v,v,s", [s0, s1, sel],
+                                     dtype=tl.int32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _mg_or_and_s(a, m, b):
+    """(a | b) & m in one v_bitop3_b32 (table 0xC8 = (S0 | S2) & S1, symmetric in S0 / S2); m in an SGPR."""
+    return tl.inline_asm_elementwise("v_bitop3_b32 $0, $1, $2, $3 bitop3:0xc8", "=v,v,s,v", [a, m, b],
+                                     dtype=tl.int32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _mg_bytemask(m, sel, J: tl.constexpr):
+    """byte k = 0xFF if bit J of byte k of the mask dword m is set, else 0x00. V = (m, m << 8) as a 64-bit
+    pair; V << (7 - J) puts bit J of bytes 1/3 at bit 7 of the low dword's bytes 1/3 and bit J of bytes 0/2 at
+    bit 7 of the high dword's bytes 1/3 (plus <= 2 spilled bits of m in high-dword bits 0-1, never read);
+    v_perm_b32 codes 8-11 (sel = 0x090B080A) broadcast those sign bits to whole bytes."""
+    v = m.to(tl.uint32, bitcast=True).to(tl.uint64) | ((m << 8).to(tl.uint32, bitcast=True).to(tl.uint64) << 32)
+    if J == 0:
+        v = tl.inline_asm_elementwise("v_lshlrev_b64 $0, 7, $1", "=v,v", [v], dtype=tl.uint64, is_pure=True, pack=1)
+    elif J == 1:
+        v = tl.inline_asm_elementwise("v_lshlrev_b64 $0, 6, $1", "=v,v", [v], dtype=tl.uint64, is_pure=True, pack=1)
+    else:
+        v = tl.inline_asm_elementwise("v_lshlrev_b64 $0, 5, $1", "=v,v", [v], dtype=tl.uint64, is_pure=True, pack=1)
+    s1 = v.to(tl.uint32).to(tl.int32, bitcast=True)
+    s0 = (v >> 32).to(tl.uint32).to(tl.int32, bitcast=True)
+    return tl.inline_asm_elementwise("v_perm_b32 $0, $1, $2, $3", "=v,v,v,v", [s0, s1, sel],
+                                     dtype=tl.int32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _mg_cvt4(a, b, c, d):
+    """4 fp32 -> 4 e4m3 bytes (a in byte 0): the instruction pair Triton's own e4m3 conversion emits."""
+    return tl.inline_asm_elementwise(
+        "v_cvt_scalef32_pk_fp8_f32 $0, $1, $2, 1.0\n\tv_cvt_scalef32_pk_fp8_f32 $0, $3, $4, 1.0 op_sel:[0,0,0,1]",
+        "=&v,v,v,v,v", [a, b, c, d], dtype=tl.int32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _mg_fp8_sat_mode(g):
+    """MODE bit 23 = 1 (gfx950 fp8 conversions saturate overflow to +-448), which Triton's own e4m3
+    conversion sets at kernel entry; needed because this kernel converts through _mg_cvt4 only."""
+    return tl.inline_asm_elementwise("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1", "=s,s", [g],
+                                     dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _mg_pk_word(pk, r, kk2, one2, sh):
+    """_pk_word with the merge as one v_lshl_or_b32 (_pk_word: v_lshlrev_b32 + v_or3_b32; gfx950
+    issues v_lshlrev_b32 at half rate). _pair_keep_bits unchanged; sh is the SHIFT constant (SGPR). Same
+    pk bits."""
+    pb = _pair_keep_bits(r.to(tl.int32, bitcast=True), kk2, one2)
+    return tl.inline_asm_elementwise("v_lshl_or_b32 $0, $1, $2, $3", "=v,v,s,v", [pb, sh, pk],
+                                     dtype=tl.int32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _row_c32_pk(
+    x_n, u_n, pk, base, row, N, Y, Mean, Rstd, RANDOM_MASK, Wp, Bp, cols4,
+    inv_D, eps, DSp, INVp, L2Ep, BMSEL, D, stride_y, stride_mask,
+    BLOCK_D: tl.constexpr,
+    MUL_U_ACTIVATION_TYPE: tl.constexpr,
+    OUTPUT_FP8: tl.constexpr,
+    SILU_U: tl.constexpr,
+):
+    """One row of _ln_mul_dropout_fwd_maskgen_pk: the bytes _row_c32 writes (the generator's int8 mask byte;
+    _ln_mul_dropout_fwd_rng_v3's y / mean / rstd), packed form:
+      - the int8 mask row is built as 2 dwords per lane: (pk >> base), byte 0 of 4 columns gathered by
+        two v_perm_b32, merged and masked to 3 bits by one v_bitop3, stored as int32;
+      - mean / var / rstd: _row_c32's expressions unchanged (same reduction order and contraction);
+      - per-element fp32 arithmetic on adjacent-column pairs in v_pk_mul_f32 / v_pk_fma_f32 (same IEEE op
+        per element: x_mean * rstd, fma(y, w, b), the fast sigmoid, u * sig, y * silu, * dropout_scale,
+        * Y_INV_SCALE), the fast sigmoid's -d folded into neg modifiers;
+      - dropout applied on the e4m3 bytes: fp8(v * ds * inv) & bytemask, which equals _row_c32's
+        fp8(((v * ds) & keep) * inv) because a dropped element is +0.0 there and +0.0 * inv = +0.0 -> 0x00
+        for every fp32 inv in (0, inf) (the only values _use_lnmd_fwd_maskgen_pk lets through)."""
+    H: tl.constexpr = BLOCK_D // 2
+    Q4: tl.constexpr = BLOCK_D // 4
+    tl.static_assert(MUL_U_ACTIVATION_TYPE == "silu")
+    tl.static_assert(OUTPUT_FP8)
+    rows = row + tl.arange(0, 1)
+    row_mask = rows < N
+    r64 = rows.to(tl.int64)
+    p32 = pk >> base
+    pa, pb = _mg_sp(p32, H)
+    p0, p2 = _mg_sp(pa, Q4)
+    p1, p3 = _mg_sp(pb, Q4)
+    mdw = _mg_or_and_s(_mg_perm(p1, p0, 0x0C0C0400), 0x07070707, _mg_perm(p3, p2, 0x04000C0C))
+    tl.store(RANDOM_MASK.to(tl.pointer_type(tl.int32)) + r64[:, None] * (stride_mask // 4) + cols4,
+             mdw, mask=row_mask[:, None])
+    x_block = x_n.to(tl.float32)
+    u_block = u_n.to(tl.float32)
+    mean = tl.sum(x_block, axis=1) * inv_D
+    tl.store(Mean + rows, mean, mask=row_mask)
+    mean = tl.expand_dims(mean, 1)
+    x_mean = x_block - mean
+    _var = x_mean * x_mean
+    var = tl.sum(_var, axis=1) * inv_D
+    rstd = 1 / tl.sqrt(var + eps)
+    tl.store(Rstd + rows, rstd, mask=row_mask)
+    rstd = tl.expand_dims(rstd, 1)
+    # _sigmoid_ieee_fast on column pairs (same ops per element), wave-uniform tl.sigmoid fallback
+    ue, uo = _mg_sp(u_block, H)
+    U = _mg_p2(ue, uo)
+    NE = _mg_pk_nmul_b(U, L2Ep)
+    E = _mg_p2(_amd_v_exp_f32(_mg_lo(NE)), _amd_v_exp_f32(_mg_hi(NE)))
+    Dd = _mg_pk_add1(E)
+    R = _mg_p2(_amd_v_rcp_f32(_mg_lo(Dd)), _amd_v_rcp_f32(_mg_hi(Dd)))
+    T = _mg_pk_nfma1(Dd, R)
+    R = _mg_pk_fma(T, R, R)
+    T = _mg_pk_nfma1(Dd, R)
+    Q = _mg_pk_fma(T, R, R)
+    T = _mg_pk_nfma1(Dd, Q)
+    SIG = _mg_pk_fma(T, R, Q)
+    # d bits as uint32 > 0x7E800000 <=> d > 2^126, +inf or NaN (any sign)
+    dmax = tl.max(tl.maximum(_mg_lo(Dd).to(tl.uint32, bitcast=True), _mg_hi(Dd).to(tl.uint32, bitcast=True)))
+    if dmax > 0x7E800000:
+        sge, sgo = _mg_sp(tl.sigmoid(u_block), H)
+        SIG = _mg_p2(sge, sgo)
+    xme, xmo = _mg_sp(x_mean, H)
+    Yp = _mg_pk_mul_b(_mg_p2(xme, xmo), _mg_bc(rstd))  # y = x_mean * rstd
+    Yp = _mg_pk_fma(Yp, Wp, Bp)  # y = y * w + b
+    SIL = _mg_pk_mul(U, SIG)  # silu = u * sigmoid(u)
+    Yp = _mg_pk_mul(Yp, SIL)  # y = y * silu
+    if SILU_U:
+        UP = SIL
+    else:
+        UP = U
+    xe, xo = _mg_sp(x_block, H)
+    UF = _mg_pk_mul_b(_mg_pk_mul_b(UP, DSp), INVp)  # (u * dropout_scale) * Y_INV_SCALE
+    XF = _mg_pk_mul_b(_mg_pk_mul_b(_mg_p2(xe, xo), DSp), INVp)
+    YF = _mg_pk_mul_b(_mg_pk_mul_b(Yp, DSp), INVp)
+    ua, ub = _mg_sp(UF, Q4)
+    xa, xb = _mg_sp(XF, Q4)
+    ya, yb = _mg_sp(YF, Q4)
+    u8 = _mg_cvt4(_mg_lo(ua), _mg_hi(ua), _mg_lo(ub), _mg_hi(ub)) & _mg_bytemask(mdw, BMSEL, 2)
+    x8 = _mg_cvt4(_mg_lo(xa), _mg_hi(xa), _mg_lo(xb), _mg_hi(xb)) & _mg_bytemask(mdw, BMSEL, 1)
+    y8 = _mg_cvt4(_mg_lo(ya), _mg_hi(ya), _mg_lo(yb), _mg_hi(yb)) & _mg_bytemask(mdw, BMSEL, 0)
+    y32 = Y.to(tl.pointer_type(tl.int32)) + r64[:, None] * (stride_y // 4) + cols4
+    tl.store(y32, u8, mask=row_mask[:, None])
+    tl.store(y32 + D // 4, x8, mask=row_mask[:, None])
+    tl.store(y32 + D // 2, y8, mask=row_mask[:, None])
+
+
+@triton.jit
+def _ln_mul_dropout_fwd_maskgen_pk(
+    X, U, Y, W, B, Mean, Rstd, RANDOM_MASK,
+    N, D, eps, dropout_ratio,
+    stride_x, stride_u, stride_y, stride_mask,
+    Y_INV_SCALE,
+    keep_min16, kk2_arg, seed,
+    BLOCK_D: tl.constexpr,
+    NUM_MASKS: tl.constexpr,
+    MUL_U_ACTIVATION_TYPE: tl.constexpr,
+    OUTPUT_FP8: tl.constexpr,
+    SILU_U: tl.constexpr,
+):
+    """_ln_mul_dropout_fwd_maskgen (above) with fewer VALU instructions, bitwise equal: the same arguments,
+    grid cdiv(N, 8), num_warps=1 and contract (MUL_U_ACTIVATION_TYPE 'silu' and OUTPUT_FP8 are asserted here;
+    NUM_MASKS=3, BLOCK_D == D == 512 as _use_lnmd_fwd_maskgen guarantees), the same Philox counters, keep
+    decisions and row arithmetic, and the same int8 mask, e4m3 y, mean and rstd bytes. Value-preserving
+    differences:
+      - the keep masks are applied on the e4m3 bytes, fp8(v * ds * inv) & bytemask, instead of
+        fp8(((v * ds) & keep) * inv): a dropped element is +0.0 in _ln_mul_dropout_fwd_maskgen and
+        +0.0 * inv = +0.0 -> 0x00 for every fp32 inv in (0, inf), the only Y_INV_SCALE values the gate lets
+        through; a kept element runs the same IEEE multiplies and the same conversion instruction.
+      - the e4m3 bytes come from v_cvt_scalef32_pk_fp8_f32 (scale 1.0), the instructions Triton's own
+        fp32 -> e4m3 conversion emits, with the MODE bit 23 (saturate) that Triton sets at kernel entry for
+        them set explicitly (_mg_fp8_sat_mode; without it e4m3 overflow gives 0x7F instead of 0x7E).
+      - the int8 mask row is assembled per lane as 2 dwords and stored as int32, the y planes likewise
+        (the gate checks dword alignment of the base pointers and row strides).
+      - the per-element fp32 multiplies / FMAs run on adjacent-column pairs in v_pk_mul_f32 /
+        v_pk_fma_f32 (the same IEEE operation per element); mean / var / rstd keep the same expressions.
+      - the Philox keep-bit merge is one v_lshl_or_b32 per word.
+      - two rows per loop trip: row i + 1's x/u are issued before row i's math, row i + 2's after it
+        (into the registers row i freed: no loop-carried register rotation).
+    Same counter limit as _ln_mul_dropout_fwd_maskgen (N < 11,184,810; _use_lnmd_fwd_maskgen refuses
+    larger N)."""
+    g = tl.program_id(0)
+    H: tl.constexpr = BLOCK_D // 2
+    Q4: tl.constexpr = BLOCK_D // 4
+    _mg_fp8_sat_mode(g)  # e4m3 bytes come from _mg_cvt4 only (see _mg_fp8_sat_mode)
+    cols = tl.arange(0, BLOCK_D)
+    col_mask = cols < BLOCK_D
+    w = tl.load(W + cols, mask=col_mask).to(tl.float32)
+    b = tl.load(B + cols, mask=col_mask).to(tl.float32)
+    inv_D = 1.0 / D
+    dropout_scale = 1.0 / (1.0 - dropout_ratio)
+    row0 = g * 8
+    # loop invariants: column-pair w / b, broadcast scalars, constants
+    we, wo = _mg_sp(w[None, :], H)
+    be, bo = _mg_sp(b[None, :], H)
+    Wp = _mg_p2(we, wo)
+    Bp = _mg_p2(be, bo)
+    DSp = _mg_bc(dropout_scale)
+    INVp = _mg_bc(Y_INV_SCALE)
+    L2Ep = tl.full([1, H], 0x3FB8AA3B, tl.uint64)  # fp32 1.4426950408889634 (_sigmoid_ieee_fast's constant)
+    BMSEL = tl.full([1, Q4], 0x090B080A, tl.int32)
+    cols4 = tl.arange(0, Q4)[None, :]  # int32 dword index of columns 4a..4a+3 (2 dwords per lane)
+
+    # row 0's x/u, issued before the Philox phase
+    xa, ua = _load_row(X, U, row0, N, stride_x, stride_u, cols, col_mask)
+
+    # ---- phase 1: the generator's Philox for this 8-row group, packed per column ----
+    kk2 = tl.full([1, BLOCK_D], 0, tl.int32) + kk2_arg
+    one2 = tl.full([1, BLOCK_D], 0x10001, tl.int32)
+    pk = tl.zeros([1, BLOCK_D], dtype=tl.int32)
+    rand_offset = g * (NUM_MASKS * BLOCK_D) + cols[None, :]
+    # layout anchor (see _ln_mul_dropout_fwd_maskgen): the counters "depend" on the row-0 x load
+    rand_offset = tl.inline_asm_elementwise(
+        "v_mov_b32 $0, $1", "=v,v,v", [rand_offset, xa], dtype=tl.int32, is_pure=True, pack=1
+    )
+    for j in tl.static_range(NUM_MASKS):
+        r0, r1, r2, r3 = _philox4x32_10_b3(rand_offset, seed)
+        pk = _mg_pk_word(pk, r0, kk2, one2, 0 + j)
+        pk = _mg_pk_word(pk, r1, kk2, one2, 3 + j)
+        pk = _mg_pk_word(pk, r2, kk2, one2, 6 + j)
+        pk = _mg_pk_word(pk, r3, kk2, one2, 9 + j)
+        rand_offset += BLOCK_D
+
+    # ---- phase 2: rows 0..7 of the group, two rows per trip ----
+    for i in tl.range(0, 8, 2, num_stages=1):
+        rows_b = row0 + i + 1 + tl.arange(0, 1)
+        m2_b = (rows_b < N)[:, None] & col_mask[None, :]
+        r64_b = rows_b.to(tl.int64)
+        xb = tl.load(X + r64_b[:, None] * stride_x + cols[None, :], mask=m2_b, other=0.0)
+        ub = tl.load(U + r64_b[:, None] * stride_u + cols[None, :], mask=m2_b, other=0.0)
+        # row i (0..3): bits 3i..3i+2; row i (4..7): bits 16+3(i-4)..
+        _row_c32_pk(
+            xa, ua, pk, 3 * (i % 4) + 16 * (i // 4), row0 + i, N, Y, Mean, Rstd, RANDOM_MASK, Wp, Bp, cols4,
+            inv_D, eps, DSp, INVp, L2Ep, BMSEL, D, stride_y, stride_mask,
+            BLOCK_D, MUL_U_ACTIVATION_TYPE, OUTPUT_FP8, SILU_U,
+        )
+        rows_n = row0 + i + 2 + tl.arange(0, 1)
+        m2_n = ((rows_n < N) & (i < 6))[:, None] & col_mask[None, :]
+        r64_n = rows_n.to(tl.int64)
+        xa = tl.load(X + r64_n[:, None] * stride_x + cols[None, :], mask=m2_n, other=0.0)
+        ua = tl.load(U + r64_n[:, None] * stride_u + cols[None, :], mask=m2_n, other=0.0)
+        _row_c32_pk(
+            xb, ub, pk, 3 * ((i + 1) % 4) + 16 * ((i + 1) // 4), row0 + i + 1, N, Y, Mean, Rstd, RANDOM_MASK,
+            Wp, Bp, cols4, inv_D, eps, DSp, INVp, L2Ep, BMSEL, D, stride_y, stride_mask,
+            BLOCK_D, MUL_U_ACTIVATION_TYPE, OUTPUT_FP8, SILU_U,
+        )
+
+
+# DLRM_HSTU_FP8_MASKGEN_PK, read once at the first call of its gate (the
+# gin env bootstrap sets it after import). Plain scalars only: the FP8 first-use
+# warmup (dlrm_v4/train/fp8_warmup.py, _SCALAR_MODULES) snapshots and restores
+# them, so the arming line prints at the real first use.
+_LNMD_FWD_MASKGEN_PK_ENABLED: Optional[bool] = None
+_LNMD_FWD_MASKGEN_PK_ARMED_LOGGED = False
+_LNMD_FWD_MASKGEN_PK_DECLINE_LOGGED = False
+# Set (with one line on every rank) when a _ln_mul_dropout_fwd_maskgen_pk launch
+# raised: _ln_mul_dropout_fwd_maskgen runs for the rest of the process.
+_LNMD_FWD_MASKGEN_PK_BROKEN: Optional[str] = None
+# DLRM_HSTU_FP8_MASKGEN_PK_LAYERS (maskgen_pk layer list), read together with the
+# knob: "" = every STU layer; otherwise the canonical ",i,j," form of the
+# zero-based STUStack indices on which maskgen_pk may run. On any other layer
+# _ln_mul_dropout_fwd_maskgen runs (the same bytes either way, so the
+# list only chooses which kernel spends the time).
+_LNMD_FWD_MASKGEN_PK_LAYERS: Optional[str] = None
+_LNMD_FWD_MASKGEN_PK_GATED_LOGGED = False
+# Zero-based STUStack index of the STU layer whose compute output is running:
+# modules/stu.py STULayer._tag_lnmd_layer sets it right before each of that
+# layer's hstu_compute_output calls (forward and targets-only forward). -1 =
+# untagged (a direct call, the FP8 first-use warmup, a layer outside a stack),
+# which every layer list accepts.
+_LNMD_LAYER_TAG: int = -1
+
+
+def set_lnmd_layer_tag(index: int) -> None:
+    """STULayer: the LN*U*dropout forward that follows serves STUStack layer
+    `index` (-1 = not owned by a stack). Read only by the maskgen_pk layer list."""
+    global _LNMD_LAYER_TAG
+    _LNMD_LAYER_TAG = int(index)
+
+
+def _lnmd_fwd_maskgen_pk_layers() -> str:
+    """DLRM_HSTU_FP8_MASKGEN_PK_LAYERS -> "" (unset or empty: every layer) or
+    ",i,j," (sorted, de-duplicated). A malformed list (a token that is not a
+    non-negative integer; the env bootstrap already rejects one at startup)
+    latches maskgen_pk off for the process with one line on every rank:
+    _ln_mul_dropout_fwd_maskgen then runs everywhere (bitwise either way)."""
+    global _LNMD_FWD_MASKGEN_PK_BROKEN
+    raw = os.environ.get("DLRM_HSTU_FP8_MASKGEN_PK_LAYERS", "")
+    tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    if not tokens:
+        return ""
+    if not all(t.isascii() and t.isdigit() for t in tokens):
+        _LNMD_FWD_MASKGEN_PK_BROKEN = (
+            f"malformed DLRM_HSTU_FP8_MASKGEN_PK_LAYERS={raw!r} (need "
+            "comma-separated zero-based STU layer indices)"
+        )
+        # every rank, tagged [rank N] (see ops.utils.arm_print_all_ranks)
+        arm_print_all_ranks(
+            "LN*U*dropout fwd maskgen pk DISABLED (DLRM_HSTU_FP8_MASKGEN_PK): "
+            f"{_LNMD_FWD_MASKGEN_PK_BROKEN}; the shipped "
+            "_ln_mul_dropout_fwd_maskgen runs for the rest of the process"
+        )
+        return ""
+    return "," + ",".join(str(i) for i in sorted({int(t) for t in tokens})) + ","
+
+
+def _fp32_kernel_arg(value: float) -> float:
+    """value as the fp32 kernel argument a Python float becomes in a Triton
+    launch: the C (float) conversion, round-to-nearest-even, +-inf past the fp32
+    range. struct's 'f' packing is that conversion and raises OverflowError
+    exactly where it overflows (a finite double such as 1e39 becomes +inf)."""
+    try:
+        return struct.unpack("<f", struct.pack("<f", value))[0]
+    except OverflowError:
+        return math.copysign(math.inf, value)
+
+
+def _use_lnmd_fwd_maskgen_pk(
+    inv_scale: float, y: torch.Tensor, random_mask: torch.Tensor
+) -> bool:
+    """DLRM_HSTU_FP8_MASKGEN_PK (absent or =0:
+    _ln_mul_dropout_fwd_maskgen; any other value
+    arms). Consulted only on calls _use_lnmd_fwd_maskgen armed (gfx950, D ==
+    BLOCK_D == 512, concat u and x, 'silu', e4m3 output, mask16, ...), whose
+    contract _ln_mul_dropout_fwd_maskgen_pk shares. True runs that kernel (same
+    int8 mask, e4m3 y, mean and rstd bytes) when, for this call,
+      - the fp32 Y_INV_SCALE the kernel receives (inv_scale as Triton converts
+        a Python float, _fp32_kernel_arg) is in (0, inf): the kernel applies the
+        dropout on the e4m3 bytes, exact because a dropped element is
+        +0.0 * inv = +0.0 there. Testing the double instead would let e.g.
+        1e39 through, which reaches the kernel as +inf;
+      - y and the mask have dword-aligned base pointers and row strides (the
+        kernel stores them as int32; always true for the launch site's fresh
+        [N, 1536] / [N, 512] allocations);
+      - no earlier launch of it raised (_LNMD_FWD_MASKGEN_PK_BROKEN);
+      - the STU layer this call serves (_LNMD_LAYER_TAG) is on the
+        DLRM_HSTU_FP8_MASKGEN_PK_LAYERS list (unset or empty: every layer; an
+        untagged call, -1, is always on it).
+    Otherwise False: _ln_mul_dropout_fwd_maskgen runs (bitwise either way); the first
+    declined call prints one line on every rank, and so does the first call
+    the layer list sends to _ln_mul_dropout_fwd_maskgen. The ACTIVE line is printed
+    after the first successful launch (_lnmd_fwd_maskgen_pk_armed), not
+    here."""
+    global _LNMD_FWD_MASKGEN_PK_ENABLED, _LNMD_FWD_MASKGEN_PK_DECLINE_LOGGED
+    global _LNMD_FWD_MASKGEN_PK_LAYERS, _LNMD_FWD_MASKGEN_PK_GATED_LOGGED
+    if _LNMD_FWD_MASKGEN_PK_ENABLED is None:
+        _LNMD_FWD_MASKGEN_PK_ENABLED = (
+            os.environ.get("DLRM_HSTU_FP8_MASKGEN_PK", "0") != "0"
+        )
+        _LNMD_FWD_MASKGEN_PK_LAYERS = (
+            _lnmd_fwd_maskgen_pk_layers() if _LNMD_FWD_MASKGEN_PK_ENABLED else ""
+        )
+    if not _LNMD_FWD_MASKGEN_PK_ENABLED or _LNMD_FWD_MASKGEN_PK_BROKEN is not None:
+        return False
+    if (
+        _LNMD_FWD_MASKGEN_PK_LAYERS
+        and _LNMD_LAYER_TAG >= 0
+        and f",{_LNMD_LAYER_TAG}," not in _LNMD_FWD_MASKGEN_PK_LAYERS
+    ):
+        if not _LNMD_FWD_MASKGEN_PK_GATED_LOGGED:
+            _LNMD_FWD_MASKGEN_PK_GATED_LOGGED = True
+            # every rank, tagged [rank N] (see ops.utils.arm_print_all_ranks)
+            arm_print_all_ranks(
+                "LN*U*dropout fwd maskgen pk layer-gated "
+                "(DLRM_HSTU_FP8_MASKGEN_PK_LAYERS="
+                f"{_LNMD_FWD_MASKGEN_PK_LAYERS.strip(',')}): STU layer "
+                f"{_LNMD_LAYER_TAG} runs the shipped _ln_mul_dropout_fwd_maskgen "
+                "(bitwise either way; printed once)"
+            )
+        return False
+    inv32 = _fp32_kernel_arg(float(inv_scale))
+    why: Optional[str] = None
+    if not 0.0 < inv32 < math.inf:
+        why = (
+            f"fp32 Y_INV_SCALE {inv32!r} (inv_scale {float(inv_scale)!r}) "
+            "is not in (0, inf)"
+        )
+    elif (
+        y.data_ptr() | random_mask.data_ptr() | y.stride(0) | random_mask.stride(0)
+    ) & 3:
+        why = (
+            f"y / mask rows not dword-aligned (strides {y.stride(0)}, "
+            f"{random_mask.stride(0)})"
+        )
+    if why is None:
+        return True
+    if not _LNMD_FWD_MASKGEN_PK_DECLINE_LOGGED:
+        _LNMD_FWD_MASKGEN_PK_DECLINE_LOGGED = True
+        # every rank, tagged [rank N] (see ops.utils.arm_print_all_ranks)
+        arm_print_all_ranks(
+            "LN*U*dropout fwd maskgen pk declined (DLRM_HSTU_FP8_MASKGEN_PK): "
+            f"{why}; the shipped _ln_mul_dropout_fwd_maskgen runs such calls "
+            "(bitwise either way; printed once)"
+        )
+    return False
+
+
+def _lnmd_fwd_maskgen_pk_armed() -> None:
+    """After the first successful _ln_mul_dropout_fwd_maskgen_pk launch: one
+    line on every rank, so the line means the kernel really runs."""
+    global _LNMD_FWD_MASKGEN_PK_ARMED_LOGGED
+    if not _LNMD_FWD_MASKGEN_PK_ARMED_LOGGED:
+        _LNMD_FWD_MASKGEN_PK_ARMED_LOGGED = True
+        # every rank, tagged [rank N] (see ops.utils.arm_print_all_ranks)
+        layers = (_LNMD_FWD_MASKGEN_PK_LAYERS or "").strip(",") or "all"
+        arm_print_all_ranks(
+            "armed OK: LN*U*dropout fwd maskgen pk ACTIVE "
+            "(DLRM_HSTU_FP8_MASKGEN_PK): _ln_mul_dropout_fwd_maskgen_pk runs "
+            "in place of _ln_mul_dropout_fwd_maskgen, bitwise (same int8 "
+            f"mask, e4m3 y, mean, rstd); STU layers {layers}, first launch on "
+            f"layer tag {_LNMD_LAYER_TAG}"
+        )
+
+
+def _lnmd_fwd_maskgen_pk_latch(error: BaseException) -> None:
+    """A _ln_mul_dropout_fwd_maskgen_pk launch raised (e.g. a compile error):
+    latch maskgen_pk off for the process (one line on every rank); the caller
+    then runs _ln_mul_dropout_fwd_maskgen, which writes every output byte."""
+    global _LNMD_FWD_MASKGEN_PK_BROKEN
+    _LNMD_FWD_MASKGEN_PK_BROKEN = f"{type(error).__name__}: {str(error)[:200]}"
+    # every rank, tagged [rank N] (see ops.utils.arm_print_all_ranks)
+    arm_print_all_ranks(
+        "LN*U*dropout fwd maskgen pk DISABLED (DLRM_HSTU_FP8_MASKGEN_PK): "
+        f"launch raised {_LNMD_FWD_MASKGEN_PK_BROKEN}; the shipped "
+        "_ln_mul_dropout_fwd_maskgen runs for the rest of the process"
+    )
+
+
+def _lnmd_fwd_maskgen_pk_try(
+    x: torch.Tensor,
+    u: torch.Tensor,
+    y: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    random_mask: torch.Tensor,
+    N: int,
+    D: int,
+    eps: float,
+    dropout_ratio: float,
+    inv_scale: float,
+    keep_min16: int,
+    kk2: int,
+    seed: int,
+    BLOCK_D: int,
+    concat_u: bool,
+    concat_x: bool,
+    mul_u_activation_type: str,
+    output_fp8: bool,
+    silu_u: bool,
+) -> bool:
+    """maskgen_pk at the maskgen launch site: True when _ln_mul_dropout_fwd_maskgen_pk
+    ran (the caller then returns y, mean, rstd, random_mask), False when the
+    caller must run the _ln_mul_dropout_fwd_maskgen launch (knob off,
+    a declined or layer-gated call, a launch that raised and latched maskgen_pk
+    off, or an untagged call with a restricted layer list, which runs both)."""
+    if not _use_lnmd_fwd_maskgen_pk(inv_scale, y, random_mask):
+        return False
+    # DLRM_HSTU_FP8_MASKGEN_PK: the same launch on the packed kernel (same
+    # bytes). If it raises, maskgen_pk latches off and the
+    # _ln_mul_dropout_fwd_maskgen launch writes every output.
+    try:
+        # pyre-ignore[28]
+        _ln_mul_dropout_fwd_maskgen_pk[(triton.cdiv(N, 8),)](
+            x,
+            u,
+            y,
+            weight,
+            bias,
+            mean,
+            rstd,
+            random_mask,
+            N,
+            D,
+            eps,
+            dropout_ratio,
+            x.stride(0),
+            u.stride(0),
+            y.stride(0),
+            random_mask.stride(0),
+            float(inv_scale),
+            keep_min16,
+            kk2,
+            seed,
+            BLOCK_D=BLOCK_D,
+            NUM_MASKS=1 + int(concat_u) + int(concat_x),
+            MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
+            OUTPUT_FP8=output_fp8,
+            SILU_U=silu_u,
+            num_warps=1,
+        )
+    except Exception as error:
+        _lnmd_fwd_maskgen_pk_latch(error)
+        return False
+    _lnmd_fwd_maskgen_pk_armed()
+    if _LNMD_LAYER_TAG < 0 and _LNMD_FWD_MASKGEN_PK_LAYERS:
+        # An untagged call (the FP8 first-use warmup, a direct call) with a
+        # restricted layer list: the training step runs BOTH kernels (the _pk
+        # one on the listed layers, _ln_mul_dropout_fwd_maskgen on the others), so this
+        # call also runs the _ln_mul_dropout_fwd_maskgen launch into the same buffers (it rewrites
+        # the same bytes). The warmup thereby compiles both kernels' warm-up
+        # specializations before RUN_START; tagged calls never take this branch.
+        return False
+    return True

@@ -29,6 +29,7 @@ from generative_recommenders.common import (
     init_mlp_weights_optional_bias,
     jagged_to_padded_dense,
 )
+from generative_recommenders.modules import action_prefill
 from generative_recommenders.modules.action_encoder import ActionEncoder
 from torch.fx._symbolic_trace import is_fx_tracing
 from generative_recommenders.ops.blas_solution_pins import install_for_tokens
@@ -343,6 +344,70 @@ class ContextualPreprocessor(InputPreprocessor):
             output_dim=self._output_embedding_dim,
         )
 
+    @torch.jit.unused
+    def prefill_action(
+        self,
+        max_uih_len: int,
+        max_targets: int,
+        total_targets: int,
+        uih_seq_lengths: torch.Tensor,
+        num_targets: torch.Tensor,
+        seq_payloads: Dict[str, torch.Tensor],
+    ) -> None:
+        """Issue the action branch now (DLRM_HSTU_FP8_ACTION_PREFILL); see
+        modules/action_prefill.py. forward() finishes it or falls back."""
+        action_prefill.issue(
+            self,
+            max_uih_len=max_uih_len,
+            max_targets=max_targets,
+            total_targets=total_targets,
+            uih_seq_lengths=uih_seq_lengths,
+            num_targets=num_targets,
+            seq_payloads=seq_payloads,
+        )
+
+    @torch.jit.unused
+    def _take_action_prefill(  # pyre-ignore[3]: ActionPrefill or None
+        self,
+        max_uih_len: int,
+        max_targets: int,
+        seq_embeddings: torch.Tensor,
+        num_targets: torch.Tensor,
+        seq_payloads: Dict[str, torch.Tensor],
+    ):
+        """The prefill issued for this forward if its inputs are the ones this
+        forward hands the action branch, else None (nothing issued, or a
+        mismatch: FALLBACK, the original order runs)."""
+        pre = action_prefill.take(self)
+        if pre is None:
+            return None
+        reason = pre.mismatch(
+            max_uih_len, max_targets, seq_embeddings, num_targets, seq_payloads
+        )
+        if reason is not None:
+            action_prefill.fallback(reason)
+            return None
+        return pre
+
+    @torch.jit.unused
+    def _action_tail_from_prefill(
+        self,
+        pre,  # pyre-ignore[2]: modules/action_prefill.py ActionPrefill
+        x: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """_mlp_add(action MLP, ActionEncoder(...), residual), cut after the
+        head the prefill ran (x = the attached head output)."""
+        mlp = self._action_embedding_mlp
+        # The three spellings of _mlp_add, cut after the head the prefill ran.
+        if self._fuse_ln_residual:
+            return mlp.forward_tail(x, pre.fused, residual=residual, prefilled=pre.l2)
+        if isinstance(mlp, FusedLinearNormMLP):
+            return residual + mlp.forward_tail(x, pre.fused, prefilled=pre.l2)
+        for m in list(mlp)[-2:]:
+            x = m(x)
+        return residual + x
+
     def forward(  # noqa C901
         self,
         max_uih_len: int,
@@ -416,33 +481,73 @@ class ContextualPreprocessor(InputPreprocessor):
                     output_seq_embeddings,
                 )
         max_seq_len = max_uih_len + max_targets
-        target_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(num_targets)
-        seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(seq_lengths)
-        uih_offsets = seq_offsets - target_offsets
-        if self._action_weights is not None:
-            action_embeddings = self._action_encoder(
+        # DLRM_HSTU_FP8_ACTION_PREFILL: DlrmHSTU.preprocess may already have
+        # issued the offsets, ActionEncoder and action-MLP pair 1 (+ the last
+        # pair's Linear) inside the forward all-to-all window. Finish it here,
+        # at the branch's original graph position: into the grouped tail when
+        # it is armed (its node reuses the prefilled Linear), else pair 2's
+        # norm (+ F2 residual epilogue). None -> the original order below.
+        pre = None
+        if not torch.jit.is_scripting() and self._action_weights is not None:
+            pre = self._take_action_prefill(
                 max_uih_len=max_uih_len,
                 max_targets=max_targets,
-                uih_offsets=uih_offsets,
-                target_offsets=target_offsets,
                 seq_embeddings=seq_embeddings,
+                num_targets=num_targets,
                 seq_payloads=seq_payloads,
-                # The result's only consumer is the action MLP below, whose
-                # first Linear casts it to the autocast dtype (both the
-                # grouped-tail head and the _mlp_add path run
-                # _LinearNormFunction, which does x.to(amp_dtype)).
-                bf16_consumer=True,
             )
+        if pre is not None and tail is not None:
+            # A group that would decline AT the action MLP completes its queued
+            # pairs before the action head; only the original order keeps the
+            # backward order then (never the case for the production model).
+            why = tail.prefilled_reason(self._action_embedding_mlp, pre.y, pre.fused)
+            if why is not None:
+                action_prefill.fallback("grouped tail declines the action MLP: " + why)
+                pre = None
+        if pre is not None:
+            x_prefilled = pre.attach()
             if tail is not None:
-                tail.head(self._action_embedding_mlp, action_embeddings)
-            else:
-                output_seq_embeddings = self._mlp_add(
-                    self._action_embedding_mlp,
-                    action_embeddings,
-                    output_seq_embeddings,
+                tail.head_prefilled(
+                    self._action_embedding_mlp, x_prefilled, pre.fused, pre.l2
                 )
+            else:
+                output_seq_embeddings = self._action_tail_from_prefill(
+                    pre, x_prefilled, output_seq_embeddings
+                )
+        else:
+            target_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+                num_targets
+            )
+            seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(seq_lengths)
+            uih_offsets = seq_offsets - target_offsets
+            if self._action_weights is not None:
+                action_embeddings = self._action_encoder(
+                    max_uih_len=max_uih_len,
+                    max_targets=max_targets,
+                    uih_offsets=uih_offsets,
+                    target_offsets=target_offsets,
+                    seq_embeddings=seq_embeddings,
+                    seq_payloads=seq_payloads,
+                    # The result's only consumer is the action MLP below, whose
+                    # first Linear casts it to the autocast dtype (both the
+                    # grouped-tail head and the _mlp_add path run
+                    # _LinearNormFunction, which does x.to(amp_dtype)).
+                    bf16_consumer=True,
+                )
+                if tail is not None:
+                    tail.head(self._action_embedding_mlp, action_embeddings)
+                else:
+                    output_seq_embeddings = self._mlp_add(
+                        self._action_embedding_mlp,
+                        action_embeddings,
+                        output_seq_embeddings,
+                    )
         if tail is not None:
             output_seq_embeddings = tail.finish()
+        if pre is not None:
+            action_prefill.armed(
+                pre, grouped=None if tail is None else not tail.declined
+            )
 
         output_max_seq_len = max_seq_len
         output_total_uih_len = total_uih_len

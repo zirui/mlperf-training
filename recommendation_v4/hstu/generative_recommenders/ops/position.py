@@ -31,6 +31,7 @@ try:
 except ImportError:
     triton_cc_add_timestamp_position_embeddings = None
 from generative_recommenders.common import HammerKernel
+from generative_recommenders.ops.eval_fwd_hygiene import eval_fwd_hygiene_enabled
 from generative_recommenders.ops.triton.triton_position import (
     posenc_dropout_fuse_supported,
     triton_add_timestamp_positional_embeddings,
@@ -77,12 +78,17 @@ _POSENC_CONCAT_FOLD: bool = (
 
 
 def posenc_concat_fold_enabled(kernel: HammerKernel) -> bool:
-    """Whether add_timestamp_positional_embeddings_concat may be used."""
+    """Whether add_timestamp_positional_embeddings_concat may be used.
+
+    DLRM_HSTU_FP8_EVAL_FWD_HYGIENE=1 (ops/eval_fwd_hygiene.py) lifts the grad
+    gate: the fold is bitwise the concat + posenc it replaces, so no-grad
+    (eval) forwards take it too.
+    """
     return (
         _POSENC_CONCAT_FOLD
         and _POSENC_FAST
         and kernel == HammerKernel.TRITON
-        and torch.is_grad_enabled()
+        and (torch.is_grad_enabled() or eval_fwd_hygiene_enabled())
     )
 
 
@@ -198,7 +204,13 @@ def add_timestamp_positional_embeddings(
             time_bucket_fn=time_bucket_fn,
         )
     assert time_bucket_fn in ["sqrt", "log"]
-    if _POSENC_FAST and kernel == HammerKernel.TRITON and torch.is_grad_enabled():
+    # DLRM_HSTU_FP8_EVAL_FWD_HYGIENE=1: no-grad (eval) forwards fold the alpha
+    # too (same bf16 values as the separate `* alpha` pass below).
+    if (
+        _POSENC_FAST
+        and kernel == HammerKernel.TRITON
+        and (torch.is_grad_enabled() or eval_fwd_hygiene_enabled())
+    ):
         return triton_add_timestamp_positional_embeddings(
             seq_embeddings=seq_embeddings,
             seq_offsets=seq_offsets,
