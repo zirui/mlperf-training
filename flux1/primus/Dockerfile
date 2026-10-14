@@ -43,7 +43,7 @@ RUN rm -rf /workspace/Primus-Turbo && \
       python3 -m pip install --no-build-isolation --no-deps -v . && \
     python3 tools/check_flux_install.py "${PRIMUS_TURBO_REVISION}"
 
-LABEL org.opencontainers.image.source="https://github.com/AMD-AGI/Primus-Turbo" \
+LABEL org.opencontainers.image.source="https://github.com/zirui/Primus-Turbo" \
       org.opencontainers.image.revision="${PRIMUS_TURBO_REVISION}"
 
 # Patch PyTorch's selective FP8 GEMM dispatch and unsupported Inductor fusion fallback.
