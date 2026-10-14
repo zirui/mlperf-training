@@ -10,7 +10,7 @@ FROM rocm/primus:v26.7@sha256:68b7eb7d4db99ecfa18bd7972e5b6d8b78e56219f0a144a8ef
 
 # Build Primus with the integrated FLUX implementations.
 ARG PRIMUS_REPO=https://github.com/AMD-AGI/Primus.git
-ARG PRIMUS_REF=c17ce1e9e22d9fe54232b612ca86810f14362194
+ARG PRIMUS_REF=94d8f575e8244214682cc64c317e8a4937a413c2
 RUN rm -rf /workspace/Primus && \
     git clone --filter=blob:none "${PRIMUS_REPO}" /workspace/Primus && \
     cd /workspace/Primus && \
@@ -27,7 +27,7 @@ RUN python3 -m pip install --no-cache-dir \
 
 # Build Primus-Turbo's Python and native layers from the same pinned commit.
 ARG PRIMUS_TURBO_REPO=https://github.com/zirui/Primus-Turbo.git
-ARG PRIMUS_TURBO_REVISION=f2bb777c11ce00e88e894fe5b0873998974fb28f
+ARG PRIMUS_TURBO_REVISION=063fa9e9e9d31ce13bc5398ef377dd879639b760
 ARG MAX_JOBS=96
 RUN rm -rf /workspace/Primus-Turbo && \
     git clone --filter=blob:none "${PRIMUS_TURBO_REPO}" /workspace/Primus-Turbo && \
