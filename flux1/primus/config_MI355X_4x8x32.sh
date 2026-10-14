@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 
-source "$(dirname -- "${BASH_SOURCE[0]}")/config_common.sh"
-
 export NNODES=4
 export DGXNNODES=${NNODES}
 export LOCAL_BATCH_SIZE=32
@@ -10,3 +8,6 @@ export EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-$LOCAL_BATCH_SIZE}
 export GLOBAL_BATCH_SIZE=1024
 export LR=${LR:-0.00025}
 export WARMUP_STEPS=${WARMUP_STEPS:-1600}
+export FLUX_FPROP_SWITCH_STEP=${FLUX_FPROP_SWITCH_STEP-7325}
+
+source "$(dirname -- "${BASH_SOURCE[0]}")/config_common.sh"

@@ -203,7 +203,7 @@ if [[ -n "${PRIMUS_LIBIONIC_SRC_ABI4_SO:-}" ]]; then
     ${DOCKER} exec \
         -e PRIMUS_LIBIONIC_SRC_ABI4_SO="${PRIMUS_LIBIONIC_SRC_ABI4_SO}" \
         "${_cont_name}" \
-        bash /workspace/utilities/ainic/fix_libionic_abi4.sh
+        bash /workspace/Primus/runner/helpers/patches/10_fix_libionic_abi4.sh
     _ionic_patch_rc=$?
     set -e
     if [[ ${_ionic_patch_rc} -ne 0 && ${_ionic_patch_rc} -ne 2 ]]; then

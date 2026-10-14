@@ -3,23 +3,31 @@
 # Pin the PyTorch/ROCm runtime by digest.
 FROM rocm/primus:v26.7@sha256:68b7eb7d4db99ecfa18bd7972e5b6d8b78e56219f0a144a8ef5e9a993e57f195
 
+# Delta from the baseline image: replace Primus and Primus-Turbo with the pinned FLUX
+# revisions below; install the A6W4-to-FP8 switch; patch PyTorch, TorchAO, and AITER;
+# replace primus-mllog; build the pinned RCCL fixes; and install the pinned ROCr runtime.
+# The remaining Python/ROCm packages come unchanged from the baseline image.
+
 # Build Primus with the integrated FLUX implementations.
 ARG PRIMUS_REPO=https://github.com/AMD-AGI/Primus.git
-ARG PRIMUS_REF=028a28b7ae9b91c5bf4ed00e96ef89e0e237a65a
+ARG PRIMUS_REF=c17ce1e9e22d9fe54232b612ca86810f14362194
 RUN rm -rf /workspace/Primus && \
     git clone --filter=blob:none "${PRIMUS_REPO}" /workspace/Primus && \
     cd /workspace/Primus && \
     git fetch origin "${PRIMUS_REF}" && \
     git checkout --detach "${PRIMUS_REF}" && \
     git submodule update --init --recursive --jobs 8
+COPY patches/flux_fprop_switch.py /tmp/flux-build/flux_fprop_switch.py
+RUN python3 /tmp/flux-build/flux_fprop_switch.py /workspace/Primus && \
+    rm -f /tmp/flux-build/flux_fprop_switch.py
 
 # Preinstall the pinned Primus diffusion requirements for offline launch.
 RUN python3 -m pip install --no-cache-dir \
     -r /workspace/Primus/runner/helpers/hooks/train/pretrain/diffusion/requirements-diffusion.txt
 
 # Build Primus-Turbo's Python and native layers from the same pinned commit.
-ARG PRIMUS_TURBO_REPO=https://github.com/AMD-AGI/Primus-Turbo.git
-ARG PRIMUS_TURBO_REVISION=6a4209844cf660042ca133e1662a6fbc519f6c48
+ARG PRIMUS_TURBO_REPO=https://github.com/zirui/Primus-Turbo.git
+ARG PRIMUS_TURBO_REVISION=f2bb777c11ce00e88e894fe5b0873998974fb28f
 ARG MAX_JOBS=96
 RUN rm -rf /workspace/Primus-Turbo && \
     git clone --filter=blob:none "${PRIMUS_TURBO_REPO}" /workspace/Primus-Turbo && \
