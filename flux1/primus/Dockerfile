@@ -27,7 +27,7 @@ RUN python3 -m pip install --no-cache-dir \
 
 # Build Primus-Turbo's Python and native layers from the same pinned commit.
 ARG PRIMUS_TURBO_REPO=https://github.com/zirui/Primus-Turbo.git
-ARG PRIMUS_TURBO_REVISION=063fa9e9e9d31ce13bc5398ef377dd879639b760
+ARG PRIMUS_TURBO_REVISION=e031c5bb3746e8b667676bd20e2697d75fe9f2b2
 ARG MAX_JOBS=96
 RUN rm -rf /workspace/Primus-Turbo && \
     git clone --filter=blob:none "${PRIMUS_TURBO_REPO}" /workspace/Primus-Turbo && \

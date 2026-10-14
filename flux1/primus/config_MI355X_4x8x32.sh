@@ -9,5 +9,7 @@ export GLOBAL_BATCH_SIZE=1024
 export LR=${LR:-0.00025}
 export WARMUP_STEPS=${WARMUP_STEPS:-1600}
 export FLUX_FPROP_SWITCH_STEP=${FLUX_FPROP_SWITCH_STEP-7325}
+# Cross-node SDMA is slower for double blocks on the current AINIC topology.
+export FSDP_SDMA_MODULES=${FSDP_SDMA_MODULES:-single_blocks}
 
 source "$(dirname -- "${BASH_SOURCE[0]}")/config_common.sh"
